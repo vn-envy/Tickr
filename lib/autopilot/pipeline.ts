@@ -6,7 +6,7 @@ import { renderSamOverlayVideo } from "../campaign/cinema/overlay";
 import { renderStillDepthReel } from "../campaign/cinema/still-depth";
 import { renderTrackedReel } from "../campaign/cinema/tracked";
 import { sha256File } from "../campaign/cinema/encode";
-import { CLAIM_REPAIR_DOCUMENT, claimRepairCount } from "../campaign/copy";
+import { CLAIM_REPAIR_DOCUMENT, isAlongsideRepair } from "../campaign/copy";
 import { CampaignCopyValidationError, ensureCampaignCopy, renderCampaignKit, type CampaignExtraAsset, type CampaignProduction, type CreateCampaignInput, type PrebuiltReel, type RenderImage, type RoutedChannel } from "../campaign/index";
 import { illustrationSubjectPhrase, prepareCampaignVisual } from "../campaign/visual";
 import { normalizeOwnerClip, normalizeOwnerRenderClip } from "../media/clip";
@@ -187,8 +187,10 @@ async function produce(input: AutopilotProductionInput, dependencies: AutopilotD
   const copyResult = await dependencies.ensureCopy(campaignInput, { reserveCopyCall: () => reserveRequired("spark_copy") });
   runtime.markPaid();
   let copy = copyResult.copy;
-  const repairedSentences = claimRepairCount(copy.reviewNotes);
-  if (repairedSentences) notes.push(`Copy check: ${plural(repairedSentences, "sentence")} ${repairedSentences === 1 ? "was" : "were"} removed or replaced with neutral wording because the sources could not support ${repairedSentences === 1 ? "it" : "them"} or ${repairedSentences === 1 ? "it" : "they"} went with a field reset; ${CLAIM_REPAIR_DOCUMENT} lists every removed sentence for owner confirmation.`);
+  const repairs = copy.claimRepairs ?? [];
+  // Records from an earlier release may have trimmed a field rather than replacing it; say so rather than over-claim.
+  const alongside = repairs.filter(isAlongsideRepair).length;
+  if (repairs.length) notes.push(`Copy check: ${plural(repairs.length, "field")} ${repairs.length === 1 ? "was" : "were"} ${repairs.every((repair) => repair.fallback) ? "replaced with a neutral line" : "repaired"} because the sources could not support ${repairs.length === 1 ? "it" : "them"}${alongside ? ` (${alongside} only because ${alongside === 1 ? "it is" : "they are"} read with such text)` : ""}; ${CLAIM_REPAIR_DOCUMENT} lists the original text for owner confirmation.`);
 
   // 3. Analyze ------------------------------------------------------------------------------
   await input.progress("analyze", harvest.assets.length ? `Muse Spark is studying ${plural(harvest.assets.length, "photo and video")} against your goal.` : "Nothing to analyze; moving on to the plan.");

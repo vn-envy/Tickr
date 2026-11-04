@@ -363,12 +363,15 @@ describe("Autopilot production pipeline", () => {
 
   test("an exhausted budget skips optional SAM, shot-log and critic steps without paid requests", async () => {
     const h = await harness("budget", { photos: 2, clip: true, caps: { sam_image: 0, spark_shotlog: 0, sam_video: 0, spark_critic: 0 } });
-    // A copy whose completed response was repaired locally reports the repaired sentence count once in the quality notes.
+    // A copy whose completed response was repaired locally reports the replaced field count once in the quality notes.
     const ensureCopy = h.deps.ensureCopy;
     h.deps.ensureCopy = async (copyInput, copyOptions) => {
       const copied = await ensureCopy(copyInput, copyOptions);
-      const note = claimRepairNote([{ field: "facebook_ads caption", removed: ["Synthetic unsupported sentence.", "Another one."], unsupported: ["Synthetic unsupported sentence."], reason: "quantity or date from a Meta summary", fallback: false }]);
-      return { ...copied, copy: { ...copied.copy, reviewNotes: [note, ...copied.copy.reviewNotes] } };
+      const claimRepairs = [
+        { field: "facebook_ads caption", removed: ["Synthetic unsupported sentence. Another one."], unsupported: ["Synthetic unsupported sentence."], reason: "quantity or date from a Meta summary", fallback: true },
+        { field: "instagram_feed body", removed: ["Synthetic unsupported body."], unsupported: ["Synthetic unsupported body."], reason: "quantity or date from a Meta summary", fallback: true },
+      ];
+      return { ...copied, copy: { ...copied.copy, claimRepairs, reviewNotes: [claimRepairNote(claimRepairs), ...copied.copy.reviewNotes] } };
     };
     const result = await produceAutopilotCampaign(h.input, h.deps);
     expect(h.calls).toEqual({ copy: 1, media: 1, shotlog: 0, samImage: 0, samVideo: 0, critic: 0 });
@@ -380,7 +383,7 @@ describe("Autopilot production pipeline", () => {
     expect(quality.notes.join(" ")).toMatch(/shot-log budget/);
     expect(quality.notes.join(" ")).toMatch(/SAM budget/);
     expect(quality.notes.join(" ")).toMatch(/critic budget/);
-    expect(quality.notes.filter((note) => note.startsWith("Copy check:"))).toEqual(["Copy check: 2 sentences were removed or replaced with neutral wording because the sources could not support them or they went with a field reset; copy-claim-repairs.json lists every removed sentence for owner confirmation."]);
+    expect(quality.notes.filter((note) => note.startsWith("Copy check:"))).toEqual(["Copy check: 2 fields were replaced with a neutral line because the sources could not support them; copy-claim-repairs.json lists the original text for owner confirmation."]);
     const state = (await readPublicState(h.input.outputDir))!;
     expect(state.critic?.verdict).toBe("not_run");
     expect(state.sam.every((record) => record.status === "skipped")).toBe(true);

@@ -9,17 +9,21 @@ import { hashBytes } from "./archive";
 import { CampaignCopyValidationError, type CompletedCopyResponse } from "./completed-response";
 import { CampaignCreativeBriefSchema, type BusinessContext, type BusinessEnrichment, type CollectedSource, type ModelUsage, type ResearchEvidence, type ResearchMode, type ResearchOpportunity, type ResearchReport } from "../research/contracts";
 
-/** One automatically repaired field of a completed paid draft, exported in full for owner confirmation. */
+/** One field of a completed paid draft that was replaced with a neutral line, exported in full for owner confirmation. */
 export const CampaignClaimRepairSchema = z.object({
   /** Owner-facing field label, e.g. "instagram_carousel caption". */
   field: z.string().min(1).max(120),
-  /** Every sentence removed from the field (for a reset field, every original sentence). */
+  /** The original field text, in full (records written by an earlier release may list it sentence by sentence). */
   removed: z.array(z.string().min(1).max(1600)).min(1).max(400),
-  /** The removed sentences the claim rules rejected; the rest went with a reset to neutral text. */
+  /**
+   * The part(s) of the original text the claim rules rejected, every occurrence listed; detection only, never kept in
+   * copy. A field replaced only because it is read with a rejected field (reason "read with the replaced …") lists its
+   * whole text here.
+   */
   unsupported: z.array(z.string().min(1).max(1600)).min(1).max(400),
-  /** Short reason(s) derived from the claim rule the field failed. */
+  /** Short reason derived from the claim rule the field failed, or "read with the replaced <field>". */
   reason: z.string().min(1).max(500),
-  /** The field was replaced with the neutral, focus-name-only fallback (or a story cleared). */
+  /** The field was replaced with the neutral, focus-name-only fallback (or a story cleared). Always true for new repairs. */
   fallback: z.boolean(),
 }).strict();
 export type CampaignClaimRepair = z.infer<typeof CampaignClaimRepairSchema>;
@@ -192,20 +196,39 @@ export function withoutInquiries(text: string, voice: CopyVoice = "business"): s
 
 /** A prefilled inquiry may open only with a bare greeting and a short addressee ("Hi team,"), never with free text. */
 const PREFILL_GREETING = String.raw`(?:(?:hi|hello|hey|hiya|namaste|greetings|good (?:morning|afternoon|evening))\b(?:\s+(?:there|all|everyone|folks|(?:[\p{L}'’&-]+\s+){0,3}team))?\s*[,:;!\u2013\u2014-]?\s*)?`;
-const PREFILL_REQUEST = new RegExp(String.raw`^${PREFILL_GREETING}(?:(?:could|would|may) (?:you|i|someone|the team)\b(?!\s+(?:${RHETORICAL}|like|love|care|fancy|prefer|use|suggest|tempt|recommend|offer|interest|introduce|treat|present)\b)|(?:please\s+)?(?:share|tell (?:me|us)|let (?:me|us) know)\b|what(?:['’]?s)?|which|i(?:['’]d| would) like to know)\b`, "iu");
-/** "what is available", "which cakes are available": an open question that presupposes no stock, sale, date or delivery. */
-const OPEN_AVAILABILITY_QUESTION = /\b(what(?:['’]s|\s+is|\s+are)|which\s+(?:[\p{L}'’-]+\s+){0,3}(?:is|are))\s+(?:currently\s+)?available\b/giu;
+/** A word that would turn a category list into a clause, a comparison, a tag question or a state ("besides", "is", "right", "I hear", "sold out"). */
+const PREFILL_LIST_STOP = String.raw`(?:is|are|was|were|be|been|being|isn['’]t|aren['’]t|wasn['’]t|weren['’]t|am|do|does|did|don['’]t|doesn['’]t|have|has|had|can|will|would|could|should|get|got|i|me|my|you|your|it|its|they|we|he|she|this|that|these|those|which|who|right|besides|beside|other|than|apart|along|with|without|including|included|include|includes|excluding|except|plus|also|too|just|only|still|already|hear|heard|said|saw|like|such|as|not|no|yes|and|or|but|so|in|on|at|for|to|from|of|by|today|tonight|tomorrow|yesterday|now|sold|out|left|remaining|ready|open|closed|back|again|off|free|sale|stock|stocked|offer|offers|deal|deals|special|discounted|reserved|booked|available)`;
+const PREFILL_LIST_WORD = String.raw`(?!${PREFILL_LIST_STOP}(?![\p{L}'’-]))\p{L}[\p{L}'’&-]*`;
+const PREFILL_LIST_ITEM = String.raw`(?:(?:the|our|your)\s+)?${PREFILL_LIST_WORD}(?:\s+${PREFILL_LIST_WORD}){0,4}`;
+/**
+ * The only tail allowed after the neutralised "available": up to three of a time ("this weekend"), a place ("at the
+ * counter") or an "in/for <category list>", an optional "and pickup/delivery options", then the closing "?" and nothing
+ * else. A copula, a tag question or the focus name after "besides / other than / along with / including / just / I hear"
+ * never matches, so "available" stays in the checked text and the business claim rules reject it.
+ */
+const PREFILL_TIME = String.raw`(?:today|tonight|tomorrow|now|right now|this (?:weekend|week|month|morning|afternoon|evening))`;
+const PREFILL_PLACE = String.raw`(?:here|in[- ]store|at the (?:counter|shop|store|bakery|cafe|café))`;
+const PREFILL_LIST = String.raw`(?:in|for)\s+${PREFILL_LIST_ITEM}(?:(?:\s*,\s*|\s*,?\s+(?:and|or|&)\s+)${PREFILL_LIST_ITEM}){0,7}`;
+const PREFILL_OPTION = String.raw`(?:pickup|pick-up|collection|delivery|takeaway)`;
+const PREFILL_AVAILABLE_TAIL = String.raw`(?:\s+(?:${PREFILL_TIME}|${PREFILL_PLACE}|${PREFILL_LIST})){0,3}`
+  + String.raw`(?:\s*,?\s+(?:and|&)\s+${PREFILL_OPTION}(?:\s+(?:or|and|&)\s+${PREFILL_OPTION})?\s+options)?`
+  + String.raw`\s*\?[\s"'”’)\]\p{Extended_Pictographic}\uFE0F\u200D]*$`;
+/**
+ * The only neutral prefill shape: an open "what is available" that is the direct object of the request at the very start
+ * of a body consisting of that single question, followed only by the allow-listed tail ("Hi! Could you share what is
+ * available this weekend in Brownies and the Cheesecake Range, and pickup options?"). A relative clause ("the Weekend
+ * loaf, which is available today"), a pseudo-cleft ("what's available today is the Weekend loaf, right?"), a later
+ * sentence or anything after a noun phrase never matches.
+ */
+const PREFILL_OPEN_AVAILABILITY = new RegExp(String.raw`^(${PREFILL_GREETING}(?:(?:could|can|would) you (?:share|tell (?:me|us)|let (?:me|us) know) what(?:['’]s|\s+is|\s+are)?\s+(?:(?:is|are)\s+)?|(?:please\s+)?(?:share|tell (?:me|us)|let (?:me|us) know) what(?:['’]s|\s+is)?\s+|what(?:['’]s|\s+is)?\s+))available\b(?=${PREFILL_AVAILABLE_TAIL})`, "iu");
 
 /**
- * Prefill voice: every sentence stays under the business claim checks. Only inside one polite request or open
- * question ("Could you share what is available this weekend?") is the open phrase "what is available" neutralised;
- * stock, sale, booking, delivery, offer, price and branch wording anywhere in the sentence is still checked.
+ * Prefill voice: the whole body stays under the business claim checks. Only the leading open "what is available" of a
+ * body that is one polite question is neutralised; stock, sale, booking, delivery, offer, price and branch wording
+ * anywhere in it, including any later "available", is still checked.
  */
 function prefillClaimText(text: string): string {
-  return text.split(/(?<=[.!?])\s+|\n+/).map((sentence) => {
-    const trimmed = sentence.trim();
-    return QUESTION_END.test(trimmed) && PREFILL_REQUEST.test(trimmed) ? trimmed.replace(OPEN_AVAILABILITY_QUESTION, "$1") : trimmed;
-  }).join(" ");
+  return text.trim().replace(PREFILL_OPEN_AVAILABILITY, "$1");
 }
 
 /** The click-to-WhatsApp body is the customer's prefilled inquiry, printed on the ad image; every other channel field is the business speaking. */
@@ -237,7 +260,10 @@ function campaignClaimRules(report: ResearchReport, opportunity: ResearchOpportu
     if (!hasScopedSources) return; // Preserve legacy descriptive concepts and their recorded review status.
     // "Ask/check whether…" points the reader to confirm; "Check out what's available today" still advertises.
     const askedText = withoutInquiries(publicCopy, voice)
-      .replace(/\b(?:ask|check(?!\s+out\b)|confirm|inquire|enquire)\b[^.!?]{0,100}\b(?:whether|if|what|which)\b[^.!?]*/gi, "");
+      // The question word must directly follow the verb (optionally "the team/us/me"), and the asked clause ends at
+      // clause punctuation or a relative pronoun: "Confirm the loaf, which is available today" and "Check if you like
+      // the loaf that is in stock now" still assert availability.
+      .replace(/\b(?:ask|check(?!\s+out\b)|confirm|inquire|enquire)(?:\s+(?:with\s+)?(?:(?:the|our)\s+(?:team|staff|crew)|team|staff|us|me|them))?\s+(?:about\s+)?(?:whether|if|what|which)\b(?:(?!\b(?:which|that|who|whose)\b)[^.!?,;:–—])*/giu, "");
     const claimText = voice === "customer" ? askedText.replace(CUSTOMER_YES_NO_QUESTION, "") : voice === "prefill" ? prefillClaimText(askedText) : askedText;
     const references = evidenceIds.map((id) => sources.find((source) => source.id === ownFacts.get(id)?.sourceId)).filter((source): source is CollectedSource => Boolean(source));
     const currentOffer = references.some((source) => isCurrentOfferSource(source));
@@ -274,9 +300,13 @@ function fieldQuantityText(fields: ReadonlyArray<string | readonly [string, stri
 
 /** The reserved prefix of the one deterministic repair note; a model-written note can never carry it. */
 export const CLAIM_REPAIR_NOTE_PREFIX = "Automatic claim repair:";
-/** The exported document that lists every repaired field and every removed sentence in full. */
+/** The exported document that lists every replaced field and its original text in full. */
 export const CLAIM_REPAIR_DOCUMENT = "copy-claim-repairs.json";
 const CLAIM_REPAIR_NOTE_MAX = 500;
+/** Reason prefix of a field replaced only because it is read together with a field the claim rules rejected. */
+const CLAIM_REPAIR_ALONGSIDE = "read with the replaced";
+/** Channels whose public post, when a creative brief exists, renders the four brief scenes (carousel slides, reel). */
+const SCENE_CHANNELS = new Set<string>(["instagram_carousel", "instagram_reels"]);
 const PRODUCTION_NOTE_PREFIX = "Production notes moved from consumer copy:";
 
 type FallbackKind = "label" | "message" | "cta" | "objective" | "audience" | "customer" | "answer" | "qualification" | "next" | "story";
@@ -298,63 +328,10 @@ const REASONS: Array<[RegExp, string]> = [
 ];
 const claimReason = (message: string) => REASONS.find(([pattern]) => pattern.test(message))?.[1] ?? "unsupported claim";
 
-/** A period that ends an abbreviation or initials ("5 p.m.", "St. Albans", "e.g.") is not a sentence boundary. */
-const ABBREVIATION = /(?:^|[\s(])(?:\p{L}\.){1,3}$|\b(?:St|Mt|Dr|Mr|Mrs|Ms|Prof|Sr|Jr|No|Nos|Vol|vs|etc|approx|Ave|Rd|Blvd|Ltd|Co|Inc|Corp|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|Mon|Tue|Tues|Wed|Thu|Thur|Thurs|Fri|Sat|Sun|min|mins|hr|hrs|ft|oz|lb|lbs|kg|cm|mm|km|fig|al)\.$/iu;
-const LIST_MARKER_ONLY = /^(?:[1-9]|1[0-2])[):./]$/;
-type Segment = { text: string; separator: string };
-
-/**
- * Sentences with the separators that preceded them, so removal keeps the remaining text's own line breaks. A list marker
- * travels with the sentence it numbers, and an abbreviation never ends a sentence, so a removal can never leave a
- * stray "2." or half of "order by 5 p.m. for same-day delivery".
- */
-function splitSentences(text: string): Segment[] {
-  const parts = text.split(/((?<=[.!?…])\s+|\s*\n+\s*)/u);
-  const segments: Segment[] = [];
-  for (let index = 0; index < parts.length; index += 2) {
-    const piece = parts[index];
-    const separator = index ? parts[index - 1] : "";
-    if (!piece.trim()) continue;
-    const previous = segments.at(-1);
-    if (previous && (LIST_MARKER_ONLY.test(previous.text.trim()) || (!/\n/.test(separator) && ABBREVIATION.test(previous.text.trimEnd())))) { previous.text += separator + piece; continue; }
-    segments.push({ text: piece, separator });
-  }
-  return segments;
-}
-function joinSentences(segments: readonly Segment[], skip: ReadonlySet<number>): string {
-  let joined = "";
-  segments.forEach((segment, index) => { if (!skip.has(index)) joined += (joined ? segment.separator || " " : "") + segment.text; });
-  return joined.trim();
-}
-/** A remainder must still say something: a bare greeting ("Hi!") or a single word is not a usable field. */
-const GREETING_WORD = /^(?:hi|hello|hey|hiya|namaste|greetings|there|team|good|morning|afternoon|evening)$/i;
-const substantive = (text: string) => text.split(/[^\p{L}\p{N}'’]+/u).filter((word) => word && !GREETING_WORD.test(word)).length >= 2;
-const LIST_MARKERS = /(^|[\s:;])([1-9]|1[0-2])([):./])(?=\s+\S)/g;
-const markerNumbers = (text: string) => [...text.matchAll(LIST_MARKERS)].map((match) => Number(match[2]));
-const isListSequence = (numbers: readonly number[]) => numbers.length >= 2 && numbers.every((value, index) => value === index + 1);
-const LEADING_MARKER = /^\s*(?:[1-9]|1[0-2])[):./]\s+/;
-/** Words that answer or continue the sentence before them ("Yes, today only!", "and only this weekend."). */
-const DEPENDENT_START = /^(?:yes|yeah|yep|yup|no|nope|nah|sure|absolutely|definitely|certainly|indeed|of course|only|just|and|but|or|so|then|also|plus|too|until|till|from|starting|including|except)\b/i;
-/** An invitation stands on its own after a removed question ("Ask the team."). */
-const INVITATION_START = /^(?:ask|message|chat|contact|send|tell|share|find out|enquire|inquire|learn)\b/i;
-
-/**
- * A remainder is coherent when no kept sentence depends on a removed one: it does not continue a removed sentence
- * (lowercase start or "Yes/Only/And…") and it does not answer a removed question. A removed segment that starts in
- * lowercase was not a whole sentence, so the split is not trusted at all.
- */
-function coherentRemainder(segments: readonly Segment[], removed: ReadonlySet<number>): boolean {
-  for (const index of removed) if (/^\s*\p{Ll}/u.test(segments[index].text)) return false;
-  for (let index = 1; index < segments.length; index++) {
-    if (removed.has(index) || !removed.has(index - 1)) continue;
-    const text = segments[index].text.trim();
-    if (/^\p{Ll}/u.test(text) || DEPENDENT_START.test(text)) return false;
-    if (QUESTION_END.test(segments[index - 1].text.trim()) && !QUESTION_END.test(text) && !INVITATION_START.test(text)) return false;
-  }
-  return true;
-}
 const excerpt = (text: string, max: number) => { const flat = text.replace(/\s+/g, " ").trim(); return flat.length > max ? `${flat.slice(0, max - 1).trimEnd()}…` : flat; };
 const unique = (values: readonly string[]) => [...new Set(values)];
+/** Detection and reporting only: a rough split that quotes which part of a reset field failed. It never shapes public copy. */
+const roughSentences = (text: string) => text.split(/(?<=[.!?…])\s+|\n+/u).map((sentence) => sentence.trim()).filter(Boolean);
 
 function fallbackText(kind: FallbackKind, focus: string): string {
   switch (kind) {
@@ -383,11 +360,14 @@ function moveProductionNotes(copy: CampaignCopy): string | null {
 }
 
 /**
- * Bounded local repair for a completed paid response: a field that breaks a claim rule loses only its unsupported
- * sentence(s), or is reset to a neutral inquiry built solely from the exact focus name. It never adds a product,
- * number, offer, date, availability or claim, and never touches structure (evidence IDs, channels, scenes, focus,
- * sources); the strict validator still runs afterwards and fails closed on anything this cannot fix. Callers pass
- * consumer text already cleaned of production labels, exactly as the strict validator judges it.
+ * Bounded local repair for a completed paid response: when a field breaks a claim rule, every field of the unit it is
+ * read with (one channel's ad and post; the four scenes with the carousel and reel channels; the brief's focus text and
+ * story; the campaign summary; the WhatsApp script) is replaced IN FULL by a neutral line built solely from the exact
+ * creative-brief focus name (a brand story is cleared instead). No part of the model's text survives in a reset unit, and
+ * units that pass are left untouched. It never adds a product, number, offer, date, availability or claim, and never
+ * touches structure (evidence IDs, channels, scenes, focus, sources). Without a focus, or when a neutral line itself
+ * would fail, the unit is left as written and strict validation, which still runs afterwards, fails closed. Callers pass consumer text already cleaned of production labels, exactly as the strict
+ * validator judges it.
  */
 export function repairCampaignCopyClaims<T extends CampaignCopy>(copy: T, report: ResearchReport, opportunity: ResearchOpportunity, sources: readonly CollectedSource[], enrichment?: BusinessEnrichment): { copy: T; repairs: CampaignClaimRepair[] } {
   const repairs: CampaignClaimRepair[] = [];
@@ -398,14 +378,18 @@ export function repairCampaignCopyClaims<T extends CampaignCopy>(copy: T, report
   // Unknown evidence is a structural failure for the strict validator, never a repair.
   if (!rules.ownFacts.size || [...topIds, ...copy.channels.flatMap((channel) => channel.evidenceIds)].some((id) => !rules.ownFacts.has(id))) return { copy, repairs };
   const focus = brief?.focus.name.trim() ? brief.focus.name : null;
+  // Without an exact focus name there is no neutral line to fall back to: nothing is repaired.
+  if (focus === null) return { copy, repairs };
 
   const targets: ClaimTarget[] = [];
-  const group = (members: Array<Omit<ClaimTarget, "context">>, fixed: () => string[] = () => []) => {
-    for (const member of members) targets.push({ ...member, context: (candidate) => [...fixed(), ...members.map((peer) => (peer === member ? candidate : peer.get()))].join(" ") });
+  const group = (members: Array<Omit<ClaimTarget, "context">>, fixed: () => string[] = () => []): ClaimTarget[] => {
+    const added = members.map((member): ClaimTarget => ({ ...member, context: (candidate) => [...fixed(), ...members.map((peer) => (peer === member ? candidate : peer.get()))].join(" ") }));
+    targets.push(...added);
+    return added;
   };
   const top = (field: string, get: () => string, set: (value: string) => void, max: number, fallback: FallbackKind, options: { voice?: CopyVoice; current?: boolean } = {}) =>
     ({ field, ids: topIds, voice: options.voice ?? "business", current: options.current ?? true, max, fallback, get, set });
-  group([
+  const topTargets = group([
     top("campaign name", () => copy.name, (value) => { copy.name = value; }, 90, "label"),
     top("objective", () => copy.objective, (value) => { copy.objective = value; }, 350, "objective", { current: false }),
     top("audience hypothesis", () => copy.audienceHypothesis, (value) => { copy.audienceHypothesis = value; }, 400, "audience", { current: false }),
@@ -419,9 +403,19 @@ export function repairCampaignCopyClaims<T extends CampaignCopy>(copy: T, report
     top("qualification question", () => copy.conversation.qualificationQuestion, (value) => { copy.conversation.qualificationQuestion = value; }, 300, "qualification"),
     top("next action", () => copy.conversation.nextAction, (value) => { copy.conversation.nextAction = value; }, 400, "next"),
   ]);
+  /**
+   * The unit of reset is the text that is read together. Resetting one field and keeping its neighbours would let a kept
+   * qualifier, lead-in or follow-on ("Today only!", "Today's deal:", "Weekend loaf is too.") attach to the focus instead
+   * of the removed claim, so when any field of a unit fails, every field of that unit is replaced.
+   */
+  const units: ClaimTarget[][] = [
+    topTargets.slice(0, 5), // Campaign name, objective, audience, core message and primary CTA.
+    topTargets.slice(5), // The WhatsApp conversation script: opener, customer questions and replies, qualification, next action.
+  ];
+  let sceneUnit: ClaimTarget[] = [];
   if (brief) {
     const scene = (field: string, get: () => string, set: (value: string) => void, max: number, fallback: FallbackKind) => ({ field, ids: briefIds, voice: "business" as const, current: true, max, fallback, get, set });
-    group([
+    const briefTargets = group([
       scene("focus description", () => brief.focus.description, (value) => { brief.focus.description = value; }, 900, "message"),
       scene("brand story", () => brief.brandStory.narrative, (value) => { brief.brandStory.narrative = value; }, 1000, "story"),
       ...brief.scenes.flatMap((item) => [
@@ -429,15 +423,23 @@ export function repairCampaignCopyClaims<T extends CampaignCopy>(copy: T, report
         scene(`${item.role} scene text`, () => item.body, (value) => { item.body = value; }, 260, "message"),
       ]),
     ], () => [brief.focus.name]);
+    units.push(briefTargets.slice(0, 2));
+    sceneUnit = briefTargets.slice(2);
+    units.push(sceneUnit);
   }
   const limits = { title: 90, headline: 72, body: 260, caption: 1600, cta: 80 } as const;
   for (const channel of copy.channels) {
-    group((["title", "headline", "body", "caption", "cta"] as const).map((key) => {
+    const channelTargets = group((["title", "headline", "body", "caption", "cta"] as const).map((key) => {
       const voice = channelFieldVoice(channel.id, key);
       const fallback: FallbackKind = key === "title" || key === "headline" ? "label" : key === "cta" ? "cta" : voice === "business" ? "message" : "customer";
       return { field: `${channel.id} ${key}`, ids: channel.evidenceIds, voice, current: true, channel: channel.id, key, max: limits[key], fallback, nameCarrier: key !== "title" && key !== "cta", get: () => channel[key], set: (value: string) => { channel[key] = value; } };
     }));
+    // With a creative brief the carousel slides and the reel are the four scenes, posted under these channels' text.
+    if (brief && SCENE_CHANNELS.has(channel.id)) sceneUnit.push(...channelTargets);
+    else units.push(channelTargets);
   }
+  const unitOf = new Map<ClaimTarget, ClaimTarget[]>();
+  for (const members of units) for (const member of members) unitOf.set(member, members);
 
   const violation = (target: ClaimTarget, text: string): string | null => {
     try {
@@ -447,117 +449,80 @@ export function repairCampaignCopyClaims<T extends CampaignCopy>(copy: T, report
     } catch (error) { return error instanceof Error ? error.message : "unsupported claim"; }
   };
   const fallbackFor = (target: ClaimTarget): string | null => {
-    if (focus === null) return null;
     const text = fallbackText(target.fallback, focus);
     return text.length <= target.max && violation(target, text) === null ? text : null;
   };
-  const repaired = new Map<ClaimTarget, CampaignClaimRepair>();
-  /** One entry per field: later passes and the focus-name reset add to it, so the note never under-reports. */
-  const record = (target: ClaimTarget, removed: string[], unsupported: string[], reason: string, fallback: boolean) => {
-    const existing = repaired.get(target);
-    if (!existing) { const entry = { field: target.field, removed: unique(removed), unsupported: unique(unsupported), reason, fallback }; repairs.push(entry); repaired.set(target, entry); return; }
-    existing.removed = unique([...existing.removed, ...removed]);
-    existing.unsupported = unique([...existing.unsupported, ...unsupported]);
-    if (!existing.reason.split("; ").includes(reason)) existing.reason = `${existing.reason}; ${reason}`;
-    existing.fallback ||= fallback;
+  const reset = new Set<ClaimTarget>();
+  /**
+   * Replaces every field of the failing field's unit and records each changed one: removed is its full original text;
+   * unsupported quotes what failed (detection only), or the whole text of a field replaced only because it is read with
+   * the failing one. When any field of the unit has no usable neutral line, nothing in the unit changes and strict
+   * validation fails closed.
+   */
+  const resetUnit = (trigger: ClaimTarget, problem: string): boolean => {
+    const members = unitOf.get(trigger) ?? [trigger];
+    if (members.some((member) => reset.has(member))) return false;
+    const plan = members.map((member) => ({ member, original: member.get(), fallback: fallbackFor(member), problem: member === trigger ? problem : violation(member, member.get()) }));
+    if (plan.some((item) => item.fallback === null)) return false; // Left as written: strict validation fails closed.
+    for (const { member, original, fallback, problem: own } of plan) {
+      reset.add(member);
+      if (original === fallback || !original.trim()) continue;
+      // Every occurrence is listed, duplicates included; when only the combination fails, the whole field is quoted.
+      const failing = own === null ? [] : roughSentences(original).filter((sentence) => violation(member, sentence) !== null);
+      repairs.push({ field: member.field, removed: [original.trim()], unsupported: failing.length ? failing : [original.trim()], reason: own === null ? `${CLAIM_REPAIR_ALONGSIDE} ${trigger.field}` : claimReason(own), fallback: true });
+    }
+    for (const { member, fallback } of plan) member.set(fallback!);
+    return true;
   };
 
-  // A removal can change the keyword context of a neighbouring field, so a bounded number of passes settles it.
+  // A reset can change a neighbouring field's keyword context, so a bounded number of passes settles it.
   for (let pass = 0; pass < 3; pass++) {
     let changed = false;
     for (const target of targets) {
-      const original = target.get();
-      const problem = violation(target, original);
-      if (problem === null) continue;
-      const reason = claimReason(problem);
-      const segments = splitSentences(original);
-      const listed = isListSequence(markerNumbers(original));
-      // A numbered list must stay a 1..n list after a removal; otherwise the field is reset instead.
-      const listIntact = (text: string) => { if (!listed) return true; const numbers = markerNumbers(text); return !numbers.length || isListSequence(numbers); };
-      const usable = (skip: ReadonlySet<number>) => {
-        const text = joinSentences(segments, skip);
-        return Boolean(text) && substantive(text) && text.length <= target.max && coherentRemainder(segments, skip) && listIntact(text) && violation(target, text) === null;
-      };
-      const alone = (text: string) => (listed ? text.replace(LIST_MARKERS, "$1") : text.replace(LEADING_MARKER, "")).trim();
-      const failsAlone = segments.map((segment) => segments.length === 1 || violation(target, alone(segment.text)) !== null);
-      let removed: number[] | null = null;
-      if (segments.length > 1) {
-        // Leave one out first, preferring a sentence that also fails on its own.
-        const candidates = segments.map((_, index) => index).filter((index) => usable(new Set([index])));
-        const chosen = candidates.find((index) => failsAlone[index]) ?? candidates[0];
-        if (chosen !== undefined) removed = [chosen];
-        else {
-          const failing = segments.map((_, index) => index).filter((index) => failsAlone[index]);
-          if (failing.length && failing.length < segments.length && usable(new Set(failing))) removed = failing;
-        }
-      }
-      if (removed !== null) {
-        const sentences = removed.map((index) => segments[index].text.trim());
-        target.set(joinSentences(segments, new Set(removed)));
-        record(target, sentences, sentences, reason, false);
-        changed = true;
-        continue;
-      }
-      const fallback = fallbackFor(target);
-      if (fallback === null) continue; // Left as is: strict validation fails closed.
-      target.set(fallback);
-      // Every sentence of the field is removed; the note quotes those that fail on their own, or all when only their combination fails.
-      const unsupported = segments.filter((_, index) => failsAlone[index]);
-      record(target, segments.map((segment) => segment.text.trim()), (unsupported.length ? unsupported : segments).map((segment) => segment.text.trim()), reason, true);
-      changed = true;
+      if (reset.has(target)) continue;
+      const problem = violation(target, target.get());
+      if (problem !== null && resetUnit(target, problem)) changed = true;
     }
     if (!changed) break;
   }
 
-  // A repair must not leave a channel without its focus offering: reset the repaired field to its named fallback instead.
-  if (brief?.focus.offeringId && focus !== null) {
+  // A repair must not leave a channel without its focus offering. Every name-carrying fallback names the focus, so this
+  // guard only acts if that ever stops holding: it re-applies the named fallback to a reset field, never to a passing one.
+  if (brief?.focus.offeringId) {
     for (const channel of copy.channels) {
       const named = () => rules.normalize(`${channel.headline} ${channel.body} ${channel.caption}`).includes(rules.normalize(focus));
-      if (named()) continue;
-      for (const target of targets.filter((item) => item.channel === channel.id && item.nameCarrier && repaired.has(item))) {
-        const fallback = fallbackFor(target);
-        if (fallback === null || fallback === target.get()) continue;
-        // The sentences still in the field go with the reset: list them so the note never under-reports.
-        const entry = repaired.get(target)!;
-        entry.removed = unique([...entry.removed, ...splitSentences(target.get()).map((segment) => segment.text.trim())]);
-        entry.fallback = true;
-        target.set(fallback);
+      for (const target of targets.filter((item) => item.channel === channel.id && item.nameCarrier && reset.has(item))) {
         if (named()) break;
+        const fallback = fallbackFor(target);
+        if (fallback !== null) target.set(fallback);
       }
     }
   }
   return { copy, repairs };
 }
 
+/** A field replaced only because it is read together with a rejected field (same ad, scene sequence or script). */
+export const isAlongsideRepair = (repair: CampaignClaimRepair) => repair.reason.startsWith(`${CLAIM_REPAIR_ALONGSIDE} `);
+
 /**
  * One concise owner-facing note for every automatic repair, bounded to the review-note limit. The complete list of
- * fields and removed sentences is exported in full as copy-claim-repairs.json, so nothing is elided from the owner.
+ * replaced fields and their original text is exported in full as copy-claim-repairs.json, so nothing is elided from the owner.
  */
 export function claimRepairNote(repairs: readonly CampaignClaimRepair[]): string {
-  const sentences = repairs.reduce((total, repair) => total + repair.removed.length, 0);
-  const unsupported = repairs.reduce((total, repair) => total + repair.unsupported.length, 0);
-  const resets = repairs.filter((repair) => repair.fallback).length;
-  const fields = `${resets} field${resets === 1 ? "" : "s"} reset to neutral text`;
-  const summary = unsupported >= sentences
-    ? `that ${sentences === 1 ? "its sources" : "their sources"} could not support${resets ? ` (${fields})` : ""}`
-    : `(${unsupported} the sources could not support; ${sentences - unsupported} more went with ${fields})`;
-  const head = `${CLAIM_REPAIR_NOTE_PREFIX} removed ${sentences} sentence${sentences === 1 ? "" : "s"} ${summary} — `;
-  const tail = `. ${CLAIM_REPAIR_DOCUMENT} lists every removed sentence in full; confirm with the owner before restoring ${sentences === 1 ? "it" : "any of it"}.`;
-  const items = repairs.map((repair) => {
-    const extra = repair.removed.length - repair.unsupported.length;
-    return `${repair.field}: “${excerpt(repair.unsupported.join(" "), 70)}”${extra > 0 ? ` +${extra} supported sentence${extra === 1 ? "" : "s"} reset` : ""} (${repair.reason})`;
-  });
+  const fields = repairs.length;
+  const alongside = repairs.filter(isAlongsideRepair).length;
+  const head = `${CLAIM_REPAIR_NOTE_PREFIX} replaced ${fields} field${fields === 1 ? "" : "s"} with a neutral line because the sources could not support this text${alongside ? ` (${alongside} only because ${alongside === 1 ? "it is" : "they are"} read with such text)` : ""} — `;
+  const tail = `. ${CLAIM_REPAIR_DOCUMENT} lists the original text in full; confirm with the owner before restoring any of it.`;
+  // The rejected text is quoted first; fields replaced only because they are read with it follow.
+  const items = [
+    ...repairs.filter((repair) => !isAlongsideRepair(repair)).map((repair) => `${repair.field}: “${excerpt(repair.unsupported.join(" "), 70)}” (${repair.reason})`),
+    ...repairs.filter(isAlongsideRepair).map((repair) => `${repair.field} (${repair.reason})`),
+  ];
   const build = (shown: number) => `${head}${items.slice(0, shown).join("; ")}${shown < items.length ? `; +${items.length - shown} more field${items.length - shown === 1 ? "" : "s"}` : ""}${tail}`;
   let shown = items.length;
   while (shown > 1 && build(shown).length > CLAIM_REPAIR_NOTE_MAX) shown--;
   const note = build(shown);
   return note.length > CLAIM_REPAIR_NOTE_MAX ? `${note.slice(0, CLAIM_REPAIR_NOTE_MAX - 1)}…` : note;
-}
-
-/** The number of sentences the deterministic repair recorded, or 0. Only validateCompletedCampaignCopy can write the note. */
-export function claimRepairCount(reviewNotes: readonly string[]): number {
-  const note = reviewNotes.find((item) => item.startsWith(CLAIM_REPAIR_NOTE_PREFIX));
-  return Number(note?.match(/^Automatic claim repair: removed (\d+) /)?.[1] ?? 0);
 }
 
 /**
