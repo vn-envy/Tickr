@@ -13,7 +13,7 @@ import { OwnerClipError, renderClipMatches, verifyRenderClip, type normalizeOwne
 import type { CompositionLedger, NormalizedClip } from "../media/cinema-types";
 import type { MediaLibrary } from "../media/library";
 import { MaskletStoreError } from "../media/masklets";
-import { composeObjectLayers, type ObjectLayer } from "../media/object-layers";
+import { composeObjectLayers, subjectBoxesFromPrompts, type ObjectLayer } from "../media/object-layers";
 import { MetaClientError } from "../meta/config";
 import { scaleSamBox, type SamObjectPrompt } from "../meta/sam-prompts";
 import type { analyzeMediaAssets, MediaAnalysisOffering, MediaAssetAnalysis } from "../meta/media-analysis";
@@ -197,7 +197,7 @@ export async function segmentStill(input: {
     // match (checkpointed below), so a retry never loops on the same stored response.
     let unusable = false;
     const layers = result.status === "segmented"
-      ? await composeObjectLayers(still.bytes, result, { minCoverage: MIN_LAYER_COVERAGE, maxCoverage: MAX_LAYER_COVERAGE }).catch(() => { unusable = true; return [] as ObjectLayer[]; })
+      ? await composeObjectLayers(still.bytes, result, { minCoverage: MIN_LAYER_COVERAGE, maxCoverage: MAX_LAYER_COVERAGE, ...(geometry ? { subjectBoxes: subjectBoxesFromPrompts(geometry) } : {}) }).catch(() => { unusable = true; return [] as ObjectLayer[]; })
       : [];
     const chosen = bestLayer(layers, geometry ? 0 : null);
     const record: SamRecord = { ...base, status: chosen ? "segmented" : unusable ? "failed" : "no_match", coverage: chosen?.coverage ?? null, elapsedMs: result.elapsedMs, responseId: result.responseId, objectCount: result.objects.length,
