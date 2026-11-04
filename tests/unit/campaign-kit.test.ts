@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import sharp from "sharp";
 import { buildZip, hashBytes, safeOutputPath, writeVerifiedArchive } from "../../lib/campaign/archive";
-import { businessQuantityText, cleanConsumerCopy, eligibleBusinessEvidence, selectCampaignEnrichment, validateCampaignCopy, validateCompletedCampaignCopy, type CampaignCopy } from "../../lib/campaign/copy";
+import { businessQuantityText, campaignCopyInstructions, cleanChannelTitle, cleanConsumerCopy, eligibleBusinessEvidence, generateCampaignCopy, selectCampaignEnrichment, validateCampaignCopy, validateCompletedCampaignCopy, type CampaignCopy } from "../../lib/campaign/copy";
 import { readCompletedCopyRecord, writeCompletedCopyRecord, type CompletedCopyResponse } from "../../lib/campaign/completed-response";
 import { campaignSvg, normalizeCampaignForeground, normalizeCampaignImage, renderCampaignFrame, type RenderInput } from "../../lib/campaign/render";
 import { assertCampaignInput, campaignInputHash, CampaignCopyValidationError, createCampaign, hasBoundCompletedCopy, readCopyCheckpoint, type CreateCampaignInput } from "../../lib/campaign";
@@ -379,6 +379,62 @@ describe("campaign concepts retain provenance and review boundaries", () => {
     expect(svg).not.toContain("<image");
     expect(svg).toContain("&lt;script&gt;");
     expect(svg).toContain("CONCEPT · REVIEW REQUIRED");
+  });
+});
+
+describe("channel titles are short consumer kickers printed on the channel image", () => {
+  test("the copy prompt asks for a 2-5 word consumer kicker; the output schema and campaignInputHash are byte-identical", async () => {
+    for (const mode of ["live", "synthetic"] as const) {
+      const instructions = campaignCopyInstructions(mode);
+      expect(instructions).toContain("Each channel title is printed on that channel's image as a short uppercase kicker above the headline, so write it as consumer-facing words of 2 to 5 words (at most 38 characters)");
+      expect(instructions).toContain("never use planning or production words in a title, such as story introduction, introduction, concept, narrative, campaign, carousel, reel, scene, part or slide");
+    }
+    // The prompt is not part of the input binding: a stored completed response stays bound to the same hash.
+    vi.stubEnv("META_STRATEGY_MODEL", ""); vi.stubEnv("META_REASONING_MODEL", "");
+    const bound: CreateCampaignInput = { business: { id: "b1", name: "Fixture bakery", locality: "Fixture", vertical: "bakery", goal: "Test stored response", website: null }, report, opportunityId: opportunity.id, sources: [productSource], enrichment, mode: "synthetic", outputDir: "/tmp" };
+    expect(campaignInputHash(bound)).toBe("593b87c7c6cd7dd8036233ab1dc4b98eac8e8b14d339f88ffb7aff0c692803e8");
+    // The wire request carries exactly these instructions and the unchanged strict JSON schema. The stubbed response is
+    // not completed, so nothing is written and no other request follows; no network is reached.
+    vi.stubEnv("META_API_KEY", "offline-test-key");
+    const bodies: Array<{ instructions: string; text: { format: { schema: unknown } } }> = [];
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => { bodies.push(JSON.parse(String(init?.body))); return new Response(JSON.stringify({ id: "offline", status: "incomplete" }), { status: 200 }); });
+    try {
+      await expect(generateCampaignCopy({ business: bound.business, report, opportunity, sources: [productSource], mode: "live", enrichment })).rejects.toThrow("did not complete");
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(bodies[0].instructions).toBe(campaignCopyInstructions("live"));
+      expect(hashBytes(Buffer.from(JSON.stringify(bodies[0].text.format.schema)))).toBe("afd0e92818116faa463cd5a1c8acc9bf065b5ba40911b78e14d495f3eaf05888");
+    } finally { fetchSpy.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  test("a trailing planning label is cut back from a channel title; words are only removed, never added or reworded", () => {
+    for (const [title, expected] of [
+      ["Taste of Home Story Introduction", "Taste of Home"], ["Taste of Home Introduction", "Taste of Home"], ["Weekend loaf Concept", "Weekend loaf"],
+      ["Weekend loaf – Concept", "Weekend loaf"], ["Weekend loaf: Carousel Story Introduction", "Weekend loaf"], ["Taste of Home Part 2", "Taste of Home"],
+      ["Taste of Home (Reel)", "Taste of Home"], ["Our Story Reel", "Our Story"], ["Story Introduction", "Story"], ["Family Recipes Narrative", "Family Recipes"], ["Weekend Bakes Campaign", "Weekend Bakes"],
+    ] as const) {
+      expect(cleanChannelTitle(title), title).toBe(expected);
+      expect(title.startsWith(expected), title).toBe(true);
+      expect(cleanChannelTitle(expected), `${title} is idempotent`).toBe(expected);
+    }
+    // Nothing changes without a trailing planning label, when nothing would be left, when the cut would end on a
+    // function word or unbalance a bracket, or when it would cut into the protected focus name.
+    for (const title of ["Taste of Home", "Our Family Story", "instagram_reels", "Carousel", "The Reel", "Fresh (from the Reel", "Part of the Family", "Slides and Swings"]) expect(cleanChannelTitle(title), title).toBe(title);
+    expect(cleanChannelTitle("Fly Fishing Reel", ["Fly Fishing Reel"])).toBe("Fly Fishing Reel");
+    expect(cleanChannelTitle("Fly Fishing Reel Introduction", ["Fly Fishing Reel"])).toBe("Fly Fishing Reel");
+    expect(cleanChannelTitle("Weekend Story Introduction", ["Weekend Story"])).toBe("Weekend Story");
+  });
+
+  test("validation prints the cleaned kicker and re-validates idempotently", () => {
+    const copy = productDraft();
+    copy.channels[0].title = "Taste of Home Story Introduction";
+    copy.channels[1].title = "Weekend loaf Concept";
+    const validated = validateCampaignCopy(copy, report, opportunity, [productSource], enrichment);
+    expect(validated.channels.slice(0, 2).map((channel) => channel.title)).toEqual(["Taste of Home", "Weekend loaf"]);
+    expect(validated.channels.slice(2).map((channel) => channel.title)).toEqual(ChannelSchema.options.slice(2));
+    expect(validateCampaignCopy(structuredClone(validated), report, opportunity, [productSource], enrichment)).toEqual(validated);
+    const completed = productDraft(); completed.channels[0].title = "Taste of Home Story Introduction";
+    completed.creativeBrief!.context = { insightIds: [], whyNow: "Explain the source-attributed offering.", seasonalTheme: { name: null, status: "none", sourceIds: [] } };
+    expect(validateCompletedCampaignCopy(completed, report, opportunity, [productSource], enrichment).channels[0].title).toBe("Taste of Home");
   });
 });
 

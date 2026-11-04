@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { hashBytes } from "../../lib/campaign/archive";
-import { boundedRecordList, businessQuantityText, CampaignCopySchema, claimRepairDocument, claimRepairNote, CLAIM_REPAIR_NOTE_PREFIX, customerQuestionQuantityText, repairCampaignCopyClaims, validateCampaignCopy, validateCompletedCampaignCopy, withoutAskedClauses, type CampaignCopy } from "../../lib/campaign/copy";
+import { boundedRecordList, businessQuantityText, CampaignClaimRepairSchema, CampaignCopySchema, claimRepairDocument, claimRepairNote, CLAIM_REPAIR_NOTE_PREFIX, customerQuestionQuantityText, repairCampaignCopyClaims, validateCampaignCopy, validateCompletedCampaignCopy, withoutAskedClauses, type CampaignCopy } from "../../lib/campaign/copy";
 import { readCompletedCopyRecord, writeCompletedCopyRecord, type CompletedCopyResponse } from "../../lib/campaign/completed-response";
 import { campaignInputHash, ensureCampaignCopy, readCopyCheckpoint, type CreateCampaignInput } from "../../lib/campaign";
 import { ChannelSchema } from "../../lib/schemas/common";
@@ -161,7 +161,8 @@ const CTWA_FALLBACK = { ...AD_FALLBACK, body: PREFILL_FALLBACK } as const;
 const adText = (copy: CampaignCopy, id: string) => { const { title, headline, body, caption, cta } = channel(copy, id); return { title, headline, body, caption, cta }; };
 /** The draft's own text in every channel field, which a unit reset replaces with the alongside reason. */
 const DRAFT_AD = { title: "", headline: "A loaf for the weekend", body: "Meet our weekend loaf.", caption: "Ask us about the weekend loaf.", cta: "Ask about the loaf" } as const;
-const alongside = (id: string, key: keyof typeof DRAFT_AD, trigger: string) => ({ field: `${id} ${key}`, removed: [key === "title" ? id : DRAFT_AD[key]], unsupported: [key === "title" ? id : DRAFT_AD[key]], reason: `read with the replaced ${trigger}`, fallback: true });
+/** A field replaced only because it is read with the rejected one: its full text is under removed, and nothing of it is listed as unsupported. */
+const alongside = (id: string, key: keyof typeof DRAFT_AD, trigger: string) => ({ field: `${id} ${key}`, removed: [key === "title" ? id : DRAFT_AD[key]], unsupported: [], reason: `read with the replaced ${trigger}`, fallback: true });
 type Evidence = "scoped" | "summary";
 const strictCheck = (copy: CampaignCopy, evidence: Evidence) => (evidence === "scoped" ? validateCampaignCopy(copy, report, opportunity, [scopedSource], candidate) : validateCampaignCopy(copy, reported, opportunity, [summarySource], enrichment));
 const completedCheck = (copy: CampaignCopy, evidence: Evidence) => (evidence === "scoped" ? validateCompletedCampaignCopy(copy, report, opportunity, [scopedSource], candidate) : validateCompletedCampaignCopy(copy, reported, opportunity, [summarySource], enrichment));
@@ -288,7 +289,7 @@ describe("whole-field claim repair of completed responses", () => {
     expect(adText(repaired, "facebook_ads")).toEqual(AD_FALLBACK);
     // Every other channel passed and is untouched.
     for (const id of ChannelSchema.options.filter((item) => item !== "facebook_ads")) expect(adText(repaired, id)).toEqual({ ...DRAFT_AD, title: id });
-    expect(repairNotes(repaired)).toEqual([`Automatic claim repair: replaced 5 fields with a neutral line because the sources could not support this text (4 only because they are read with such text) — facebook_ads caption: “${THEOBROMA_CTWA_BODY.slice(4, 73).trimEnd()}…” (availability or offer without dated original evidence); facebook_ads title (read with the replaced facebook_ads caption); +3 more fields. copy-claim-repairs.json lists the original text in full; confirm with the owner before restoring any of it.`]);
+    expect(repairNotes(repaired)).toEqual([`Automatic claim repair: replaced 5 fields with a neutral line because the sources could not support this text (4 not rejected, only read with such text) — facebook_ads caption: “${THEOBROMA_CTWA_BODY.slice(4, 73).trimEnd()}…” (availability or offer without dated original evidence); facebook_ads title (read with the replaced facebook_ads caption); +3 more fields. copy-claim-repairs.json lists the original text in full; confirm with the owner before restoring any of it.`]);
     expect(repaired.claimRepairs).toEqual([
       alongside("facebook_ads", "title", "facebook_ads caption"), alongside("facebook_ads", "headline", "facebook_ads caption"), alongside("facebook_ads", "body", "facebook_ads caption"),
       { field: "facebook_ads caption", removed: [THEOBROMA_CTWA_BODY], unsupported: [THEOBROMA_CTWA_BODY.slice(4)], reason: "availability or offer without dated original evidence", fallback: true },
@@ -345,7 +346,7 @@ describe("whole-field claim repair of completed responses", () => {
       expect(repaired.claimRepairs!.map((repair) => repair.field), label).toEqual(changed.map((key) => `${id} ${key}`));
       for (const key of changed) expect(repaired.claimRepairs!.find((repair) => repair.field === `${id} ${key}`)!.removed, label).toEqual([original[key]]);
       for (const other of ChannelSchema.options.filter((item) => item !== id)) expect(adText(repaired, other), label).toEqual({ ...DRAFT_AD, title: other });
-      expect(repairNotes(repaired)[0], label).toMatch(/^Automatic claim repair: replaced \d+ fields with a neutral line because the sources could not support this text \(\d+ only because (?:it is|they are) read with such text\) — /);
+      expect(repairNotes(repaired)[0], label).toMatch(/^Automatic claim repair: replaced \d+ fields with a neutral line because the sources could not support this text \(\d+ not rejected, only read with such text\) — /);
       expect(validateCampaignCopy(structuredClone(repaired), report, opportunity, [scopedSource], candidate), label).toEqual(repaired);
     }
   });
@@ -373,7 +374,7 @@ describe("whole-field claim repair of completed responses", () => {
     expect(() => validateCampaignCopy(structuredClone(script), report, opportunity, [scopedSource], candidate)).toThrow("dated, original evidence");
     const repaired = validateCompletedCampaignCopy(script, report, opportunity, [scopedSource], candidate);
     expect(repaired.conversation.commonReplies[0]).toEqual({ question: PREFILL_FALLBACK, answer: "The team will confirm that detail for you." });
-    expect(repaired.claimRepairs!.find((repair) => repair.field === "reply 1")).toEqual({ field: "reply 1", removed: ["Yes, until Sunday at closing."], unsupported: ["Yes, until Sunday at closing."], reason: "read with the replaced customer question 1", fallback: true });
+    expect(repaired.claimRepairs!.find((repair) => repair.field === "reply 1")).toEqual({ field: "reply 1", removed: ["Yes, until Sunday at closing."], unsupported: [], reason: "read with the replaced customer question 1", fallback: true });
     expect(adText(repaired, "facebook_ads")).toEqual({ ...DRAFT_AD, title: "facebook_ads" });
   });
 
@@ -417,13 +418,13 @@ describe("whole-field claim repair of completed responses", () => {
     // The campaign summary is one unit; the name already equals its neutral label and is not listed.
     expect([repaired.name, repaired.objective, repaired.audienceHypothesis, repaired.coreMessage, repaired.primaryCta]).toEqual(["Weekend loaf", "Invite customer questions about Weekend loaf.", "People curious about Weekend loaf.", FIELD_FALLBACK, "Ask the team"]);
     const [note] = repairNotes(repaired);
-    expect(note).toMatch(/^Automatic claim repair: replaced 23 fields with a neutral line because the sources could not support this text \(16 only because they are read with such text\) — core message: “Visit us for the weekend loaf\.” \(unconfirmed local destination\); WhatsApp opener: /);
+    expect(note).toMatch(/^Automatic claim repair: replaced 23 fields with a neutral line because the sources could not support this text \(16 not rejected, only read with such text\) — core message: “Visit us for the weekend loaf\.” \(unconfirmed local destination\); WhatsApp opener: /);
     expect(note).toContain("unconfirmed local destination");
     expect(note.length).toBeLessThanOrEqual(500);
     expect(repaired.claimRepairs).toHaveLength(23);
     expect(repaired.claimRepairs!.filter((repair) => !repair.reason.startsWith("read with the replaced ")).map((repair) => repair.field)).toEqual(["core message", "WhatsApp opener", "reply 2", "facebook_ads headline", "facebook_ads caption", "facebook_ads cta", "instagram_feed caption"]);
     expect(repaired.claimRepairs!.find((repair) => repair.field === "WhatsApp opener")).toEqual({ field: "WhatsApp opener", removed: ["Hi! The weekend loaf is available this weekend."], unsupported: ["The weekend loaf is available this weekend."], reason: "availability or offer without dated original evidence", fallback: true });
-    expect(repaired.claimRepairs!.find((repair) => repair.field === "reply 1")).toEqual({ field: "reply 1", removed: ["The team can confirm availability."], unsupported: ["The team can confirm availability."], reason: "read with the replaced WhatsApp opener", fallback: true });
+    expect(repaired.claimRepairs!.find((repair) => repair.field === "reply 1")).toEqual({ field: "reply 1", removed: ["The team can confirm availability."], unsupported: [], reason: "read with the replaced WhatsApp opener", fallback: true });
     expect(repaired.claimRepairs!.find((repair) => repair.field === "primary CTA")).toMatchObject({ removed: ["Ask about the loaf"], reason: "read with the replaced core message" });
     expect(repaired.claimRepairs!.some((repair) => repair.field === "campaign name")).toBe(false);
     // A repeated unsupported sentence is listed once; the full original text, with every occurrence, is under removed.
@@ -445,7 +446,7 @@ describe("whole-field claim repair of completed responses", () => {
     const repaired = validateCompletedCampaignCopy(copy, report, opportunity, [scopedSource], candidate);
     expect(adText(repaired, "instagram_feed")).toEqual(AD_FALLBACK);
     expect(repaired.claimRepairs!.find((repair) => repair.field === "instagram_feed body")).toEqual({ field: "instagram_feed body", removed: ["Our weekend loaf is in stock today. Fresh bread for your table."], unsupported: ["Our weekend loaf is in stock today."], reason: "availability or offer without dated original evidence", fallback: true });
-    expect(repaired.claimRepairs!.find((repair) => repair.field === "instagram_feed caption")).toEqual({ field: "instagram_feed caption", removed: ["Ask us more about it."], unsupported: ["Ask us more about it."], reason: "read with the replaced instagram_feed body", fallback: true });
+    expect(repaired.claimRepairs!.find((repair) => repair.field === "instagram_feed caption")).toEqual({ field: "instagram_feed caption", removed: ["Ask us more about it."], unsupported: [], reason: "read with the replaced instagram_feed body", fallback: true });
   });
 
   test("the repair judges consumer text after production labels are moved out, exactly as strict validation does", () => {
@@ -572,7 +573,7 @@ describe("stored completed responses replay through repair without another paid 
       expect(channel(repaired, "click_to_whatsapp").body).toBe(THEOBROMA_CTWA_BODY);
       expect(channel(repaired, "instagram_carousel").caption).toBe(GRANDMA_CAROUSEL_CAPTION);
       expect(adText(repaired, "facebook_ads")).toEqual(AD_FALLBACK);
-      expect(repairNotes(repaired)).toEqual(["Automatic claim repair: replaced 5 fields with a neutral line because the sources could not support this text (4 only because they are read with such text) — facebook_ads caption: “Baked fresh since 1998.” (quantity or date from a Meta summary); facebook_ads title (read with the replaced facebook_ads caption); +3 more fields. copy-claim-repairs.json lists the original text in full; confirm with the owner before restoring any of it."]);
+      expect(repairNotes(repaired)).toEqual(["Automatic claim repair: replaced 5 fields with a neutral line because the sources could not support this text (4 not rejected, only read with such text) — facebook_ads caption: “Baked fresh since 1998.” (quantity or date from a Meta summary); facebook_ads title (read with the replaced facebook_ads caption); +3 more fields. copy-claim-repairs.json lists the original text in full; confirm with the owner before restoring any of it."]);
       expect(repaired.claimRepairs).toEqual([
         alongside("facebook_ads", "title", "facebook_ads caption"), alongside("facebook_ads", "headline", "facebook_ads caption"), alongside("facebook_ads", "body", "facebook_ads caption"),
         { field: "facebook_ads caption", removed: ["Ask us about the weekend loaf. Baked fresh since 1998."], unsupported: ["Baked fresh since 1998."], reason: "quantity or date from a Meta summary", fallback: true },
@@ -929,5 +930,105 @@ describe("fifth review: realistic compliant copy is no longer reset (each allowa
     }
     expect(customerQuestionQuantityText("Can we reserve a table for 6?")).not.toMatch(/\d/);
     expect(customerQuestionQuantityText("We can reserve a table for 6.")).toContain("6");
+  });
+});
+
+describe("hosted live run (4 Nov 2026): read-together repair records quote no unsupported text", () => {
+  test("a field replaced only because it is read with a rejected field lists nothing under unsupported; removed keeps its full text", () => {
+    const copy = generatedDraft(); channel(copy, "facebook_ads").caption = "Weekend loaf on sale today.";
+    const repaired = validateCompletedCampaignCopy(copy, ...scopedArgs);
+    const records = repaired.claimRepairs!;
+    expect(records.map((record) => record.field)).toEqual(["title", "headline", "body", "caption", "cta"].map((key) => `facebook_ads ${key}`));
+    for (const record of records.filter((item) => item.field !== "facebook_ads caption")) {
+      expect(record.unsupported, record.field).toEqual([]);
+      expect(record.reason, record.field).toBe("read with the replaced facebook_ads caption");
+      expect(record.removed, record.field).toEqual([record.field === "facebook_ads title" ? "facebook_ads" : DRAFT_AD[record.field.split(" ")[1] as keyof typeof DRAFT_AD]]);
+    }
+    expect(records.find((item) => item.field === "facebook_ads caption")).toEqual({ field: "facebook_ads caption", removed: ["Weekend loaf on sale today."], unsupported: ["Weekend loaf on sale today."], reason: "availability or offer without dated original evidence", fallback: true });
+    // The owner note quotes only rejected text, and says the read-together fields were not rejected.
+    const [note] = repairNotes(repaired);
+    expect(note).toContain("(4 not rejected, only read with such text)");
+    expect(note).toContain("facebook_ads caption: “Weekend loaf on sale today.”");
+    expect(note).not.toContain("Meet our weekend loaf.");
+    expect(() => CampaignCopySchema.parse(repaired)).not.toThrow();
+    expect(validateCampaignCopy(structuredClone(repaired), ...scopedArgs)).toEqual(repaired);
+  });
+
+  test("the record schema allows an empty unsupported list only for a read-together replacement, and keeps earlier records valid", () => {
+    const base = { field: "facebook_ads body", removed: ["Meet our weekend loaf."], fallback: true };
+    expect(() => CampaignClaimRepairSchema.parse({ ...base, unsupported: [], reason: "read with the replaced facebook_ads caption" })).not.toThrow();
+    // Records written by an earlier release repeat the read-together field's whole text under unsupported.
+    expect(() => CampaignClaimRepairSchema.parse({ ...base, unsupported: ["Meet our weekend loaf."], reason: "read with the replaced facebook_ads caption" })).not.toThrow();
+    // A field that failed a claim rule itself must say what failed.
+    expect(() => CampaignClaimRepairSchema.parse({ ...base, unsupported: [], reason: "availability or offer without dated original evidence" })).toThrow();
+    expect(() => CampaignClaimRepairSchema.parse({ ...base, unsupported: [], reason: "read with the replacedfacebook_ads caption" })).toThrow();
+    expect(() => CampaignClaimRepairSchema.parse({ ...base, unsupported: [""], reason: "read with the replaced facebook_ads caption" })).toThrow();
+    expect(() => CampaignClaimRepairSchema.parse({ ...base, removed: [], unsupported: [], reason: "read with the replaced facebook_ads caption" })).toThrow();
+    // The exported document explains the empty list.
+    const document = claimRepairDocument([{ ...base, unsupported: [], reason: "read with the replaced facebook_ads caption" }]);
+    expect(document.note).toContain("A field whose reason is \"read with the replaced …\" had no text of its own rejected: its unsupported list is empty");
+    expect(document.note).toMatch(/removed holds the original field text in full/);
+    expect(claimRepairNote([{ ...base, unsupported: [], reason: "read with the replaced facebook_ads caption" }])).toBe("Automatic claim repair: replaced 1 field with a neutral line because the sources could not support this text (1 not rejected, only read with such text) — facebook_ads body (read with the replaced facebook_ads caption). copy-claim-repairs.json lists the original text in full; confirm with the owner before restoring any of it.");
+  });
+});
+
+describe("hosted live run (4 Nov 2026): 'ask the team about <items> and what …' is an inquiry invitation", () => {
+  const THEOBROMA_FACEBOOK_BODY = "Ask the team about the Brownies and Cheesecake Range and what is available for pickup.";
+  test("the exact Theobroma facebook_ads body passes strict and completed validation unchanged, with no repair", () => {
+    expect(withoutAskedClauses(THEOBROMA_FACEBOOK_BODY)).toBe(".");
+    for (const summary of [false, true]) {
+      const copy = withField(["facebook_ads", "body", THEOBROMA_FACEBOOK_BODY]);
+      const strict = summary ? validateCampaignCopy(structuredClone(copy), ...summaryScopedArgs) : validateCampaignCopy(structuredClone(copy), ...scopedArgs);
+      expect(channel(strict, "facebook_ads").body).toBe(THEOBROMA_FACEBOOK_BODY);
+      const completed = summary ? validateCompletedCampaignCopy(copy, ...summaryScopedArgs) : validateCompletedCampaignCopy(copy, ...scopedArgs);
+      expect(channel(completed, "facebook_ads").body).toBe(THEOBROMA_FACEBOOK_BODY);
+      expect(completed.claimRepairs).toBeUndefined();
+    }
+    // Both earlier live strings still pass unchanged beside it.
+    const all = withField(["facebook_ads", "body", THEOBROMA_FACEBOOK_BODY]);
+    channel(all, "click_to_whatsapp").body = THEOBROMA_CTWA_BODY;
+    channel(all, "instagram_carousel").caption = GRANDMA_CAROUSEL_ONLY;
+    const completed = validateCompletedCampaignCopy(all, ...summaryScopedArgs);
+    expect([channel(completed, "facebook_ads").body, channel(completed, "click_to_whatsapp").body, channel(completed, "instagram_carousel").caption]).toEqual([THEOBROMA_FACEBOOK_BODY, THEOBROMA_CTWA_BODY, GRANDMA_CAROUSEL_ONLY]);
+    expect(completed.claimRepairs).toBeUndefined();
+  });
+
+  test.each([
+    "Check with the team about the Weekend loaf and which flavours are available this weekend.",
+    "Ask us about the Weekend loaf and whether it is available for pickup.",
+    "Ask about the Weekend loaf & Brownies and what is available this weekend.",
+    "Ask our bakers about the Weekend loaf and what's available at the counter today.",
+  ])("a narrow item list before 'and what/which/whether' is an asked clause: %j", (body) => {
+    expect(() => validateCampaignCopy(withField(["facebook_ads", "body", body]), ...scopedArgs)).not.toThrow();
+  });
+
+  test.each([
+    "Ask the team about the Weekend loaf, which is available today.",
+    "Ask about the loaf and what's on sale today.",
+    "Ask the team about the Weekend loaf which is available today.",
+    "Ask the team about the Weekend loaf available today and what else is new.",
+    "Ask about the Weekend loaf, in stock now, and what is available for pickup.",
+    "Ask about the half-price Weekend loaf and what is available for pickup today.",
+    "Ask about the free Weekend loaf and what is available today.",
+    "Ask about the discounted Weekend loaf and what is available today.",
+    "Ask the team about our Pune store loaves and what is available today.",
+    "Ask about the Weekend loaf and the Sourdough Brownie Range and what is available today.",
+    "Ask about the Weekend loaf and what's available today. Yes!",
+    "Ask about the Weekend loaf and what's available today: the Weekend loaf!",
+    "Ask about the Weekend loaf and what is available today - in stock now.",
+    "Ask about the Weekend loaf and what's available today and grab one now in stock.",
+    "Ask about the Weekend loaf and what's available today because it is on sale.",
+    "Ask about the Weekend loaf and whether bookings are open today.",
+    "Ask about the Weekend loaf and which slots are available today.",
+    "Confirm about the Weekend loaf and what is available today.",
+    "Ask about the Weekend loaf and and what is available today.",
+    "Ask about it and what is available today.",
+    "Ask about the Weekend loaf with delivery and what is available today.",
+    "See about the Weekend loaf and what is available today.",
+  ])("anything outside the narrow item list stays a checked availability claim and is reset: %j", (body) => {
+    expect(() => validateCampaignCopy(withField(["facebook_ads", "body", body]), ...scopedArgs)).toThrow("dated, original evidence");
+    const repaired = validateCompletedCampaignCopy(withField(["facebook_ads", "body", body]), ...scopedArgs);
+    expect(channel(repaired, "facebook_ads").body).toBe(fallbackFor("facebook_ads", "body"));
+    expect(repaired.claimRepairs!.find((repair) => repair.field === "facebook_ads body")).toMatchObject({ removed: [body], fallback: true });
   });
 });
