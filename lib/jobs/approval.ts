@@ -3,17 +3,9 @@ import { lstat, readFile, realpath } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 import { RequestError } from "../http";
 import { CampaignApprovalSchema, type CampaignApproval, type CampaignKit } from "../research/contracts";
+import { APPROVAL_STATEMENT, approvableFiles } from "./approval-shared";
 
-export const APPROVAL_STATEMENT = "I have reviewed these exact campaign files, their claims and the people, products and places they show. I approve them as campaign material for my business. Publishing, ad spend and messaging remain separate steps.";
-
-/** Files the owner approves: every manifest entry except the archive and documents excluded by the export. */
-export function approvableFiles(campaign: CampaignKit, withheld: readonly string[] = []) {
-  const blocked = new Set(withheld);
-  return campaign.assets
-    .filter((asset) => !blocked.has(asset.filename))
-    .map(({ filename, sha256, bytes }) => ({ filename, sha256, bytes }))
-    .sort((a, b) => a.filename.localeCompare(b.filename));
-}
+export { APPROVAL_STATEMENT, approvableFiles };
 
 /** Canonical digest the UI shows and the owner must echo back, binding approval to exact bytes. */
 export function manifestDigest(campaignId: string, files: ReturnType<typeof approvableFiles>): string {

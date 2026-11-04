@@ -1,6 +1,8 @@
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { isAbsolute, join, resolve } from "node:path";
+import { promisify } from "node:util";
 import sharp, { type OverlayOptions } from "sharp";
 import { renderReel } from "./reel";
 import type { CampaignCreativeBrief } from "../research/contracts";
@@ -33,8 +35,21 @@ export interface RenderInput {
     foregroundBytes?: Uint8Array;
     backgroundBytes?: Uint8Array;
     backgroundStyle?: "palette_gradient" | "source_image";
+    /** Visible footer label override (escaped, uppercased and bounded before rendering). */
+    provenanceLabel?: string;
   };
+  /** Per-placement image routing; absent channels use `image`. facebook_ads_portrait follows facebook_ads. */
+  channelImages?: Partial<Record<RoutedChannel, RenderImage>>;
+  /** Exactly four images, one per carousel slide in order. */
+  carouselImages?: RenderImage[];
+  /** A Reel rendered elsewhere (e.g. cinema), adopted after an ffprobe contract check instead of the zoompan render. */
+  reel?: PrebuiltReel;
 }
+
+export type RenderImage = NonNullable<RenderInput["image"]> & { provenanceLabel?: string };
+export const ROUTED_CHANNELS = ["instagram_feed", "facebook_ads", "instagram_stories", "click_to_whatsapp", "whatsapp_status"] as const;
+export type RoutedChannel = (typeof ROUTED_CHANNELS)[number];
+export interface PrebuiltReel { kind: "prebuilt"; videoPath: string; coverPath: string }
 
 export interface RenderedAsset {
   id: string;
@@ -47,7 +62,7 @@ export interface RenderedAsset {
   bytes: number;
 }
 
-type Theme = { paper: string; ink: string; accent: string; soft: string; dark: string };
+export type Theme = { paper: string; ink: string; accent: string; soft: string; dark: string };
 const themes: Record<string, Theme> = {
   bakery: { paper: "#F5EEDF", ink: "#263A30", accent: "#BB4D2F", soft: "#E1C69E", dark: "#263A30" },
   dentist: { paper: "#F0F3EE", ink: "#173C40", accent: "#247C79", soft: "#B7D3CC", dark: "#173C40" },
@@ -69,6 +84,11 @@ function campaignTheme(input: Pick<RenderInput, "vertical" | "creativeBrief">): 
   // A proposed palette may not compromise readable text.
   if (luminance(paper) < .5 || (luminance(paper) + .05) / (luminance(ink) + .05) < 7) return fallback;
   return { paper, ink, accent, soft: fallback.soft, dark: ink };
+}
+
+/** The validated campaign palette, shared with the cinema renderers. */
+export function resolveCampaignTheme(input: Pick<RenderInput, "vertical" | "creativeBrief">): Theme {
+  return campaignTheme(input);
 }
 
 /** Raster-only entry point: SVG/XML bytes are rejected before any image parser runs. */
@@ -103,6 +123,19 @@ export function escapeSvg(value: string): string {
 function cleanText(value: string, limit: number): string {
   const clean = value.replace(/[\u0000-\u001f]/g, " ").replace(/\s+/g, " ").trim();
   return clean.length > limit ? `${clean.slice(0, limit - 1).trimEnd()}…` : clean;
+}
+
+/**
+ * Visible footer provenance (plain text; escape it at the SVG boundary). An explicit label is caller data:
+ * cleaned, uppercased and bounded. `cutout`/`backdrop` describe an art-directed SAM composition.
+ */
+export function campaignProvenanceLabel(image: Pick<RenderImage, "provenance" | "provenanceLabel">, layers: { cutout?: boolean; backdrop?: boolean } = {}): string {
+  const custom = typeof image.provenanceLabel === "string" ? cleanText(image.provenanceLabel.toUpperCase(), 60) : "";
+  if (custom) return custom;
+  if (image.provenance === "meta_illustration") return "ILLUSTRATIVE IMAGE";
+  const owner = image.provenance === "owner_photo", background = Boolean(layers.backdrop);
+  if (layers.cutout) return `${owner ? "OWNER PHOTO · SAM CUTOUT" : "SOURCE CUTOUT"}${background ? " · AI BACKDROP" : ""}`;
+  return owner ? "OWNER PHOTO" : "SOURCE IMAGE";
 }
 
 function wrapText(value: string, columns: number, maxLines: number): string[] {
@@ -171,7 +204,7 @@ async function artDirectedFrame(input: RenderInput, layout: Layout, original: Bu
   const ctaY = square ? 910 : tall ? 1738 : 1178;
   const focus = cleanText(input.creativeBrief?.focus.name || layout.kicker, 62);
   const concept = input.mode === "synthetic" ? "SYNTHETIC DEMO · CONCEPT" : "CONCEPT · REVIEW REQUIRED";
-  const provenance = input.image!.provenance === "meta_illustration" ? "ILLUSTRATIVE IMAGE" : foreground ? background ? "SOURCE CUTOUT · AI BACKDROP" : "SOURCE CUTOUT" : "SOURCE IMAGE";
+  const provenance = campaignProvenanceLabel(input.image!, { cutout: Boolean(foreground), backdrop: Boolean(background) });
   const circleX = story ? w - 20 : role === "detail" ? w / 2 : w * .56;
   const circleY = stage.y + stage.height * .54;
   const backgroundSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}">
@@ -218,7 +251,7 @@ ${fittedHeadline(layout.headline, headingX - 3, headingY, headingWidth, headingL
 ${textBlock(layout.body, margin, bodyY, bodyColumns, story ? 5 : tall ? 4 : 3, square ? 26 : 28, square ? 38 : 42, ink)}
 <rect x="${margin}" y="${ctaY}" width="${Math.min(w - 128, Math.max(350, cta.length * 16 + 76))}" height="74" rx="37" fill="${ink}"/>
 <text x="${margin + 29}" y="${ctaY + 47}" fill="${paper}" font-family="DejaVu Sans,sans-serif" font-size="25">${escapeSvg(cta)}</text>
-<text x="${margin}" y="${h - 66}" fill="${ink}" opacity=".8" font-family="DejaVu Sans,sans-serif" font-size="13" letter-spacing="1.4">${provenance}</text>
+<text x="${margin}" y="${h - 66}" fill="${ink}" opacity=".8" font-family="DejaVu Sans,sans-serif" font-size="13" letter-spacing="1.4">${escapeSvg(provenance)}</text>
 <text x="${margin}" y="${h - 32}" fill="${ink}" font-family="DejaVu Sans,sans-serif" font-size="13" letter-spacing="1.2">${escapeSvg(cleanText(input.campaignName.toUpperCase(), 75))}</text>
 </svg>`;
   return sharp(Buffer.from(backgroundSvg)).composite([...layers, { input: Buffer.from(overlay), left: 0, top: 0 }]).png().toBuffer();
@@ -289,7 +322,7 @@ export async function renderCampaignFrame(input: RenderInput, layout: Layout, no
   const ctaY = square ? 935 : tall ? 1737 : 1205;
   const image = await sharp(normalizedImage).resize(imageWidth, imageHeight, { fit: "cover", position: sharp.strategy.attention }).composite([{ input: Buffer.from(`<svg width="${imageWidth}" height="${imageHeight}"><rect width="${imageWidth}" height="${imageHeight}" rx="24" fill="white"/></svg>`), blend: "dest-in" }]).png().toBuffer();
   const concept = input.mode === "synthetic" ? "SYNTHETIC DEMO · CONCEPT" : "CONCEPT · REVIEW REQUIRED";
-  const provenance = input.image.provenance === "meta_illustration" ? "ILLUSTRATIVE IMAGE" : "SOURCE IMAGE";
+  const provenance = campaignProvenanceLabel(input.image);
   const focus = input.creativeBrief?.focus.name || layout.kicker;
   const label = cleanText(focus, 48).toUpperCase();
   const cta = cleanText(layout.cta, 43);
@@ -301,8 +334,8 @@ ${textBlock(input.businessName, 64, 111, 60, 1, 29, 36, ink)}
 <rect x="64" y="${titleY - 68}" width="6" height="24" fill="${theme.accent}"/>
 <text x="84" y="${titleY - 49}" fill="${ink}" font-family="DejaVu Sans,sans-serif" font-size="17" letter-spacing="2">${escapeSvg(label)}</text>
 ${textBlock(layout.headline, 61, titleY + 22, square ? 28 : tall ? 22 : 25, 3, headlineSize, headlineSize * 1.15, ink, true)}
-<rect x="82" y="${imageTop + imageHeight - 54}" width="${provenance.length * 9 + 34}" height="34" rx="17" fill="${theme.paper}" opacity=".96"/>
-<text x="99" y="${imageTop + imageHeight - 31}" fill="${theme.ink}" font-family="DejaVu Sans,sans-serif" font-size="14" letter-spacing="1">${provenance}</text>
+<rect x="82" y="${imageTop + imageHeight - 54}" width="${Array.from(provenance).length * 9 + 34}" height="34" rx="17" fill="${theme.paper}" opacity=".96"/>
+<text x="99" y="${imageTop + imageHeight - 31}" fill="${theme.ink}" font-family="DejaVu Sans,sans-serif" font-size="14" letter-spacing="1">${escapeSvg(provenance)}</text>
 ${textBlock(layout.body, 64, bodyY, tall ? 52 : 57, tall ? 4 : 3, 28, 41, ink)}
 <rect x="64" y="${ctaY}" width="${Math.min(w - 128, Math.max(350, cta.length * 16 + 76))}" height="72" rx="36" fill="${ink}"/>
 <text x="92" y="${ctaY + 46}" fill="${paper}" font-family="DejaVu Sans,sans-serif" font-size="25">${escapeSvg(cta)}</text>
@@ -311,19 +344,122 @@ ${textBlock(layout.body, 64, bodyY, tall ? 52 : 57, tall ? 4 : 3, 28, 41, ink)}
   return sharp({ create: { width: w, height: h, channels: 4, background: paper } }).composite([{ input: image, left: 64, top: imageTop }, { input: Buffer.from(overlay), left: 0, top: 0 }]).png().toBuffer();
 }
 
+const run = promisify(execFile);
+const PREBUILT_REEL_MAX_BYTES = 95_000_000;
+const PREBUILT_COVER_MAX_BYTES = 16 * 1024 * 1024;
+const PREBUILT_REEL_ERROR = "The prebuilt Reel did not meet its output contract and was not adopted.";
+
+/** MP4-family major brands ffmpeg's mp4 muxer writes; QuickTime ("qt  ") shares format_name with MP4 and is rejected. */
+const MP4_BRANDS = new Set(["isom", "iso2", "iso4", "iso5", "iso6", "mp41", "mp42", "avc1"]);
+
+/**
+ * The renderReel / cinema encoder output contract: one 1080x1920 H.264 yuv420p video stream at 30/1 fps,
+ * 360 frames and 12 s in an MP4 (not QuickTime) container, with no audio or other streams.
+ */
+async function verifyReelContract(path: string): Promise<boolean> {
+  try {
+    const result = await run("ffprobe", ["-v", "error", "-protocol_whitelist", "file", "-show_entries", "stream=codec_type,width,height,codec_name,pix_fmt,nb_frames,r_frame_rate:format=duration,format_name:format_tags=major_brand", "-of", "json", path], { timeout: 15_000, maxBuffer: 64_000 });
+    const probe = JSON.parse(result.stdout) as { streams?: { codec_type?: string; width?: number; height?: number; codec_name?: string; pix_fmt?: string; nb_frames?: string; r_frame_rate?: string }[]; format?: { duration?: string; format_name?: string; tags?: { major_brand?: string } } };
+    const streams = probe.streams ?? [];
+    const video = streams[0];
+    const duration = Number(probe.format?.duration);
+    return streams.length === 1 && video.codec_type === "video"
+      && Boolean(probe.format?.format_name?.split(",").includes("mp4")) && MP4_BRANDS.has(probe.format?.tags?.major_brand?.trim() ?? "")
+      && video.width === 1080 && video.height === 1920 && video.codec_name === "h264" && video.pix_fmt === "yuv420p" && video.r_frame_rate === "30/1"
+      && Number(video.nb_frames) === 360 && Math.abs(duration - 12) <= 0.1;
+  } catch { return false; }
+}
+
+/** Dimensions of a local MP4's single video stream; a non-MP4 (including a still image or QuickTime file) or any probe failure is null. */
+export async function probeLocalMp4Size(path: string): Promise<{ width: number; height: number } | null> {
+  try {
+    const result = await run("ffprobe", ["-v", "error", "-protocol_whitelist", "file", "-show_entries", "stream=codec_type,width,height:format=format_name:format_tags=major_brand", "-of", "json", path], { timeout: 15_000, maxBuffer: 64_000 });
+    const probe = JSON.parse(result.stdout) as { streams?: { codec_type?: string; width?: number; height?: number }[]; format?: { format_name?: string; tags?: { major_brand?: string } } };
+    const videos = (probe.streams ?? []).filter((stream) => stream.codec_type === "video");
+    const [video] = videos;
+    if (!probe.format?.format_name?.split(",").includes("mp4") || !MP4_BRANDS.has(probe.format.tags?.major_brand?.trim() ?? "")) return null;
+    if (videos.length !== 1 || !Number.isInteger(video.width) || !Number.isInteger(video.height) || video.width! < 1 || video.height! < 1 || video.width! > 20_000 || video.height! > 20_000) return null;
+    return { width: video.width!, height: video.height! };
+  } catch { return null; }
+}
+
+/** Adopt a locally rendered Reel: the copied bytes are what is probed, hashed and exported. */
+async function adoptPrebuiltReel(reel: PrebuiltReel, outputDir: string): Promise<void> {
+  const pending = join(outputDir, "instagram_reel.pending.mp4");
+  try {
+    if (reel.kind !== "prebuilt" || !isAbsolute(reel.videoPath) || !isAbsolute(reel.coverPath)) throw new Error("Invalid prebuilt Reel reference.");
+    const coverInfo = await stat(reel.coverPath);
+    if (!coverInfo.isFile() || coverInfo.size < 1 || coverInfo.size > PREBUILT_COVER_MAX_BYTES) throw new Error("Invalid cover.");
+    const cover = await readFile(reel.coverPath);
+    if (cover.length > PREBUILT_COVER_MAX_BYTES || !cover.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) throw new Error("Invalid cover.");
+    const coverMetadata = await sharp(cover, { limitInputPixels: 1080 * 1920, failOn: "error", animated: false }).metadata();
+    if (coverMetadata.format !== "png" || coverMetadata.width !== 1080 || coverMetadata.height !== 1920 || (coverMetadata.pages ?? 1) !== 1) throw new Error("Invalid cover.");
+    const videoInfo = await stat(reel.videoPath);
+    if (!videoInfo.isFile() || videoInfo.size < 1 || videoInfo.size > PREBUILT_REEL_MAX_BYTES) throw new Error("Invalid Reel.");
+    await copyFile(resolve(reel.videoPath), pending);
+    const copied = await stat(pending);
+    if (copied.size < 1 || copied.size > PREBUILT_REEL_MAX_BYTES || !(await verifyReelContract(pending))) throw new Error("Invalid Reel.");
+    await rename(pending, join(outputDir, "instagram_reel.mp4"));
+    await writeFile(join(outputDir, "instagram_reel_cover.png"), cover);
+  } catch {
+    // Probe and filesystem errors can contain local paths; keep the public error fixed.
+    await rm(pending, { force: true }).catch(() => undefined);
+    throw new Error(PREBUILT_REEL_ERROR);
+  }
+}
+
+type PreparedImage = { image: RenderImage; normalized: Buffer; foreground?: Buffer; background?: Buffer };
+
+/**
+ * Pure routing preflight: unknown placements, a carousel without exactly four images, an unsupported Reel source
+ * or a prebuilt Reel without the Reels channel are caller errors, rejected before anything is rendered.
+ */
+export function validateRenderRouting(input: Pick<RenderInput, "channels" | "channelImages" | "carouselImages" | "reel">): void {
+  if (input.channelImages !== undefined) {
+    if (!input.channelImages || typeof input.channelImages !== "object" || Array.isArray(input.channelImages)) throw new Error("Channel image routing must map known placements to images.");
+    for (const [key, image] of Object.entries(input.channelImages)) {
+      if (!(ROUTED_CHANNELS as readonly string[]).includes(key) || (image !== undefined && (!image || typeof image !== "object"))) throw new Error("Channel image routing must map known placements to images.");
+    }
+  }
+  if (input.carouselImages !== undefined && (!Array.isArray(input.carouselImages) || input.carouselImages.length !== 4 || input.carouselImages.some((image) => !image || typeof image !== "object"))) throw new Error("The carousel needs exactly four images.");
+  if (input.reel !== undefined && (!input.reel || input.reel.kind !== "prebuilt")) throw new Error("Unsupported Reel source.");
+  if (input.reel && !input.channels.some((channel) => channel.id === "instagram_reels")) throw new Error("A prebuilt Reel needs the Instagram Reels channel.");
+}
+
 export async function renderCampaignAssets(input: RenderInput): Promise<RenderedAsset[]> {
+  validateRenderRouting(input);
   const outputDir = resolve(input.outputDir);
   await mkdir(outputDir, { recursive: true });
   const assets: RenderedAsset[] = [];
-  const normalizedImage = input.image ? await normalizeCampaignImage(input.image) : undefined;
-  const normalizedForeground = input.image?.foregroundBytes ? await normalizeCampaignForeground(input.image.foregroundBytes) : undefined;
-  const normalizedBackground = input.image?.backgroundBytes ? await normalizeCampaignImage({ ...input.image, bytes: input.image.backgroundBytes, mimeType: "image/png" }) : undefined;
+  // Each distinct raster is decoded once, keyed by role, declared type and content hash.
+  const normalizedCache = new Map<string, Promise<Buffer>>();
+  const normalizeOnce = (role: string, bytes: Uint8Array, mimeType: string, normalize: () => Promise<Buffer>) => {
+    const key = `${role}:${mimeType}:${createHash("sha256").update(bytes).digest("hex")}`;
+    let normalized = normalizedCache.get(key);
+    if (!normalized) { normalized = normalize(); normalizedCache.set(key, normalized); }
+    return normalized;
+  };
+  const prepare = async (image: RenderImage): Promise<PreparedImage> => ({
+    image,
+    normalized: await normalizeOnce("image", image.bytes, image.mimeType, () => normalizeCampaignImage(image)),
+    foreground: image.foregroundBytes ? await normalizeOnce("foreground", image.foregroundBytes, "image/png", () => normalizeCampaignForeground(image.foregroundBytes!)) : undefined,
+    background: image.backgroundBytes ? await normalizeOnce("background", image.backgroundBytes, "image/png", () => normalizeCampaignImage({ ...image, bytes: image.backgroundBytes!, mimeType: "image/png" })) : undefined,
+  });
+  const primary = input.image ? await prepare(input.image) : undefined;
+  const routed = new Map<string, PreparedImage>();
+  for (const channel of ROUTED_CHANNELS) {
+    const image = input.channelImages?.[channel];
+    if (image) routed.set(channel, await prepare(image));
+  }
+  const carousel: Array<PreparedImage | undefined> = [];
+  for (const image of input.carouselImages ?? []) carousel.push(await prepare(image));
+  const frame = (prepared: PreparedImage | undefined, layout: Layout) => renderCampaignFrame({ ...input, image: prepared?.image }, layout, prepared?.normalized, prepared?.foreground, prepared?.background);
   const record = async (filename: string, channel: string, width: number, height: number, mediaType: "image" | "video") => {
     const bytes = await readFile(join(outputDir, filename));
     assets.push({ id: filename.replace(/\.[a-z0-9]+$/i, ""), channel, filename, mediaType, width, height, sha256: createHash("sha256").update(bytes).digest("hex"), bytes: bytes.length });
   };
-  const image = async (filename: string, channel: string, layout: Layout) => {
-    const bytes = await renderCampaignFrame(input, layout, normalizedImage, normalizedForeground, normalizedBackground);
+  const image = async (filename: string, channel: string, layout: Layout, prepared: PreparedImage | undefined) => {
+    const bytes = await frame(prepared, layout);
     await writeFile(join(outputDir, filename), bytes);
     await record(filename, channel, layout.width, layout.height, "image");
   };
@@ -344,15 +480,20 @@ export async function renderCampaignAssets(input: RenderInput): Promise<Rendered
         { headline: channel.caption.split(/[.!?]\s/)[0] || channel.headline, body: channel.body, kicker: "Make it part of your day" },
         { headline: channel.cta, body: channel.headline, kicker: "Your next step" },
       ];
-      for (const [slideIndex, slide] of slides.entries()) await image(`instagram_carousel_${slideIndex + 1}.png`, channel.id, { ...layout, ...slide, role: ART_ROLES[slideIndex], variant: slideIndex, page: `${slideIndex + 1} / 4` });
+      for (const [slideIndex, slide] of slides.entries()) await image(`instagram_carousel_${slideIndex + 1}.png`, channel.id, { ...layout, ...slide, role: ART_ROLES[slideIndex], variant: slideIndex, page: `${slideIndex + 1} / 4` }, carousel.length ? carousel[slideIndex] : primary);
     } else {
-      await image(`${channel.id}.png`, channel.id, layout);
-      if (square) await image("facebook_ads_portrait.png", channel.id, { ...layout, height: 1350, variant: index + 1 });
+      const prepared = routed.get(channel.id) ?? primary;
+      await image(`${channel.id}.png`, channel.id, layout, prepared);
+      if (square) await image("facebook_ads_portrait.png", channel.id, { ...layout, height: 1350, variant: index + 1 }, prepared);
     }
   }
 
   const reel = input.channels.find((channel) => channel.id === "instagram_reels");
-  if (reel) {
+  if (reel && input.reel) {
+    await adoptPrebuiltReel(input.reel, outputDir);
+    await record("instagram_reel.mp4", reel.id, 1080, 1920, "video");
+    await record("instagram_reel_cover.png", reel.id, 1080, 1920, "image");
+  } else if (reel) {
     const sceneDir = join(outputDir, ".reel-scenes");
     await mkdir(sceneDir, { recursive: true });
     const scenes = input.creativeBrief ? input.creativeBrief.scenes.map((scene) => ({ headline: scene.headline, body: scene.body, kicker: input.creativeBrief!.focus.name })) : [
@@ -365,10 +506,10 @@ export async function renderCampaignAssets(input: RenderInput): Promise<Rendered
     try {
       for (const [index, scene] of scenes.entries()) {
         const scenePath = join(sceneDir, `scene-${index + 1}.png`);
-        await writeFile(scenePath, await renderCampaignFrame(input, { width: 1080, height: 1920, ...scene, cta: reel.cta, role: ART_ROLES[index], variant: index, page: `${index + 1} / 4` }, normalizedImage, normalizedForeground, normalizedBackground));
+        await writeFile(scenePath, await frame(primary, { width: 1080, height: 1920, ...scene, cta: reel.cta, role: ART_ROLES[index], variant: index, page: `${index + 1} / 4` }));
         scenePaths.push(scenePath);
       }
-      await renderReel(scenePaths, join(outputDir, "instagram_reel.mp4"), { artDirected: hasArtDirection(input) });
+      await renderReel(scenePaths, join(outputDir, "instagram_reel.mp4"), { artDirected: hasArtDirection({ ...input, image: primary?.image }) });
       await record("instagram_reel.mp4", reel.id, 1080, 1920, "video");
       const cover = await readFile(scenePaths[0]);
       await writeFile(join(outputDir, "instagram_reel_cover.png"), cover);

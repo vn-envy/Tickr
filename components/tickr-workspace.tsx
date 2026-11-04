@@ -1,10 +1,13 @@
 "use client";
 
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore, type FormEvent } from "react";
 import Link from "next/link";
-import { ArrowRight, ArrowUpRight, Check, CheckCircle2, ChevronDown, ChevronRight, Compass, FileText, FlaskConical, Layers3, Lightbulb, LoaderCircle, MapPin, Palette, Plus, Rocket, Search, ShieldCheck, Sparkles, Store, Trash2, type LucideIcon } from "lucide-react";
+import { ArrowRight, ArrowUpRight, Check, CheckCircle2, ChevronDown, ChevronRight, Compass, FileText, FlaskConical, Layers3, Lightbulb, LoaderCircle, MapPin, Palette, Plus, Rocket, Search, ShieldCheck, Sparkles, Store, Trash2, WandSparkles, type LucideIcon } from "lucide-react";
 import type { RunView, SourceInput, ResearchMode } from "@/lib/research/contracts";
 import { CampaignPanel, EmptyStage, ExportPanel, OpportunitiesPanel, ResearchPanel } from "./research-panels";
+import { AutopilotExperience } from "./autopilot/autopilot-experience";
+import { AutopilotShell } from "./autopilot/autopilot-shell";
+import { VIEW_STORAGE_KEY } from "./autopilot/model";
 
 type StageId = "discover" | "investigate" | "opportunities" | "studio" | "launch";
 type Brief = { name: string; website: string; locality: string; vertical: string; goal: string };
@@ -44,7 +47,28 @@ function clearRunLink() {
   const url = new URL(window.location.href); url.searchParams.delete("run"); window.history.replaceState(null, "", url);
 }
 
+/* The one-shot Autopilot is the default; the step-by-step studio stays one switch away. */
+const viewEvent = "tickr:view";
+function subscribeView(callback: () => void) {
+  window.addEventListener(viewEvent, callback); window.addEventListener("storage", callback);
+  return () => { window.removeEventListener(viewEvent, callback); window.removeEventListener("storage", callback); };
+}
+function readView() { try { return window.localStorage.getItem(VIEW_STORAGE_KEY); } catch { return null; } }
+function chooseView(view: "autopilot" | "studio") {
+  try { if (view === "studio") window.localStorage.setItem(VIEW_STORAGE_KEY, "studio"); else window.localStorage.removeItem(VIEW_STORAGE_KEY); } catch { /* Optional storage. */ }
+  window.dispatchEvent(new Event(viewEvent)); window.scrollTo({ top: 0 });
+}
+
 export function TickrWorkspace() {
+  const [sessionView, setSessionView] = useState<"autopilot" | "studio" | null>(null);
+  const storedView = useSyncExternalStore(subscribeView, readView, () => null);
+  const view = sessionView ?? (storedView === "studio" ? "studio" : "autopilot");
+  function select(next: "autopilot" | "studio") { setSessionView(next); chooseView(next); }
+  if (view === "studio") return <StepByStepStudio onAutopilot={() => { clearRunLink(); select("autopilot"); }} />;
+  return <AutopilotShell onStudio={() => select("studio")}><AutopilotExperience onStudio={() => select("studio")} /></AutopilotShell>;
+}
+
+function StepByStepStudio({ onAutopilot }: { onAutopilot: () => void }) {
   const [activeStage, setActiveStage] = useState<StageId>("discover");
   const [brief, setBrief] = useState<Brief>(blankBrief);
   const [sources, setSources] = useState<SourceInput[]>([newSource()]);
@@ -171,7 +195,7 @@ export function TickrWorkspace() {
   return <div className="workspace">
     <a className="skip-link" href="#main-content">Skip to content</a>
     <aside className="sidebar" aria-label="Workspace navigation"><Link href="/" className="brand" aria-label="Tickr home"><span className="brand-mark" aria-hidden="true"><span /><span /><span /></span><span>tickr<span className="brand-period">.</span></span></Link><div className="workspace-label"><Store size={15} /><span>Local growth studio</span></div><div className="sidebar-section-label">YOUR CAMPAIGN</div><nav className="stage-navigation" aria-label="Campaign stages">{stages.map((stage, index) => { const Icon = stage.icon; return <button key={stage.id} type="button" className={`stage-button ${activeStage === stage.id ? "is-active" : ""}`} aria-label={stage.label} aria-current={activeStage === stage.id ? "step" : undefined} onClick={() => setActiveStage(stage.id)}><Icon size={19} strokeWidth={1.7} /><span className="stage-button-label">{stage.label}</span><span className="stage-number" aria-hidden="true">{completedStage(stage.id) ? <Check size={13} /> : `0${index + 1}`}</span></button>; })}</nav><div className="sidebar-note"><div className="sidebar-note-icon"><Layers3 size={18} /></div><strong>Grounded in your business.</strong><p>Evidence first. A clear strategy. Creative with a reason to exist.</p></div><div className="sidebar-footer"><span className="status-dot" /><span>Powered by Meta AI</span><Sparkles size={14} /></div></aside>
-    <div className="workspace-body"><header className="topbar"><div className="breadcrumbs"><span>Workspace</span><ChevronRight size={14} /><span>{active.label}</span></div><span className="local-badge">{mode === "synthetic" ? <FlaskConical size={12} /> : <span className="status-dot" />}{mode === "synthetic" ? "Synthetic demo" : "Private workspace"}</span></header>
+    <div className="workspace-body"><header className="topbar"><div className="breadcrumbs"><span>Workspace</span><ChevronRight size={14} /><span>{active.label}</span></div><div className="ap-topbar-right"><button type="button" className="ap-studio-switch" onClick={onAutopilot}><WandSparkles size={13} />Back to Autopilot</button><span className="local-badge">{mode === "synthetic" ? <FlaskConical size={12} /> : <span className="status-dot" />}{mode === "synthetic" ? "Synthetic demo" : "Private workspace"}</span></div></header>
       <main id="main-content" className="main-content"><div className="page-heading"><div><div className="eyebrow"><span>0{stageNumber}</span>{active.label}</div><h1>{activeStage === "discover" ? "Small business. Big story." : activeStage === "investigate" ? "See what makes you different." : activeStage === "opportunities" ? "Your next good move." : activeStage === "studio" ? "A story, ready to take shape." : "Your campaign, together."}</h1><p>{activeStage === "discover" ? "Drop in a business link. We’ll find its story, its market and a reason to choose it." : active.description + "."}</p></div><span className="page-step">STEP {stageNumber} OF 5</span></div>
         {restoring && <p className="connection-notice" role="status"><LoaderCircle className="spin" size={15} />Checking your saved workspace…</p>}
         {restoredRun && run && <div className="saved-run-notice" role="status"><FileText size={15} /><div><strong>Saved run · {new Date(run.createdAt).toLocaleDateString()}</strong><p>{processing ? "Following an existing run and its saved progress." : "You’re viewing stored outputs. Opening this page did not request a new analysis."}</p></div></div>}

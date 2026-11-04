@@ -1,14 +1,17 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import sharp from "sharp";
+import { z } from "zod";
 import { CampaignKitSchema, ModelUsageSchema, type BusinessContext, type BusinessEnrichment, type CampaignKit, type CampaignVisual, type CollectedSource, type ModelUsage, type ResearchMode, type ResearchOpportunity, type ResearchReport } from "../research/contracts";
 import { eligibleBusinessEvidence, generateCampaignCopy, validateCampaignCopy, validateCompletedCampaignCopy, type CampaignCopy } from "./copy";
 import { hashBytes, safeOutputPath, writeVerifiedArchive } from "./archive";
-import { normalizeCampaignImage, renderCampaignAssets, type RenderInput } from "./render";
+import { normalizeCampaignImage, probeLocalMp4Size, renderCampaignAssets, validateRenderRouting, type RenderInput } from "./render";
+import type { Channel } from "../schemas/common";
 import { prepareCampaignVisual } from "./visual";
 import { prepareCampaignLayers, type LayerAsset } from "./layers";
 import { CampaignCopyValidationError, readCompletedCopyRecord, writeCompletedCopyRecord } from "./completed-response";
 export { CampaignCopyValidationError } from "./completed-response";
+export type { PrebuiltReel, RenderImage, RoutedChannel } from "./render";
 
 export interface CreateCampaignInput {
   business: BusinessContext;
@@ -71,15 +74,21 @@ export async function readCopyCheckpoint(input: CreateCampaignInput, opportunity
   } catch { throw new Error("The campaign copy checkpoint no longer matches this run. Start a fresh run instead of retrying a paid request."); }
 }
 
-/** One bounded Meta text request, deterministic local assets, and a review-only export. */
-export async function createCampaign(input: CreateCampaignInput): Promise<{ campaign: CampaignKit; usage: ModelUsage; additionalUsage?: ModelUsage[] }> {
+export interface CampaignCopyResult { copy: CampaignCopy; usage: ModelUsage; origin?: "completed_response" }
+
+/**
+ * The copy stage alone. A valid checkpoint or input-bound completed response is always reused; a corrupt,
+ * pending or mismatched one fails closed. `reserveCopyCall` is awaited immediately before a NEW paid request only.
+ */
+export async function ensureCampaignCopy(input: CreateCampaignInput, options: { reserveCopyCall?: () => Promise<void> } = {}): Promise<CampaignCopyResult> {
   assertCampaignInput(input);
   const opportunity = input.report.opportunities.find((item) => item.id === input.opportunityId);
   if (!opportunity) throw new Error("Select an opportunity from the current research report.");
   await mkdir(input.outputDir, { recursive: true });
-  let completed = await readCopyCheckpoint(input, opportunity);
+  let completed: CampaignCopyResult | null = await readCopyCheckpoint(input, opportunity);
   if ((input.reuseCompletedCopyOnly || input.requireCompletedCopy) && !completed) throw new Error("The completed copy checkpoint is required for this retry. No Meta request was made.");
   if (!completed) {
+    await options.reserveCopyCall?.();
     completed = await generateCampaignCopy({ ...input, opportunity, onCompletedResponse: (response) => writeCompletedCopyRecord(input.outputDir, campaignInputHash(input), response) });
   }
   if (!(await readFile(safeOutputPath(input.outputDir, "copy-checkpoint.json")).then(() => true).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return false; throw error; }))) {
@@ -87,21 +96,146 @@ export async function createCampaign(input: CreateCampaignInput): Promise<{ camp
     await writeFile(pendingPath, JSON.stringify({ inputHash: campaignInputHash(input), copy: completed.copy, usage: completed.usage }), { mode: 0o600 });
     await rename(pendingPath, safeOutputPath(input.outputDir, "copy-checkpoint.json"));
   }
+  return completed;
+}
+
+/** One bounded Meta text request, deterministic local assets, and a review-only export. */
+export async function createCampaign(input: CreateCampaignInput): Promise<{ campaign: CampaignKit; usage: ModelUsage; additionalUsage?: ModelUsage[] }> {
+  const completed = await ensureCampaignCopy(input);
+  const opportunity = input.report.opportunities.find((item) => item.id === input.opportunityId)!;
   // Paid visual preparation must stay outside the retry-safe local-render catch.
   const prepared = input.image ? {
     image: input.image,
     visual: { kind: input.image.provenance === "meta_illustration" ? "meta_illustration" as const : "source_photo" as const, filename: "campaign-source-image.png", description: input.image.description, sourceIds: input.image.sourceIds, sourceUrls: [], model: null, warnings: ["Caller-supplied image; verify provenance, permissions and product fidelity before publication."] } satisfies CampaignVisual,
   } : await prepareCampaignVisual({ business: input.business, copy: completed.copy, enrichment: input.enrichment, sources: input.sources, outputDir: input.outputDir, mode: input.mode, reuseCompletedOnly: input.reuseCompletedCopyOnly, reserveModelCall: input.reserveAdditionalModelCall });
   const directed = await prepareCampaignLayers({ image: prepared.image, visual: prepared.visual, copy: completed.copy, outputDir: input.outputDir, mode: input.mode, reuseCompletedOnly: input.reuseCompletedCopyOnly, reserveModelCall: input.reserveAdditionalModelCall });
-  try {
-    const rendered = await renderConcept(input, opportunity, completed.copy, completed.usage, directed.image, directed.visual, directed.assets);
-    const additionalUsage = [...("usage" in prepared && prepared.usage ? [prepared.usage] : []), ...directed.usage];
-    return { ...rendered, ...(additionalUsage.length ? { additionalUsage } : {}) };
+  const rendered = await renderCampaignKit(input, opportunity, completed.copy, completed.usage, { image: directed.image, visual: directed.visual, layerAssets: directed.assets });
+  const additionalUsage = [...("usage" in prepared && prepared.usage ? [prepared.usage] : []), ...directed.usage];
+  return { ...rendered, ...(additionalUsage.length ? { additionalUsage } : {}) };
+}
+
+export interface CampaignExtraAsset { id?: string; filename: string; mediaType: "image" | "video" | "document"; channel: Channel | null; width?: number | null; height?: number | null }
+export interface CampaignProduction {
+  image?: RenderInput["image"];
+  visual: CampaignVisual;
+  layerAssets?: LayerAsset[];
+  render?: Pick<RenderInput, "channelImages" | "carouselImages" | "reel">;
+  /** Files already written to outputDir by an earlier local stage; hashed here and exported. */
+  extraAssets?: CampaignExtraAsset[];
+  /** Small text documents written to outputDir and exported. */
+  extraDocuments?: Array<{ filename: string; content: string }>;
+  extraReviewNotes?: string[];
+}
+
+/**
+ * Filenames the standard kit or a private run record occupies in outputDir (.data/runs/<runId>), which the copy,
+ * visual, layer, analysis and Autopilot stages share. Extras can neither replace nor export any of them.
+ */
+const RESERVED_FILENAMES = new Set([
+  "instagram_feed.png", "facebook_ads.png", "facebook_ads_portrait.png", "instagram_stories.png", "click_to_whatsapp.png", "whatsapp_status.png",
+  "instagram_carousel_1.png", "instagram_carousel_2.png", "instagram_carousel_3.png", "instagram_carousel_4.png",
+  "instagram_reel.mp4", "instagram_reel.pending.mp4", "instagram_reel_cover.png", "campaign-hero-source.png", "campaign-source-image.png",
+  "campaign-subject.png", "campaign-subject-mask.png", "campaign-backdrop.png",
+  "campaign-strategy.json", "brand-product-dossier.json", "evidence-report.json", "captions.md", "whatsapp-conversation.json", "review-report.json", "readme.txt", "manifest.json", "campaign-concept.zip",
+  "copy-checkpoint.json", "copy-checkpoint.pending.json", "copy-response.json", "copy-response.pending.json", "visual-checkpoint.json", "visual-checkpoint.pending.json", "media-acquisition.json",
+  "art-direction-checkpoint.json", "backdrop-checkpoint.json", "sam-layer-checkpoint.json", "sam-layer-diagnostic.json",
+  "analysis-response.json", "analysis-response.pending.json", "autopilot-budget.json", "autopilot-public", "state.json", "masklets.json",
+]);
+/**
+ * Private record shapes: paid-response-store markers/responses (<prefix>-request.json, -response.json,
+ * -response.pending.json), checkpoints, budgets, diagnostics and state files, plus any `.pending`/`.partial` write.
+ */
+const PRIVATE_RECORD = /(^|[-_.])(request|response|checkpoint|budget|diagnostic|state|masklets)\.json$|\.(pending|partial)(\.|$)/;
+const stripExtension = (filename: string) => filename.replace(/\.[^.]+$/, "");
+/** Asset ids the standard kit uses (including README, manifest and the ZIP's campaign-concept). */
+const STANDARD_IDS = new Set([...RESERVED_FILENAMES].map(stripExtension).concat(["README", "readme", "manifest", "campaign-concept", "campaign-hero-source"]));
+const EXTRA_FILENAME = /^[a-z0-9][a-z0-9._-]{0,100}$/;
+const EXTRA_FILE_MAX_BYTES = 95_000_000;
+const EXTRA_TOTAL_MAX_BYTES = 100_000_000;
+const ExtraAssetSchema = z.object({
+  id: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,100}$/).optional(), filename: z.string(), mediaType: z.enum(["image", "video", "document"]),
+  channel: z.enum(["facebook_ads", "instagram_feed", "instagram_carousel", "instagram_stories", "instagram_reels", "click_to_whatsapp", "whatsapp_status"]).nullable(),
+  width: z.number().int().positive().max(20_000).nullable().optional(), height: z.number().int().positive().max(20_000).nullable().optional(),
+}).strict();
+const ExtraDocumentSchema = z.object({ filename: z.string(), content: z.string().max(2_000_000) }).strict();
+const ExtraNotesSchema = z.array(z.string().trim().min(1).max(600)).max(40);
+
+/**
+ * Pure preflight, before rendering: an extra file may not overwrite, impersonate or export a standard kit file or
+ * a private run record, and its effective asset id must be unique across the whole kit. Routing input is checked too.
+ */
+function assertExtras(input: CreateCampaignInput, copy: CampaignCopy, production: CampaignProduction): void {
+  const assets = z.array(ExtraAssetSchema).max(40).safeParse(production.extraAssets ?? []);
+  const documents = z.array(ExtraDocumentSchema).max(20).safeParse(production.extraDocuments ?? []);
+  if (!assets.success || !documents.success || !ExtraNotesSchema.safeParse(production.extraReviewNotes ?? []).success) throw new Error("The extra campaign files are invalid.");
+  const reservedNames = new Set([...RESERVED_FILENAMES, ...(production.layerAssets ?? []).map((layer) => layer.filename), ...(production.visual.filename ? [production.visual.filename] : [])]);
+  const reservedIds = new Set([...STANDARD_IDS, ...[...reservedNames].map(stripExtension)]);
+  const names = new Set<string>();
+  const ids = new Set<string>();
+  const extras = [...assets.data.map((asset) => ({ filename: asset.filename, id: asset.id ?? stripExtension(asset.filename) })), ...documents.data.map((document) => ({ filename: document.filename, id: stripExtension(document.filename) }))];
+  for (const { filename, id } of extras) {
+    if (!EXTRA_FILENAME.test(filename) || PRIVATE_RECORD.test(filename) || reservedNames.has(filename) || names.has(filename)) throw new Error("An extra campaign file name is invalid or collides with a standard kit file.");
+    if (reservedIds.has(id) || ids.has(id)) throw new Error("An extra campaign asset id is invalid or collides with a standard kit asset.");
+    safeOutputPath(input.outputDir, filename);
+    names.add(filename);
+    ids.add(id);
   }
+  if (Buffer.byteLength(documents.data.map((document) => document.content).join(""), "utf8") > EXTRA_TOTAL_MAX_BYTES) throw new Error("The extra campaign files are too large to export.");
+  validateRenderRouting({ channels: copy.channels, ...production.render });
+}
+
+/**
+ * Inspect the caller's existing extra files before rendering: regular files only (no symlinks), bounded per file and
+ * in total, images decoded and videos probed so the recorded dimensions are the real ones. Errors name no local path.
+ */
+async function inspectExtraAssets(input: CreateCampaignInput, production: CampaignProduction): Promise<CampaignKit["assets"]> {
+  for (const document of production.extraDocuments ?? []) {
+    // A retry rewrites its own earlier document; anything other than a regular file is never written through.
+    const info = await lstat(safeOutputPath(input.outputDir, document.filename)).catch((error: NodeJS.ErrnoException) => (error.code === "ENOENT" ? null : error));
+    if (info instanceof Error || (info && !info.isFile())) throw new Error(`The extra campaign document ${document.filename} would replace something other than a regular file.`);
+  }
+  const extras: CampaignKit["assets"] = [];
+  let total = Buffer.byteLength((production.extraDocuments ?? []).map((document) => document.content).join(""), "utf8");
+  for (const extra of production.extraAssets ?? []) {
+    const path = safeOutputPath(input.outputDir, extra.filename);
+    const info = await lstat(path).catch(() => null);
+    if (!info?.isFile() || info.size < 1 || info.size > EXTRA_FILE_MAX_BYTES || (total += info.size) > EXTRA_TOTAL_MAX_BYTES) throw new Error(`The extra campaign file ${extra.filename} is missing, empty, not a regular file or too large to export.`);
+    let bytes: Buffer;
+    try { bytes = await readFile(path); }
+    catch { throw new Error(`The extra campaign file ${extra.filename} could not be read.`); }
+    if (bytes.length !== info.size) throw new Error(`The extra campaign file ${extra.filename} changed while it was inspected.`);
+    let { width = null, height = null } = extra;
+    if (extra.mediaType === "document") { width = null; height = null; }
+    else {
+      const measured = extra.mediaType === "image"
+        ? await sharp(bytes, { limitInputPixels: 40_000_000, failOn: "error" }).metadata().then(({ width: w, height: h }) => (w && h ? { width: w, height: h } : null), () => null)
+        : await probeLocalMp4Size(path);
+      if (!measured || (width !== null && width !== measured.width) || (height !== null && height !== measured.height)) throw new Error(`The extra campaign ${extra.mediaType} ${extra.filename} could not be decoded or does not match its declared size.`);
+      ({ width, height } = measured);
+    }
+    extras.push({ id: extra.id ?? stripExtension(extra.filename), channel: extra.channel, filename: extra.filename, mediaType: extra.mediaType, width, height, sha256: hashBytes(bytes), bytes: bytes.length });
+  }
+  return extras;
+}
+
+/**
+ * Local rendering and the verified export for already-completed copy and visuals. No Meta request happens here.
+ * Caller errors (routing, extra names, ids and the existing extra files) are plain Errors raised before anything is
+ * rendered; any later local failure becomes a retry-safe CampaignRenderError.
+ */
+export async function renderCampaignKit(input: CreateCampaignInput, opportunity: ResearchOpportunity, copy: CampaignCopy, usage: ModelUsage, production: CampaignProduction): Promise<{ campaign: CampaignKit; usage: ModelUsage }> {
+  if (opportunity.id !== input.opportunityId) throw new Error("Select an opportunity from the current research report.");
+  assertExtras(input, copy, production);
+  const extras = await inspectExtraAssets(input, production);
+  try { return await renderConcept(input, opportunity, copy, usage, production, extras); }
   catch { throw new CampaignRenderError(); }
 }
 
-async function renderConcept(input: CreateCampaignInput, opportunity: ResearchOpportunity, copy: CampaignCopy, usage: ModelUsage, image: RenderInput["image"], visual: CampaignVisual, layerAssets: LayerAsset[] = []): Promise<{ campaign: CampaignKit; usage: ModelUsage }> {
+async function renderConcept(input: CreateCampaignInput, opportunity: ResearchOpportunity, copy: CampaignCopy, usage: ModelUsage, production: CampaignProduction, extras: CampaignKit["assets"]): Promise<{ campaign: CampaignKit; usage: ModelUsage }> {
+  let { image, visual } = production;
+  const layerAssets = production.layerAssets ?? [];
+  const routing = production.render ?? {};
+  const routedImages = Boolean((routing.channelImages && Object.values(routing.channelImages).some(Boolean)) || routing.carouselImages);
   // Export the normalized local raster used for composition, without replacing visual checkpoints.
   let sourceImageAsset: CampaignKit["assets"][number] | null = null;
   if (image) {
@@ -113,12 +247,13 @@ async function renderConcept(input: CreateCampaignInput, opportunity: ResearchOp
     visual = { ...visual, filename };
     sourceImageAsset = { id: "campaign-hero-source", channel: null, filename, mediaType: "image", width: metadata.width!, height: metadata.height!, sha256: hashBytes(bytes), bytes: bytes.length };
   }
-  const rendered = await renderCampaignAssets({ businessName: input.business.name, vertical: input.business.vertical, mode: input.mode, campaignName: copy.name, channels: copy.channels, outputDir: input.outputDir, creativeBrief: copy.creativeBrief, image });
+  const rendered = await renderCampaignAssets({ businessName: input.business.name, vertical: input.business.vertical, mode: input.mode, campaignName: copy.name, channels: copy.channels, outputDir: input.outputDir, creativeBrief: copy.creativeBrief, image, ...(routing.channelImages ? { channelImages: routing.channelImages } : {}), ...(routing.carouselImages ? { carouselImages: routing.carouselImages } : {}), ...(routing.reel ? { reel: routing.reel } : {}) });
   const reviewNotes = [...new Set([
     "Concept only: verify every factual claim, caption, offer and CTA with the business owner before use.",
-    visual.kind === "meta_illustration" ? "The shared hero image is an AI-generated illustration, not a photograph of this business's actual product. Confirm product fidelity and use authorized real photographs for exact product representation." : visual.kind === "source_photo" ? "The same source image is composed across the campaign. Confirm usage permission and that it depicts the intended business offering." : "No product image is included. Confirm brand direction and add authorized imagery where needed.",
+    routedImages ? "Different images are routed to individual placements and carousel slides; each frame's footer names its image provenance. Confirm usage permission and that every routed image depicts the intended business offering." : visual.kind === "meta_illustration" ? "The shared hero image is an AI-generated illustration, not a photograph of this business's actual product. Confirm product fidelity and use authorized real photographs for exact product representation." : visual.kind === "source_photo" ? "The same source image is composed across the campaign. Confirm usage permission and that it depicts the intended business offering." : "No product image is included. Confirm brand direction and add authorized imagery where needed.",
     "The visual palette and layout are a proposed campaign interpretation, not a verified brand guide.",
     ...visual.warnings,
+    ...(production.extraReviewNotes ?? []).map((note) => note.trim()),
     "WhatsApp Status is a creative concept; advertiser and regional placement eligibility has not been checked. Suggested messages are not a deployed messaging integration.",
     ...(input.mode === "synthetic" ? ["Synthetic demonstration: the business facts and campaign are illustrative, not real market findings or customer results."] : []),
     ...copy.reviewNotes,
@@ -136,6 +271,7 @@ async function renderConcept(input: CreateCampaignInput, opportunity: ResearchOp
     if (bytes.length !== layer.bytes || hashBytes(bytes) !== layer.sha256) throw new Error("A campaign layer changed before export.");
     campaign.assets.push({ id: layer.filename.replace(/\.[^.]+$/, ""), channel: null, mediaType: "image", ...layer });
   }
+  campaign.assets.push(...extras);
 
   const addDocument = async (filename: string, content: string) => {
     const bytes = Buffer.from(content, "utf8");
@@ -167,10 +303,10 @@ async function renderConcept(input: CreateCampaignInput, opportunity: ResearchOp
     checks: [
       { id: "channel-inventory", status: "pass", reason: "All seven channel adaptations are present." },
       { id: "evidence-references", status: "pass", reason: "Copy references selected source-attributed business claims. Reported signals remain unverified; this checks references, not semantic entailment or current availability." },
-      { id: "local-media", status: "pass", reason: "PNG dimensions and the four-scene MP4 encoding/duration were checked locally." },
+      { id: "local-media", status: "pass", reason: routing.reel ? "PNG dimensions and the adopted Reel's encoding, frame count and duration were checked locally." : "PNG dimensions and the four-scene MP4 encoding/duration were checked locally." },
       { id: "owner-and-contextual-review", status: "needs_owner", reason: "Owner factual, brand, category, placement and final-copy review has not been completed." },
     ],
-    assets: rendered.map(({ filename, sha256, bytes }) => ({ filename, sha256, bytes })), reviewNotes,
+    assets: [...rendered, ...extras].map(({ filename, sha256, bytes }) => ({ filename, sha256, bytes })), reviewNotes,
   }));
   await addDocument("README.txt", [
     `TICKR — ${copy.name}`, "CONCEPT PACKAGE — REVIEW REQUIRED", `Source mode: ${input.mode}`, "",
@@ -181,6 +317,8 @@ async function renderConcept(input: CreateCampaignInput, opportunity: ResearchOp
     "manifest.json records the bytes of all preceding assets/documents. It excludes itself and this ZIP to avoid a circular checksum.",
     "The server inventory additionally records the manifest and ZIP hashes. A changed file invalidates its matching hash.", "",
   ].join("\n"));
+  for (const document of production.extraDocuments ?? []) await addDocument(document.filename, document.content);
+  if (new Set(campaign.assets.map((asset) => asset.id)).size !== campaign.assets.length || new Set(campaign.assets.map((asset) => asset.filename)).size !== campaign.assets.length) throw new Error("Campaign asset identifiers must be unique.");
   await addDocument("manifest.json", json({ campaignId: campaign.id, status: campaign.status, mode: campaign.mode, createdAt: campaign.createdAt, schemaVersion: "concept-v1", inventory: [...campaign.assets], checksumScope: "Every listed file; manifest and enclosing ZIP excluded to avoid circular hashes." }));
   const archive = await writeVerifiedArchive(input.outputDir, campaign.assets);
   campaign.assets.push({ id: "campaign-concept", channel: null, filename: "campaign-concept.zip", mediaType: "archive", width: null, height: null, ...archive });
