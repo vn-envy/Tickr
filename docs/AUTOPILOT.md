@@ -2,7 +2,7 @@
 
 Updated 4 November 2026 (IST). **Autopilot** is the one-shot product flow. The owner shares a Google Maps listing or website link and a campaign goal, and Tickr works autonomously until there is a **review-ready** campaign kit with reel-worthy content. The owner then gives **one** approval, bound to the exact file hashes. Nothing is published, no ad budget is spent and no message is sent.
 
-This page describes what is implemented and tested **offline**. On 4 November the engine had **not yet been run end to end against live Meta APIs** with the new modules, because this build session had no `META_API_KEY`. Earlier live checks (Spark research and copy, Muse Image generation, one SAM image mask) are recorded in [setup verification](SETUP_VERIFICATION.md). Treat every capability marked *live-unverified* below as an assumption until `npm run autopilot:check` passes with a key.
+Live verification status (4 November 2026): `npm run autopilot:check` passed all 7 steps against the live Meta API on synthetic media. It made 6 paid requests: 3 Muse Spark and 3 SAM 3.1. The full end-to-end Autopilot path through the app and worker is verified offline (614 tests, production build, browser flow). A live end-to-end run on real businesses is the next recorded check; see [setup verification](SETUP_VERIFICATION.md).
 
 ## The owner's experience
 
@@ -84,10 +84,29 @@ npm run autopilot:check       # LIVE: every Autopilot Meta operation on syntheti
 
 `autopilot:check` writes `.data/autopilot-live-check/<time>/report.json` with each step's model, timing, response ID, usage and a fixed diagnostic code. It also prints a clearly labelled list-price estimate. It never records keys, prompts containing owner data, or raw provider bodies.
 
-### Still live-unverified (4 November)
+### Live capability results (4 November 2026, synthetic media)
 
-- That Spark's grounded boxes land on real products well enough to drive SAM box prompts. Measure the box-to-mask agreement.
-- That SAM 3.1 echoes geometry object IDs, how it represents video frames with no objects, its video usage field names, and its latency on a 12 s clip sent inline.
-- That Spark accepts inline MP4 input for shot logs and the critic within the client timeouts.
-- That the Graph API accepts the form-POST code exchange and token upgrade, and which CDN hostnames media is served from.
-- How strict JSON schemas behave with multimodal Responses input.
+| Step | Result |
+| --- | --- |
+| Spark media analysis (2 images) | 6.0 s. Grounded boxes and labels for both subjects ("white coffee cup", "orange preserve jar") |
+| SAM 3.1 box prompt from Spark's box | 1.0 s. One object, confidence 0.988 |
+| SAM 3.1 concept prompt | 1.0 s. One object, confidence 0.922; bounds within about 6 px of the drawn subject |
+| Spark shot log (inline 4 s MP4) | 3.4 s. One moment, correct subject, no people or speech |
+| SAM 3.1 video tracking (concept) | 5.6 s. Subject tracked in 120 of 120 frames, mean confidence 0.94; usage reported as `video_frames_processed` |
+| Local depth Reel, tracked Reel and overlay | Contracts met; zero generated pixels on the subject |
+| Spark critic (still + inline Reel) | 15.7 s. Grounded findings with timestamps |
+
+The list-price estimate for the whole probe was about USD 0.06; this is an estimate, not an invoice. The run also surfaced visual issues, which are now fixed:
+
+- jagged edges on an upscaled mask;
+- specks in the cutout;
+- the moving subject hiding the hook headline;
+- a low-contrast subtitle;
+- a wrong end-card label.
+
+### Still live-unverified
+
+- How accurate Spark's boxes are on real busy product photos, as opposed to synthetic ones.
+- SAM 3.1 behaviour on long or crowded real footage and on video frames with no objects.
+- The Graph API's acceptance of the form-POST code exchange and token upgrade, and the real CDN hostnames.
+- Inline payload limits for long Reels sent to the critic.

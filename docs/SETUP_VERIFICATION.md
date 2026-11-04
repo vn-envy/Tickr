@@ -1,3 +1,22 @@
+# Setup verification — 4 November 2026 (Autopilot build)
+
+These checks ran in cloud instances on the `claude/epic-davinci-lhcj86` branch. Dates are UTC.
+
+| Check | Observed result |
+| --- | --- |
+| Code checks | `npm run check` passed: ESLint, TypeScript and **614 tests across 56 files** |
+| Production build | `npm run build` passed; it includes the new Autopilot routes |
+| Media diagnostic | `npm run media:check` passed, including the offline depth Reel contract (1080×1920, 30 fps, 360 frames, H.264) |
+| Persistence/API | `npm run smoke` passed against the production server |
+| Browser flow (production) | Playwright ran intake → consented synthetic upload → Autopilot start → director's room with no console errors. Without a key, the worker stopped before discovery with no Meta request, and the UI showed the stopped state |
+| Same-origin fix | Browser writes failed in production because Next binds to `0.0.0.0`. Fixed to compare Origin with the Host header plus a host allowlist; regression-tested |
+| Live Meta capability probe | `npm run autopilot:check`, run in a separate session with `META_API_KEY`: **7/7 steps passed** (Spark media analysis, SAM 3.1 box and concept segmentation, Spark shot log, SAM 3.1 video tracking, local Reels, Spark critic). 6 paid requests; list-price estimate about USD 0.06 |
+| Adversarial review | 6 lenses; 20 findings confirmed by two independent skeptics; all fixed with regression tests and independently re-checked |
+
+The live probe used synthetic local media only. It verifies request and response shapes and basic quality on simple subjects. It does not show Spark box accuracy on busy real photos, campaign effectiveness, or that the Graph connector works. A live end-to-end Autopilot run on real businesses is recorded separately once complete.
+
+---
+
 # Setup verification — 2 November 2026
 
 Dates use IST; saved artifacts retain UTC timestamps. These checks ran in the current cloud instance. Snapshot restoration has not been independently tested. Outputs remain campaign concepts requiring review.
