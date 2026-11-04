@@ -11,3 +11,6 @@ lib/generated/
 coverage/
 *.log
 .DS_Store
+
+# Python bytecode (deploy/modal_app.py checks)
+__pycache__/
