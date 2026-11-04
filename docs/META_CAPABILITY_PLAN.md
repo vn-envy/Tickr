@@ -1,8 +1,8 @@
 # Tickr — Meta-native capability plan (SAM 3.1 + Muse)
 
-Drafted 4 November 2026 (IST). This is a **proposal**. Nothing in it is implemented or live-verified yet. [BUILD_PLAN.md](../BUILD_PLAN.md) and [ARCHITECTURE.md](ARCHITECTURE.md) remain the contracts. Every new operation below needs its own recorded capability probe in [SETUP_VERIFICATION.md](SETUP_VERIFICATION.md) before the product depends on it.
+Drafted 4 November 2026 (IST). Revision 2: no deadline constraints, ambitious scope. This is a **proposal**; nothing here is implemented or live-verified yet. [BUILD_PLAN.md](../BUILD_PLAN.md) and [ARCHITECTURE.md](ARCHITECTURE.md) remain the binding contracts until this plan is adopted into them. Every new Meta operation needs its own recorded live probe in [SETUP_VERIFICATION.md](SETUP_VERIFICATION.md) before the product depends on it.
 
-Capability facts come from Meta's developer docs, retrieved 4 November 2026: [models](https://dev.meta.ai/docs/models), [SAM overview](https://dev.meta.ai/docs/sam/overview), [SAM segmenting](https://dev.meta.ai/docs/sam/segmenting), [SAM cookbook](https://dev.meta.ai/docs/cookbook/sam), [image understanding](https://dev.meta.ai/docs/image-understanding), [video understanding](https://dev.meta.ai/docs/video-understanding), [image generation](https://dev.meta.ai/docs/image-generation), [image edits](https://dev.meta.ai/docs/api-reference/images/edit-image) and [pricing/rate limits](https://dev.meta.ai/docs/pricing-rate-limits). Prices and limits can change, so re-check them before relying on any cost ceiling.
+Capability facts come from Meta developer docs retrieved 4 November 2026: [models](https://dev.meta.ai/docs/models), [SAM overview](https://dev.meta.ai/docs/sam/overview), [SAM segmenting](https://dev.meta.ai/docs/sam/segmenting), [SAM cookbook](https://dev.meta.ai/docs/cookbook/sam), [image understanding](https://dev.meta.ai/docs/image-understanding), [video understanding](https://dev.meta.ai/docs/video-understanding), [image generation](https://dev.meta.ai/docs/image-generation), [image edits](https://dev.meta.ai/docs/api-reference/images/edit-image) and [pricing/rate limits](https://dev.meta.ai/docs/pricing-rate-limits). Prices and limits can change, so re-check them before relying on any cost ceiling.
 
 ---
 
@@ -10,40 +10,47 @@ Capability facts come from Meta's developer docs, retrieved 4 November 2026: [mo
 
 | Area | What exists | What's left unused |
 | --- | --- | --- |
-| **SAM 3.1** | One image request per run, one text concept (the offering name), one-bit masks, union of matches, one fixed subject layer. One live probe passed. A saved response passed full rendering. The Tiger Lily live attempt failed and its cause was not retained. | Video input and **cross-frame tracking**, **box and point prompts** (up to 16 objects in one request), stable object IDs, per-object (not unioned) layers, confidence-driven selection, `propagation_direction`, the Files API, and SAM as a QA instrument. |
-| **Muse Spark 1.3** | Discovery and investigation (native search, ≤5 + ≤10 actions), strict-JSON analysis, copy. | **Image understanding with grounded coordinates** (points, boxes and counts on a 0–1000 grid, up to 50 images per request), **video understanding** (frames plus embedded audio), visual critique of our own rendered output. |
-| **Muse Image 1.0** | `/images/generations`, one inline PNG, tools disabled. JSON reference editing is implemented but not live-tested. | **Multi-reference composition** (1–10 images per edit), multi-turn editing via Responses, `n` > 1 for variants, `size` aspect-ratio control for each placement. |
-| **Muse Wonder 1.0** | Listed in the catalog, never called. | Highest-effort reasoning for the one or two decisions that matter most: opportunity ranking and the final critic. |
-| **Muse Voice Transcribe** | Not used. | Owner voice notes in 25 languages with turn timestamps, as a low-friction **owner-stated** evidence channel. |
-| **Reel** | Four Sharp/SVG scenes plus FFmpeg whole-scene pan/zoom. No subject motion. | Layered motion from real tracked masks: subject pop-out, text behind the subject, tracked callouts, background treatment and subject-aware reframing. |
-| **Budget** | Flat cap of 6 Meta requests: 4 text + 2 visual. | A per-role ledger that SAM's pricing makes cheap: $2.50 per 1,000 images and $0.20 per 1,000 video frames (minimum 50 frames per request). |
+| **SAM 3.1** | One image request per run, one text concept (the offering name), one-bit masks, union of matches, one fixed subject layer. One live probe passed. A saved response passed full rendering. The Tiger Lily live attempt failed and its cause was not retained. | **Video tracking** (≤16 objects per frame, ≤15,000 frames, stable IDs, `propagation_direction`), **box and point prompts** (≤16 objects in one request, negative points), per-object layers, every-instance concept results, `include_confidence`, streaming, the Files API, and SAM as a QA instrument. |
+| **Muse Spark 1.3** | Discovery and investigation (native search, ≤5 + ≤10 actions), strict-JSON analysis, copy. | **Grounded image understanding** (points, boxes and counts on a 0–1000 grid, ≤50 images per request), **video understanding** (frames plus embedded audio), tool calling over our own tools, vision critique of rendered output. |
+| **Muse Wonder 1.0** | Listed in the catalog, never called. | Long-horizon agent with **parallel tool calls and sub-agents**, 1M context, `max` reasoning effort, plus image, video and audio understanding. |
+| **Muse Image 1.0** | `/images/generations`, one inline PNG, tools disabled. Reference editing is implemented but not live-tested. | **Multi-reference composition** (1–10 images per edit), multi-turn editing via Responses, `n` up to 10 variants, a `size` aspect ratio for each placement. |
+| **Muse Voice Transcribe** | Not used. | File and **realtime** transcription with diarization, voice-activity detection, keyword biasing, 25 languages and turn timestamps. |
+| **Meta platform APIs** | Not used (optional adapters, P2). | With owner authorization: Instagram and Facebook media and insights, Marketing API drafts, and the WhatsApp Cloud API. These close the loop from creative to measured outcome. |
+| **Reel** | Four Sharp/SVG scenes plus FFmpeg whole-scene pan/zoom. No subject motion. | Layered motion from real tracked masks, speaker-anchored captions, mask-based transitions, edits cut from the transcript, and variants per audience. |
+| **Budget** | Flat cap of 6 Meta requests: 4 text + 2 visual. | A per-role ledger. SAM is very cheap: $2.50 per 1,000 images, $0.20 per 1,000 video frames (minimum 50 frames per request). |
 
-**Diagnosis.** Today SAM is used as a background remover, which is its weakest showcase. SAM 3.1's distinctive strengths are open-vocabulary concept segmentation of **every instance**, **prompting by box and point**, and **tracking objects through video with stable identities**. Tickr's whole philosophy is real pixels, provenance and no fabrication. SAM is exactly the model that lets real products move, layer and reframe without a generative model inventing anything. That is the story to build around.
+**Diagnosis.** Today Tickr uses SAM as a background remover, its least distinctive use. SAM 3.1's real strengths are finding **every instance** of an open-vocabulary concept, accepting **box and point** prompts, and **tracking objects through video with stable identities**. Tickr's whole philosophy is real pixels, provenance and no fabrication. SAM is the model that lets a business's real products and people move, layer and reframe without a generative model inventing anything. The product should be built around that.
 
 ---
 
 ## 2. Product thesis
 
-> **"Your real shop, cinematically produced, with zero invented pixels on the product."**
-> The owner pastes a link and, optionally, records a 20-second phone clip or voice note. Spark finds the story. Spark sees and points at the product. SAM cuts it out and tracks it through the owner's own footage. Muse builds the set around it. Spark then watches the finished Reel and critiques it. Every product pixel in the final kit can be traced back to a source frame.
+> **Tickr becomes an AI creative studio that turns a shop's own reality into cinema.**
+> The owner pastes a link and, optionally, walks the shop with their phone, talking. Wonder directs. Spark researches, watches and points. SAM cuts out and tracks the real cake, the real hands and the real storefront through the owner's own footage. Muse builds sets around them. Voice Transcribe turns the owner's words into evidence and captions. Spark then watches every Reel it made and critiques it. Every product pixel and every claim traces back to a source frame, a source page or a timestamp in the owner's voice.
 
-Five Meta models work in one flow, each in the role it is strongest at:
+Six Meta capability families in one loop:
 
 ```mermaid
-flowchart LR
-  L[Link / voice note / phone clip] --> S1[Spark: discover + investigate]
-  L --> VT[Voice Transcribe: owner story]
-  L --> SV[Spark video understanding: best moments + timestamps]
-  S1 --> W[Wonder: opportunity ranking + blueprint]
-  SV --> G[Spark grounding: boxes/points on key frames]
-  G --> SAM[SAM 3.1: box-prompted masks + video tracking]
-  SAM --> MI[Muse Image: multi-reference set / backdrop plates]
-  SAM --> R[Local layered compositor + FFmpeg]
-  MI --> R
-  R --> C[Spark vision + video critic]
-  C --> SQA[SAM fidelity QA]
-  SQA -->|pass, hashes bound| X[Export]
-  C -->|bounded revision| R
+flowchart TD
+  IN[Link + phone walk-through + voice] --> R[Spark: discovery + investigation]
+  IN --> VT[Voice Transcribe: diarized owner/staff speech]
+  IN --> VU[Spark video understanding: shot log]
+  R --> DIR[Wonder creative director agent]
+  VT --> DIR
+  VU --> DIR
+  DIR -->|tool calls| GR[Spark grounding: boxes/points]
+  DIR -->|tool calls| SAM[SAM 3.1: box-prompted masks, multi-instance, video tracking]
+  DIR -->|tool calls| MI[Muse Image: multi-reference sets/plates]
+  DIR -->|tool calls| RC[Local layered compositor + FFmpeg]
+  GR --> SAM
+  SAM --> RC
+  MI --> RC
+  RC --> CR[Spark/Wonder vision + video critic]
+  CR --> QA[SAM fidelity + consent/rights gates]
+  QA -->|fail: new version| DIR
+  QA -->|pass, hashes bound| OWN[Owner approval]
+  OWN --> EX[Export kit] --> PUB[Optional authorized Meta publishing + insights]
+  PUB -->|measured outcomes| DIR
 ```
 
 ---
@@ -52,184 +59,179 @@ flowchart LR
 
 ### Pillar A: "Spark points, SAM cuts" (grounded segmentation)
 
-**Problem.** A text concept such as "Grandma's Victoria sponge" is ambiguous for SAM and can return nothing, as the Tiger Lily failure may illustrate. A union of every match also merges unrelated objects into one layer.
+A text concept such as "Grandma's Victoria sponge" is ambiguous and can return nothing, which may explain the Tiger Lily failure. Merging every match also fuses unrelated objects into one layer.
 
-**Design.**
-1. Send each candidate source image (official-site media and owner uploads, up to 50 per request) to Spark image understanding with strict JSON output. Ask for the named offering's box, the logo box, people and faces, embedded text regions, competitor or third-party branding, and a count of repeated items.
-2. Convert Spark's 0–1000 coordinates into source pixels, clamping values such as 1001. Build **one SAM box-prompt request** covering up to 16 named objects (`<0f>` frame marker, `<|box;…|>` tokens, with `w` and `h` equal to the displayed size).
-3. Keep **per-object layers**, each with its own object ID, mask, box and `include_confidence`. Do not union them. The compositor can then place the product, the logo and a secondary item independently.
-4. Fallback order: Spark-box prompt → text-concept prompt → labelled crop. Retain the raw response and diagnostics for every failure, so a failure like Tiger Lily's is always explainable.
+1. Spark image understanding (≤50 images per request, strict JSON) returns boxes for the named offering, the logo, people and faces, text regions and third-party branding, plus counts of repeated items.
+2. Map the 0–1000 grid to source pixels and clamp out-of-range values. Build **one SAM box-prompt request** for up to 16 named objects (`<0f>`, `<|box;…|>`, with `w` and `h` equal to the displayed size).
+3. Keep **per-object layers**, each with its own ID, mask, box and `include_confidence`. Do not union them.
+4. Fallback order: Spark box → text concept → labelled crop. Retain the raw response and diagnostics for every failure.
 
-**Why it matters.** It makes segmentation dramatically more reliable. A single SAM call can serve many uses, and the box ties every mask to a model-grounded label that the evidence ledger can store as an image-region provenance record. Spark's box is a *located claim*, not proof of identity.
+Spark's box is a *located observation* and SAM's mask is a *selection*. Neither proves product identity.
 
-**Cost.** One Spark vision call plus one SAM image call (about $0.0025).
+### Pillar B: owner footage → tracked real-product cinema (SAM 3.1 video)
 
-### Pillar B: owner phone clip → tracked real-product motion (SAM 3.1 video)
+1. The owner uploads one or more 10–60 s phone clips, or records them in the browser. Validate the container and codec (MP4/MOV, H.264/H.265), re-mux with `+faststart`, strip GPS and other metadata, and record rights and consent.
+2. Upload each clip **once** to the Meta Files API (`purpose: user_data`). Reuse the `file_id` for Spark and SAM, then delete it after the run. Never send an arbitrary remote `video_url`.
+3. **Spark video understanding** produces a structured **shot log**: timestamped moments (hero product, process, hands, storefront, interior), steadiness, light, people present and embedded speech.
+4. **Spark grounding** on chosen prompt frames returns boxes. **SAM video tracking** then runs with box prompts on those frames and the narrowest `propagation_direction`. It returns masklets for up to 16 objects with stable IDs (product, hands, logo, signage, cup), streamed and keyed by frame marker.
+5. Masklets are stored as compressed one-bit frame sequences under `.data/`, hashed and bound to the source clip.
 
-This is the headline feature.
+**Cost.** A 30 s clip at 30 fps is 900 frames, about $0.18 of SAM.
 
-**Flow.**
-1. The owner uploads a 10–30 s phone clip: the product on the counter, the tray coming out of the oven, the storefront. Validate it as MP4/MOV with H.264/H.265, apply size and duration limits, re-mux with `-movflags +faststart`, and strip location metadata.
-2. Upload the clip **once** to the Meta Files API (`purpose: user_data`) and reuse the same `file_id` for both Spark and SAM. Delete the file after the run. Never use `video_url` with an arbitrary remote host.
-3. **Spark video understanding** returns structured shots: the best hero moment, an action moment, steadiness, lighting, whether people or faces appear, and a transcript of embedded speech. All of it is stored as *observed signal*, not fact.
-4. **Spark grounding** on the chosen prompt frame produces a box for the product (and the logo, if present).
-5. **SAM 3.1 video tracking** takes box prompts on frame N with `propagation_direction` set to the narrowest needed window (`forward` from the hero moment). It returns masklets for up to 16 objects with stable IDs, streamed frame by frame.
-6. A local compositor uses the masklets, with no generative video:
-   - **Subject pop-out:** the real product stays sharp while the background is desaturated, darkened, blurred or replaced by a Muse plate.
-   - **Depth layering:** the headline sits *behind* the product and the CTA in front.
-   - **Tracked callouts:** an offering name or approved price tag pinned to the moving product (shown only when evidence permits it).
-   - **Subject-aware reframe:** horizontal footage converted to 9:16, 4:5 and 1:1 with the crop window following the track centroid.
-   - **Animated sticker loops** for Stories and Status, following the Meta cookbook's "video to animated stickers" pattern.
-7. The Reel becomes hook (real footage, tracked pop-out) → proof (product close-up) → value (story line from the owner's voice) → CTA. The existing four-scene contract stays and gains real subject motion.
+### Pillar C: the cinematic compositor (local, deterministic, mask-driven)
 
-**Integrity rules.** Product pixels are always decoded source frames multiplied by the mask. Generated plates are labelled as generated. Any frame with people requires a recorded owner consent statement before export. If tracking is lost (an object drops out), cut to the next scene. Never interpolate or fabricate frames.
+Every effect uses real decoded frames multiplied by SAM masks, rendered with Sharp and FFmpeg. There is no generative video.
 
-**Cost.** A 10 s clip at 30 fps is about 300 frames, roughly $0.06 of SAM tracking. This is the cheapest high-impact item in the plan.
+- **Subject pop-out:** the real product stays sharp while the background is desaturated, darkened, blurred or replaced by a Muse plate.
+- **Depth-layered kinetic typography:** words pass *behind* the tracked product and the CTA sits in front, updated per frame from the masklet.
+- **Tracked callouts:** offering names, or approved prices only, pinned to the moving object's track.
+- **Mask transitions:** a wipe shaped like the product's silhouette, match-cuts between shots of the same object ID, and iris reveals from the subject's centroid.
+- **2.5D parallax from stills:** split foreground, midground and background (for example product / counter / room) with several concept or box requests, then move them at different speeds.
+- **Subject-aware reframing:** each placement (9:16, 4:5, 1:1, carousel) is cropped from horizontal or vertical footage with a crop window that follows the track centroid, using smoothing and lookahead.
+- **Process montage:** with consent, tracked "hands" shots tell a "made by hand" story without inventing a single frame.
+- **Animated stickers:** transparent loops of the tracked product for Stories and Status, following the cookbook pattern.
 
-**Prerequisite.** Owner uploads (still open in BUILD_PLAN §12) need validation, rights and consent records, and private storage under `.data/`.
+If tracking is lost, the shot ends. The compositor never interpolates or fabricates frames.
 
-### Pillar C: interactive "tap to cut" refinement
+### Pillar D: voice-first owner and staff evidence
 
-In the workspace, the owner taps a product in a photo or on a paused video frame. That tap becomes a SAM point prompt. A mask preview appears within seconds (the probe measured about 3.2 s). Tapping where the mask is wrong adds a negative point (`-<|point…|>`). Selecting a different object starts a new object ID.
+- **File transcription** of the owner's walk-through audio and voice notes, with **diarization**. **Keyword biasing** uses named offerings and the business name.
+- **Realtime "interview mode"** over the realtime WebSocket. Tickr shows its 3 material questions on screen, the owner answers aloud, and owner-stated facts stream in live. Meta has no TTS, so questions stay as text.
+- Spark extracts **owner-stated facts**, each linked to an audio timestamp the owner can replay.
+- **Speaker-anchored captions:** diarized turns are matched to SAM-tracked people, following the cookbook's multi-speaker captions recipe, and rendered as collision-aware caption bubbles.
+- **Edits cut from the transcript:** the director chooses cut points on sentence boundaries, so the Reel uses the owner's real voice and words. The only audio is the owner's own recording, with rights recorded.
 
-- This gives the owner direct control over what counts as "the product". The selection is recorded as **owner-confirmed region**, a stronger provenance than any model guess.
-- It makes for a memorable live demo moment that clearly shows SAM.
-- Each refinement is a separate, explicitly user-initiated request with its own small budget, for example 8 refinements per asset. Refinements are never auto-retried.
+### Pillar E: Wonder as the agentic creative director
 
-### Pillar D: multi-instance "shelf to catalog"
+Replace the fixed linear pipeline after research with a **bounded tool-calling agent** on `muse-wonder-1.0`, using parallel tool calls and sub-agents. All guardrails sit inside the tools, not in the prompt:
 
-A concept prompt returns **every instance** in an image. Running "cake", "loaf" or "pastry" on a display-counter photo produces one crop per item. Spark (with all crops in a single request) labels each crop and matches it against named offerings from the evidence ledger.
+| Tool | Executes | Guard inside the tool |
+| --- | --- | --- |
+| `ground_objects` | Spark vision | Coordinate clamping, schema validation |
+| `segment` / `track` | SAM 3.1 | Per-role budget, saved raw response, no auto-retry |
+| `make_plate` | Muse Image edits | Empty-set prompt policy, `enable_*` search/shell off, no product pixels |
+| `compose_scene` / `render_reel` | Local compositor | Composition-type provenance, text-over-subject check |
+| `critique` | Spark/Wonder vision critic | Findings bound to asset hashes |
+| `cite` | Evidence ledger lookup | Only supported or owner-confirmed claims can enter copy |
 
-- The output is a visual catalog. Each entry is either *matched to source-named offering X* or *unmatched visual item (needs owner name)*. This attacks the "no named offering" gap seen in Grandma Daphne's run: the owner confirms names instead of typing a menu.
-- The catalog feeds carousel slides ("4 bakes worth the trip"), Status creative and the CTWA conversation kit.
-- Counts appear only as observations ("12 items visible in the inspected photo"), never as menu size or inventory.
+The director plans an **edit decision list** (EDL): shots, object IDs, effects, copy and timing. It executes the list, critiques the result and revises within budget. Sub-agents work in parallel on placements such as the Reel, the carousel and CTWA. The EDL is a persisted, versioned artifact, so every Reel can be explained and reproduced. Exhausting the budget pauses the run with a reason.
 
-### Pillar E: Muse Image as set designer, never product painter
+### Pillar F: multi-instance "shelf to catalog"
 
-- **Multi-reference plates:** pass the SAM cutout, a storefront or interior photo, and the palette swatch (1–10 images per edit) to request an *empty* set that matches the shop's light and colour. Then composite the real cutout locally on top. Muse never repaints the product.
-- **Variants:** use `n` = 3 backdrop candidates per placement, all for one $0.01-per-image request group, with `size` matched to each target ratio (`1024x1536` for 9:16 and 4:5, a square size for 1:1). Spark picks the best plate (Pillar F), with reasons.
-- **Multi-turn edits:** chain plate edits with `store: false` and replay of the prior `image_generation_call`, not stored server state. Keep `enable_web_search`, `enable_image_search` and `enable_shell` **false**, as today.
-- Contact shadow and reflection are rendered locally from the mask (blur plus offset), not generated, so the product's edge pixels stay untouched.
-- Live-test the edit endpoint before depending on it. It is implemented but unverified today.
+A concept prompt on counter, menu-board or display photos returns every instance. Spark labels all the crops in one request and matches them to offerings in the evidence ledger. Each catalog entry is either *matched to source-named offering X* or *unmatched visual item, needs owner name*.
 
-### Pillar F: Spark (or Wonder) as a vision-and-video critic
+The owner confirms names with a tap or by voice instead of typing a menu. The catalog feeds the carousel ("4 bakes worth the trip"), Status and the CTWA kit. Counts appear only as observations ("12 items visible in the inspected photo").
 
-The planned "contextual final critique" is now concrete:
+### Pillar G: interactive SAM studio
 
-1. Send **all rendered stills** (up to 50 images in one request) plus the **final Reel MP4** (video understanding) to Spark, together with the blueprint and the evidence IDs.
-2. The critic returns strict JSON: per-asset findings with severity, the rule broken (claim traceability, unapproved offer, unreadable text, CTA missing or occluded, brand inconsistency, review language leaking into consumer copy, people without consent) and **grounded boxes** pointing at the problem.
-3. The UI overlays those boxes on the asset. A revision creates a new version, which invalidates the old verdict (an existing rule).
-4. Use **Wonder at high reasoning effort** only for the final verdict and for opportunity ranking. Use Spark everywhere else. The model used for each verdict is disclosed in the QA report.
-5. The critic stays a diagnostic. Deterministic checks and owner approval still gate readiness.
+- **Tap to cut:** a tap becomes a point prompt and returns a mask in about 3 s. Negative taps refine the edge. A new object gets a new ID. The selection is recorded as an **owner-confirmed region**.
+- **Scrub to track:** the owner pauses a clip, taps the product, chooses "follow this", and gets a live streaming overlay of SAM tracking as frames arrive.
+- **Layer panel:** shows every object ID with its mask, confidence and track lifespan, plus toggles for which objects appear in which placement.
+- Refinements are user-initiated and budgeted (for example 8 per asset), and never retried automatically.
 
-### Pillar G: SAM as a deterministic fidelity instrument
+### Pillar H: Muse Image as set designer, never product painter
 
-This turns "we preserve the real product" from a claim into a measured property:
+- **Multi-reference plates:** the SAM cutout, a storefront or interior frame and the palette go into one edit (1–10 images), which returns an *empty* matched set. The real cutout is then composited locally on top.
+- **Variants:** `n` = 3–4 plates for each target ratio. The critic picks one and gives reasons.
+- **Seasonal and occasion sets** (Diwali, monsoon, weekend brunch) stay labelled as *proposed* themes, never as an existing promotion.
+- **Multi-turn plate refinement** uses `store: false` and replays the prior `image_generation_call`. Web search, image search and shell stay off.
+- Contact shadows and reflections are rendered locally from the mask. Product edge pixels are never generated.
 
-- **Re-segmentation check:** run SAM on the final rendered asset with the same box or concept. Compare the mask with the expected placement mask (IoU), and compare the pixels inside it with the resized source cutout (mean ΔE). Flag drift above a threshold.
-- **Text-over-subject check:** compare the layout's own text boxes with the subject mask to catch headlines covering the product. This is local geometry, with no model call.
-- **People and logo gate:** run SAM concept requests for "person", "face" and "logo" on source media. Any hit raises a consent or third-party-rights item that the owner must resolve before export.
+### Pillar I: competitive and self visual audit
 
-These checks are diagnostics, not identity proof. The architecture already states this, and the QA report must repeat it.
+- **Competitor imagery:** use only permitted official-site reads of competitor pages discovered through Meta-native search. Spark vision and SAM measure observable composition, for example: "In the 14 inspected competitor images, 11 show interiors, 2 show products, 0 show the making process." That supports a bounded differentiation claim, and the inspected sample is always shown.
+- **The owner's own feed:** through the authorized Instagram Graph API (opt-in), Spark scores existing posts, SAM finds the recurring hero products, and Tickr reports what the feed over- and under-shows against the selected story.
+- Both are observations about the inspected set, never claims about the whole market.
 
-### Pillar H: owner voice as first-class evidence
+### Pillar J: critic, fidelity and safety gates
 
-The owner can record a 60-second note ("Tell us your story / what you want people to know"). Muse Voice Transcribe turns it into a transcript with turn timestamps (it supports 25 languages, which matters for Indian shop owners). Spark then extracts **owner-stated facts** such as founder story, signature item and opening hours. Each fact links to its audio timestamp, so the owner can replay exactly where they said it.
+- **Vision and video critic:** all stills (≤50 per request) plus each Reel MP4 go to Spark, and the final verdict to Wonder at high effort. It returns strict-JSON findings with severity, the rule broken and a **grounded box**, shown as overlays in the UI. Each revision creates a new version that invalidates the old verdict.
+- **SAM fidelity check:** re-segment the final rendered frames and stills. Measure IoU against the expected placement mask and mean ΔE inside the mask against the source cutout. Flag drift.
+- **Text-over-subject geometry:** a local check of text boxes against the subject mask on every frame.
+- **Consent and rights gates:** SAM and Spark person or face detections require recorded consent. Third-party logos, other businesses' signage and minors block export until the owner resolves them.
 
-- This fills the gap where research "remains unknown" without asking the owner to type.
-- The owner's actual words can drive the Reel's on-screen story line, with on-screen captions generated locally. Tickr cannot speak in the owner's voice because Meta offers no text-to-speech and no external TTS is permitted. Any optional audio is the owner's own recording.
-- Cost: $0.18 per hour of audio, so a minute costs about $0.003.
+These checks are diagnostics. Deterministic rules plus exact-version owner approval still gate readiness.
 
-### Pillar I: role-based budget ledger
+### Pillar K: variants, publishing and measured learning (authorized Meta APIs)
 
-Replace the flat 6-request cap with per-role reservations, using rates retrieved 4 November 2026 and re-checked at run time:
+- **Audience variants:** the director produces 2–3 Reel and caption variants, one per audience hypothesis in the blueprint, sharing tracked assets so the extra SAM cost is zero.
+- **Optional, owner-authorized adapters:** Marketing API *drafts* (never activated without explicit approval and budget authorization), Instagram scheduling, and the WhatsApp Cloud API for a CTWA follow-up assistant. That assistant answers only from owner-approved facts in the evidence ledger and hands off to the owner.
+- **Insights loop:** with permission, read post and ad insights back and attach them to the variant that produced them. The opportunity report gains measured evidence (*qualified inquiries*, *attended bookings*), and later runs can learn which hooks performed for *this* business. A conversion claim requires a valid measured comparison.
+
+### Pillar L: role-based budget ledger
+
+The worker reserves budget per role, using list rates from the dated pricing page, and records actual usage:
 
 | Role | Default cap per run | Approximate list cost at cap |
 | --- | --- | --- |
-| Spark text (discover, investigate, analyse, copy) | 4 | token-metered; record actual usage |
-| Spark vision (grounding + catalog) | 2 | token-metered |
-| Spark or Wonder critic (stills + Reel) | 2 (1 revision) | token-metered; Wonder is about 3–5× Spark per token |
-| Muse Image | 2 requests, up to 6 images | ≤ $0.06 |
-| SAM image (box, concept or QA) | 8 | ≤ $0.02 |
-| SAM video | 1 request, ≤ 900 frames | ≤ $0.18 |
-| SAM interactive refinements | 8 per asset (user-initiated) | ≤ $0.02 |
-| Voice transcription | ≤ 3 min | ≤ $0.01 |
+| Spark text (research, analysis, copy) | 6 | token-metered |
+| Spark vision and video (grounding, shot log, catalog, critic) | 6 | token-metered |
+| Wonder director and final verdict | 1 session, bounded tool steps (e.g. 40) | token-metered; about 3–5× Spark per token |
+| Muse Image | 4 requests, up to 16 images | ≤ $0.16 |
+| SAM image (box, concept, layers, QA) | 24 | ≤ $0.06 |
+| SAM video | ≤ 4 requests, ≤ 3,600 frames total | ≤ $0.72 |
+| SAM interactive refinements | 8 per asset (user-initiated) | ≤ $0.02 per asset |
+| Voice transcription | ≤ 10 min | ≤ $0.03 |
 
-The existing rules stay in force: concurrency limit, requested-markers before paid calls, no automatic retry of uncertain requests, saved raw responses, and pause-with-reason when a cap would be exceeded. Rate limits per team (SAM 3,000/min, Muse Image 150/min) are not a constraint at this scale.
-
----
-
-## 4. What the demo should show
-
-The judging weights are Impact 30, Meta tooling 25, Technical depth 20 and Demo 25. A run should show, in this order:
-
-1. Paste the Grandma Daphne's link → live discovery trace (existing).
-2. Record a voice note ("my grandmother's recipe…") → transcript with timestamped owner-stated facts (Pillar H).
-3. Upload a 15 s phone clip of a cake → Spark marks the hero moment; **SAM tracks the cake; the on-screen mask overlay follows it** (Pillar B).
-4. Tap to fix a mask edge with a negative point (Pillar C).
-5. The Reel plays with the real cake popping out of a Muse-built set and the headline behind it, reframed to every placement (Pillars B and E).
-6. The Spark critic flags one problem with a box overlay. Revision → new version → the verdict re-binds to the new hashes (Pillar F, honouring the "one actual failure/correction" demo requirement).
-7. The fidelity report shows the SAM re-segmentation IoU and ΔE on the product region (Pillar G).
-8. Export the ZIP with its provenance map.
-
-If the real owner footage is not authorized, use a clip the team filmed and owns. Label it as such and **never** present it as the business's footage.
+The existing rules stay in force: concurrency limit, requested-markers before paid calls, saved raw responses, no automatic retry of uncertain requests, and pause-with-reason before any cap is exceeded. Rate limits per team (SAM 3,000/min, Muse Image 150/min) are not a constraint at this scale.
 
 ---
 
-## 5. Sequenced delivery
+## 4. Architecture changes
 
-The submission buffer is **20:00 IST on 4 November** and the stated deadline is 07:30 IST on 5 November. Hours remain, not days, so the order below puts reliability and demo value first. Each item exits only with a live probe recorded in SETUP_VERIFICATION.
+| Component | Change |
+| --- | --- |
+| `lib/meta/files.ts` (new) | Files API upload, reuse and delete on the fixed Meta origin, with bounded sizes and cleanup on failure |
+| `lib/meta/grounding.ts` (new) | Spark vision grounding → validated boxes, points and counts in source pixels |
+| `lib/meta/segmentation.ts` | Box, point and negative-point prompt builder, multi-object requests, `include_confidence`, video input, streaming parse keyed by frame marker |
+| `lib/media/masklets.ts` (new) | Compressed one-bit masklet store, track statistics (lifespan, centroid path, coverage), hash binding |
+| `lib/media/uploads.ts` (new) | Owner photo, clip and audio intake: validation, metadata stripping, consent and rights records |
+| `lib/meta/voice.ts` (new) | File and realtime transcription, diarization, keyword biasing |
+| `lib/agents/director.ts` (new) | Wonder tool loop, EDL schema, sub-agent fan-out, budget-aware tool wrappers |
+| `lib/agents/critic.ts` (new) | Multi-image and video critic with grounded findings |
+| `lib/campaign/compositor/` (new) | Per-frame layered compositing, kinetic typography, mask transitions, tracked reframing, captions |
+| `lib/jobs/store.ts` | Per-role ledger replaces `MAX_MODEL_CALLS` |
+| `prisma/` | Tables for uploads, consents, masklets, EDL versions, critic findings, variants and insights |
+| UI | Studio (tap to cut, scrub to track, layer panel), interview mode, critic overlays, variant comparison |
 
-### Tier 0: before submission (small, high-leverage, low-risk)
+The network boundary is unchanged: Meta API host, restricted official-site reader and fixed-host Maps redirect resolver. Platform adapters use owner-scoped Meta tokens, kept separate from research tools.
 
-| # | Work | Touches | Exit evidence |
-| --- | --- | --- | --- |
-| 0.1 | Spark grounding → SAM **box prompts**, with per-object layers and text-concept fallback (Pillar A) | `lib/meta/segmentation.ts` (box/point prompt builder), new `lib/meta/grounding.ts`, `lib/campaign/layers.ts` | One live run on a real source image: box → mask, raw response saved |
-| 0.2 | Subject-aware reframing of stills from mask and box (local only) | `lib/campaign/render.ts` | `npm run media:check`; subject never cropped in 4:5, 1:1 and 9:16 |
-| 0.3 | Text-over-subject geometry check plus SAM re-segmentation fidelity check | `lib/campaign/render.ts`, QA report | Report fields populated; offline test with the saved response |
-| 0.4 | Spark vision critic on the final stills (one request, grounded findings) | new `lib/agents/critic.ts` | One live critique bound to asset hashes |
-| 0.5 | Budget ledger split by role (keep the total conservative) | `lib/jobs/store.ts` | Unit tests for reservation and exhaustion |
+---
 
-### Tier 1: video and owner input (first post-submission sprint)
+## 5. Phased delivery
 
-1. Owner upload pipeline for photos, clips and voice, with type, size and duration validation, metadata stripping, a consent record and private storage.
-2. Files API adapter (upload, reuse, delete) on the fixed Meta origin.
-3. Spark video understanding → shot plan JSON.
-4. SAM video tracking adapter (streaming parse keyed by frame marker, minimal `propagation_direction`), with masklets stored as compressed one-bit frames under `.data/`.
-5. Layered Reel compositor in FFmpeg using per-frame alpha mattes: pop-out, text behind the subject, tracked callout, reframe.
-6. Voice Transcribe → owner-stated facts with timestamps.
+Each phase exits only with live evidence recorded in SETUP_VERIFICATION, not mocked tests.
 
-### Tier 2: interaction and catalog
-
-1. Tap-to-cut UI with positive and negative points and a live preview.
-2. Shelf-to-catalog multi-instance extraction and the owner naming flow.
-3. Muse multi-reference set plates with `n` variants and critic selection.
-4. Reel critic (Spark video understanding on the final MP4) and Wonder for the final verdict.
-5. Animated sticker export for Stories and Status.
-
-### Tier 3: evaluation
-
-- Run the frozen-input baseline (direct Muse generation) against the full pipeline across the four example verticals plus one outside them. Measure blind human scores for visual authenticity, and SAM-fidelity IoU and ΔE.
-- Record live failure rates for box-prompted versus concept-prompted segmentation. This answers the open Tiger Lily question with data.
+| Phase | Scope | Exit evidence |
+| --- | --- | --- |
+| **1. Grounded segmentation** | Pillar A, per-object layers, tracked-reframe for stills, text-over-subject check, per-role ledger | Live box-prompt runs on real source images, including Tiger Lily; failure rates for box vs concept prompts recorded |
+| **2. Owner media and voice** | Uploads and consent, Files API, voice file transcription, owner-stated facts with timestamps | One real walk-through clip and voice note ingested; facts link back to audio |
+| **3. SAM video and cinematic compositor** | Shot log, SAM tracking, masklet store, Pillar C effects, speaker captions | A Reel built from real tracked footage; `ffprobe` and frame inspection; fidelity IoU and ΔE reported |
+| **4. Director and critic** | Wonder director with EDL, Spark/Wonder critic with overlays, a bounded revision loop | One run where the critic catches a real defect and the revision passes with re-bound hashes |
+| **5. Studio UI and catalog** | Tap to cut, scrub to track, layer panel, shelf to catalog, realtime interview mode, Muse multi-reference plates | Owner-confirmed regions and catalog names persisted; plates chosen by the critic |
+| **6. Audit and variants** | Competitor and self visual audit, audience variants | Audit tables with sample sizes; variants sharing tracked assets |
+| **7. Authorized platform loop** | Marketing API drafts, IG scheduling, CTWA assistant, insights read-back | Requires explicit owner authorization; nothing goes live without it |
+| **8. Evaluation** | Frozen-input baseline vs full pipeline, five or more businesses, blind human review | Actual scores, failures, latency and spend reported, including misses |
 
 ---
 
 ## 6. Guardrails that must not slip
 
-- **Meta-only inference.** All new calls go to `api.meta.ai` with keys kept server-side. Video and images are sent inline or through the Meta Files API, never as third-party `video_url` or `image_url` values. Files are deleted after the run.
-- **No generated product pixels.** SAM masks only *select* real pixels. Muse makes sets and plates only. Every asset records its composition type.
-- **No generated video presented as footage.** Tracked motion is real footage. Synthetic plates are labelled.
-- **People and rights.** SAM or Spark person and face detections require owner consent before export. Third-party logos raise a rights item.
-- **Provenance.** Spark boxes are *located observations*, SAM masks are *selections*, owner taps are *owner-confirmed regions* and voice facts are *owner-stated* with timestamps. None of these on its own verifies a product claim or an offer.
-- **Budget honesty.** Record actual usage. Cost figures above are list prices from the dated pricing page, not measured spend.
-- **Fixtures are not proof.** A saved-response replay of any new adapter does not count as live capability.
+- **Meta-only inference.** All new calls go to `api.meta.ai` with keys kept server-side. Media is sent inline or through the Meta Files API, then deleted. No open-weight or local inference: Muse Spark Open and Glimmer are excluded.
+- **No generated product or people pixels.** SAM masks only select real pixels. Muse makes empty sets only. Every asset records its composition type.
+- **No generated footage presented as real.** Motion comes from real clips. Plates and illustrations are labelled.
+- **Consent and rights.** Detected people need recorded consent. Third-party logos and signage, and minors, block export.
+- **Provenance classes.** Spark boxes are *located observations*, SAM masks are *selections*, owner taps are *owner-confirmed regions*, voice is *owner-stated* with timestamps, and insights are *measured outcomes*. None of these on its own verifies a product claim or an offer.
+- **Platform actions.** No publishing, ad spend or outbound messaging without explicit, scoped owner authorization.
+- **Honest numbers.** Costs are dated list prices until actual usage is recorded. Fixtures and replays never count as live capability.
 
 ---
 
 ## 7. Open verification questions
 
 1. Do SAM box prompts succeed where text concepts failed? Probe this on the Tiger Lily source image with a saved raw response.
-2. What are the SAM video request size and duration limits through the Files API, and how long is uploaded-file retention for this account?
-3. Does `/v1/images/edits` preserve a reference set's light and palette well enough for plates? This needs a live test, because editing is unverified.
-4. What is Wonder's latency at high effort for a 20-image critique? Is it worth the extra cost over Spark? Measure before adopting it.
-5. Is Spark grounding accuracy on small products in busy counter photos good enough to seed SAM boxes? Measure box-to-mask agreement.
+2. What are this account's Files API size limits and retention, and what is SAM video latency for a 900-frame clip when streamed?
+3. Does `/v1/images/edits` multi-reference keep a set's light and palette faithfully enough for plates? Editing is still unverified.
+4. Is Spark grounding accurate on small products in busy counter photos? Measure box-to-mask agreement.
+5. Is the Wonder director's quality gain over a fixed Spark pipeline worth its cost and latency? Measure it on frozen inputs.
+6. Does Voice Transcribe diarization separate owner and staff reliably enough for speaker-anchored captions on noisy shop audio?
