@@ -230,6 +230,7 @@ export function AutopilotIntake({ restoring, onStarted }: { restoring: boolean; 
         <textarea id={`${ids}-goal`} rows={2} maxLength={600} value={goalText} onChange={(event) => setGoalText(event.target.value)} placeholder={goalId ? "Anything specific? e.g. our new pistachio croissant, weekday mornings" : "Or say it in your own words — e.g. get more people in for weekday breakfast"} />
       </fieldset>
 
+      {media?.mediaError && <p className="ap-hint is-warning" role="status">{media.mediaError}</p>}
       <div className="ap-extras">
         <MediaDropzone queue={queue} uploaded={media?.assets ?? []} rejected={rejected} disabled={disabled} rights={rights} people={people} consentError={consentError} consentRef={consentRef}
           onAdd={addFiles} onRemoveQueued={removeQueued} onRemoveUploaded={(assetId) => void removeUploaded(assetId)} onRights={(value) => { setRights(value); if (value && people) setConsentError(false); }} onPeople={(value) => { setPeople(value); if (rights) setConsentError(false); }} />

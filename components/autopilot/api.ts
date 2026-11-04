@@ -20,7 +20,8 @@ export const postJson = <T>(url: string, body: unknown) => requestJson<T>(url, {
 
 export type MediaAsset = { id: string; kind: "image" | "video"; provenance: "owner_upload"; mimeType: string; width: number; height: number; durationSeconds: number | null; bytes: number; addedAt: string; thumbUrl: string };
 export type MetaConnection = { status: "not_configured" | "disconnected" | "connected" | "expired"; provider: "meta"; accountName: string | null; instagramUsername: string | null; pageName: string | null; expiresAt: string | null; mediaCount: number | null };
-export type BusinessMedia = { assets: MediaAsset[]; connection: MetaConnection };
+/** mediaError: present when the saved upload library can't be read (e.g. the secret key changed). */
+export type BusinessMedia = { assets: MediaAsset[]; connection: MetaConnection; mediaError?: string };
 
 export const createBusiness = (website: string, goal: string) => postJson<{ business: { id: string } }>("/api/businesses", goal ? { website, goal } : { website });
 export const getBusiness = (id: string) => requestJson<{ business: { id: string; website: string | null; goal: string } }>(`/api/businesses/${encodeURIComponent(id)}`);
