@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import type { CriticBoundAsset, CriticCampaignChannel, CriticFinding, CriticRule, CriticSeverity, CritiqueReport } from "../../lib/agents/critic";
-import { MANUAL_EDIT_MARKERS, REVIEW_LANGUAGE_PHRASES, findManualEditMarkers, planDeterministicFixes, stripReviewLanguage } from "../../lib/agents/critic-fixes";
+import { MANUAL_EDIT_MARKERS, REVIEW_LANGUAGE_PHRASES, findManualEditMarkers, isProvenanceLabelFinding, isProvenanceLabelText, planDeterministicFixes, stripReviewLanguage } from "../../lib/agents/critic-fixes";
 
 // SYNTHETIC critique reports for a fictional bakery; no model call is involved.
 const assets: CriticBoundAsset[] = [
@@ -91,7 +91,7 @@ describe("stripReviewLanguage", () => {
 describe("planDeterministicFixes", () => {
   test("a clean critique needs no remedies", () => {
     const plan = planDeterministicFixes(report([]), channels);
-    expect(plan).toMatchObject({ rulesVersion: "critic-fixes-2", critiqueRulesVersion: "critic-1", critiqueInputHash: "e".repeat(64), remedies: [], withheldAssetIds: [], recheckAssetIds: [], status: "clear" });
+    expect(plan).toMatchObject({ rulesVersion: "critic-fixes-3", critiqueRulesVersion: "critic-1", critiqueInputHash: "e".repeat(64), remedies: [], dismissedFindings: [], withheldAssetIds: [], recheckAssetIds: [], status: "clear" });
     expect(plan.assets.every((asset) => asset.disposition === "unchanged" && !asset.recheck)).toBe(true);
     expect(plan.provenance).toEqual({ kind: "deterministic_fix_plan", modelCall: false, ownerApprovalRequired: true });
   });
@@ -283,5 +283,76 @@ describe("planDeterministicFixes", () => {
     expect(plan.remedies.every((remedy) => remedy.kind === "withhold_asset")).toBe(true);
     expect(JSON.stringify(input)).toBe(snapshot);
     expect(planDeterministicFixes(input, channels)).toEqual(plan);
+  });
+});
+
+describe("mandatory provenance/concept labels", () => {
+  const described = (assetId: string, severity: CriticSeverity, description: string, rule: CriticRule = "review_language_in_consumer_copy") => ({ ...finding(assetId, rule, severity), description });
+
+  test.each([
+    "WEBSITE IMAGE · SAM CUTOUT", "OWNER PHOTO · SAM CUTOUT", "OWNER PHOTO · SAM CUTOUT · AI BACKDROP", "AI BACKDROP", "ILLUSTRATIVE IMAGE",
+    "ILLUSTRATIVE IMAGE · SAM CUTOUT", "ILLUSTRATION", "CONCEPT · REVIEW REQUIRED", "SYNTHETIC DEMO · CONCEPT", "OWNER INSTAGRAM PHOTO", "OWNER FACEBOOK VIDEO", "SOURCE CUTOUT",
+  ])("%j is provenance label text", (label) => {
+    expect(isProvenanceLabelText(label)).toBe(true);
+  });
+
+  test.each(["TASTE OF HOME STORY INTRODUCTION", "DRAFT COPY", "AI-GENERATED", "PLACEHOLDER", "CONCEPT · TODO", ""])("%j is not provenance label text", (text) => {
+    expect(isProvenanceLabelText(text)).toBe(false);
+  });
+
+  test.each([
+    'Footer label "WEBSITE IMAGE · SAM CUTOUT" is internal production wording visible to consumers.',
+    "The bottom label “OWNER PHOTO · SAM CUTOUT · AI BACKDROP” exposes production tooling.",
+    "Small text 'CONCEPT · REVIEW REQUIRED' at the bottom is review language.",
+    "Footer reads ILLUSTRATIVE IMAGE · SAM CUTOUT, which is production language.",
+    'Footer shows "AI BACKDROP" and "CONCEPT · REVIEW REQUIRED" (SAM tooling).',
+  ])("a finding that only cites the label is recognised: %j", (description) => {
+    expect(isProvenanceLabelFinding(described("feed-1", "critical", description))).toBe(true);
+  });
+
+  test.each([
+    'Kicker "TASTE OF HOME STORY INTRODUCTION" is a channel planning title shown to consumers.',
+    'Footer "WEBSITE IMAGE · SAM CUTOUT" and kicker "TASTE OF HOME STORY INTRODUCTION" are internal planning jargon.',
+    "Footer WEBSITE IMAGE · SAM CUTOUT and kicker TASTE OF HOME STORY INTRODUCTION are internal wording.",
+    'Body text says "draft copy" next to the "AI BACKDROP" label.',
+    "Internal review wording is visible at the bottom.",
+  ])("a finding that cites other wording (or nothing) is kept: %j", (description) => {
+    expect(isProvenanceLabelFinding(described("feed-1", "critical", description))).toBe(false);
+  });
+
+  test("only review-language findings can be dismissed", () => {
+    expect(isProvenanceLabelFinding(described("feed-1", "critical", 'Label "AI BACKDROP" hides the subject.', "subject_occluded_or_cropped"))).toBe(false);
+  });
+
+  test("label-only findings never withhold or hold an asset, even when critical; other review language still does", () => {
+    // Live shape: the critic flagged the required footer label on every asset.
+    const labelFindings = [
+      described("feed-1", "critical", 'Footer label "WEBSITE IMAGE · SAM CUTOUT" is production wording.'),
+      described("story-1", "major", 'Footer label "OWNER PHOTO · SAM CUTOUT" is visible to consumers.'),
+      described("loose-1", "critical", 'Footer "ILLUSTRATIVE IMAGE" label is review language.'),
+      described("reel", "critical", 'Frame footer "CONCEPT · REVIEW REQUIRED" is review wording.'),
+    ];
+    const plan = planDeterministicFixes(report(labelFindings), channels);
+    expect(plan.withheldAssetIds).toEqual([]);
+    expect(plan.remedies).toEqual([]);
+    expect(plan.status).toBe("clear");
+    expect(plan.assets.every((asset) => asset.disposition === "unchanged")).toBe(true);
+    expect(plan.dismissedFindings).toEqual(labelFindings.map((item) => ({ findingId: item.id, assetId: item.assetId, reason: "mandatory_provenance_label" })));
+
+    // The planning kicker is legitimately reportable: it keeps its normal (fail-closed) treatment.
+    const kicker = described("feed-1", "critical", 'Kicker "TASTE OF HOME STORY INTRODUCTION" is a channel planning title.');
+    const mixed = planDeterministicFixes(report([...labelFindings, kicker]), channels);
+    expect(mixed.withheldAssetIds).toEqual(["feed-1"]);
+    expect(mixed.remedies).toContainEqual({ kind: "manual_review", assetId: "feed-1", channelId: "instagram_feed", reason: "review_language_not_in_copy", severity: "critical", findingIds: [kicker.id] });
+    expect(mixed.dismissedFindings.map((item) => item.findingId)).not.toContain(kicker.id);
+    expect(disposition(mixed, "story-1")).toBe("unchanged");
+  });
+
+  test("a dismissed label finding never counts as covered by a copy strip either", () => {
+    const label = described("feed-1", "critical", 'Footer "CONCEPT · REVIEW REQUIRED" label.');
+    const plan = planDeterministicFixes(report([label]), [{ ...channels[0], caption: "Fresh croissants daily. Draft copy." }, channels[1]]);
+    const strip = plan.remedies.find((remedy) => remedy.kind === "strip_review_language");
+    expect(strip).toMatchObject({ channelId: "instagram_feed", field: "caption", findingIds: [] });
+    expect(plan.withheldAssetIds).toEqual([]);
   });
 });

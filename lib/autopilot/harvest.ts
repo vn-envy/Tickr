@@ -162,13 +162,22 @@ async function exists(path: string): Promise<boolean> {
 export const GALLERY_NOTE_UNREADABLE = "Tickr could not read the official website this time; no website photos were used.";
 export const GALLERY_NOTE_DOWNLOADS_FAILED = "Tickr read your website, but its photos could not be downloaded (for example the image host blocks automated access); no website photos were used.";
 export const GALLERY_NOTE_NO_PHOTOS = "The official website offered no usable photos.";
+export const GALLERY_NOTE_IMAGE_ROBOTS = "The official website was read, but its image server did not allow automated image downloads (robots.txt), so no website photos were used. Add your own photos or connect Instagram/Facebook to use real media.";
 
-export function emptyGalleryNote(gallery: Pick<OfficialGalleryResult, "status" | "assets" | "pagesRead" | "skipped">): string | null {
+/**
+ * A photo download refused by the image host's robots.txt (or by robots rules that could not be
+ * cleared, e.g. robots.txt answering HTTP 500). The gallery records each failed download as
+ * "<candidate id>: <code>: <message>"; linked-page failures ("Linked page skipped: …") are pages, not photos.
+ */
+const IMAGE_ROBOTS_WARNING = /^candidate_[a-z0-9]+: ROBOTS_RESTRICTED:/u;
+
+export function emptyGalleryNote(gallery: Pick<OfficialGalleryResult, "status" | "assets" | "pagesRead" | "skipped"> & { warnings?: readonly string[] }): string | null {
   if (gallery.assets.length) return null;
   if (!gallery.pagesRead.length) return GALLERY_NOTE_UNREADABLE;
   // Pages were read but photo downloads failed or were blocked (robots, HTTP errors, lost connection).
   const downloadsFailed = gallery.status !== "no_candidates" && gallery.skipped.some((item) => item.reason === "fetch_failed");
-  return downloadsFailed ? GALLERY_NOTE_DOWNLOADS_FAILED : GALLERY_NOTE_NO_PHOTOS;
+  if (!downloadsFailed) return GALLERY_NOTE_NO_PHOTOS;
+  return (gallery.warnings ?? []).some((warning) => IMAGE_ROBOTS_WARNING.test(warning)) ? GALLERY_NOTE_IMAGE_ROBOTS : GALLERY_NOTE_DOWNLOADS_FAILED;
 }
 
 /** Default dependencies: the worker's real business library, official gallery reader and Meta Graph connection. */

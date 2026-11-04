@@ -61,6 +61,21 @@ function response(output: unknown, overrides: Record<string, unknown> = {}) {
 }
 const finding = (assetId: string, rule: string, severity: string, box: unknown = null, timeSeconds: number | null = null, description = "Synthetic finding.") => ({ assetId, severity, rule, description, box, timeSeconds });
 
+describe("critic instructions", () => {
+  test("list the mandatory provenance/concept footer labels as never reportable, while planning jargon stays reportable", () => {
+    for (const label of ["WEBSITE IMAGE · SAM CUTOUT", "OWNER PHOTO · SAM CUTOUT · AI BACKDROP", "AI BACKDROP", "ILLUSTRATIVE IMAGE", "CONCEPT · REVIEW REQUIRED", "SYNTHETIC DEMO · CONCEPT"]) {
+      expect(CRITIC_INSTRUCTIONS).toContain(`"${label}"`);
+    }
+    for (const term of ["OWNER PHOTO", "WEBSITE IMAGE", "INSTAGRAM", "FACEBOOK", "SAM CUTOUT", "AI BACKDROP", "ILLUSTRATIVE IMAGE", "ILLUSTRATION", "CONCEPT", "REVIEW REQUIRED"]) {
+      expect(CRITIC_INSTRUCTIONS).toContain(term);
+    }
+    expect(CRITIC_INSTRUCTIONS).toContain("These labels are required honesty disclosures, not review language or production jargon: never report their wording or their presence");
+    expect(CRITIC_INSTRUCTIONS).toContain("internal planning jargon such as a channel or scene planning title printed as consumer text");
+    // "AI-generated" in consumer copy would contradict the mandatory "AI BACKDROP" label; it is no longer a listed example.
+    expect(CRITIC_INSTRUCTIONS).not.toContain('"AI-generated"');
+  });
+});
+
 describe("Muse Spark critic request", () => {
   test("sends labelled downscaled JPEG stills in order, the reel inline, and a strict schema bound to asset ids", async () => {
     const responseDirectory = await directory();

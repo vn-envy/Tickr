@@ -153,6 +153,36 @@ describe("website gallery notes", () => {
     ] }))).toBe(downloadsFailed);
   });
 
+  test("pages read but every photo refused by the image host's robots.txt gets the robots note, not 'could not read'", async () => {
+    const robots = "The official website was read, but its image server did not allow automated image downloads (robots.txt), so no website photos were used. Add your own photos or connect Instagram/Facebook to use real media.";
+    // Live shape: the pages were read; the approved image CDN answered robots.txt with HTTP 500, which counts as a disallow.
+    const blocked = gallery({
+      pagesRead: ["https://synthetic-patisserie.example/", "https://synthetic-patisserie.example/menu"], candidatesFound: 6, attempted: 2,
+      skipped: [
+        { imageUrl: "https://cdn.synthetic.example/a.jpg", reason: "fetch_failed" }, { imageUrl: "https://cdn.synthetic.example/b.jpg", reason: "fetch_failed" },
+      ],
+      warnings: [
+        "candidate_0123456789abcdef0123: ROBOTS_RESTRICTED: Official site access restrictions could not be cleared.",
+        "candidate_fedcba9876543210fedc: ROBOTS_RESTRICTED: Official site access restrictions could not be cleared.",
+        "No usable official photo could be acquired. This is a media-access limitation, not proof that the business has no photos.",
+      ],
+    });
+    expect(emptyGalleryNote(blocked)).toBe(robots);
+    const notes = await notesFor(blocked, "image-robots");
+    expect(notes).toContain(robots);
+    expect(notes).not.toContain(unreadable);
+    expect(notes).not.toContain(downloadsFailed);
+    expect(notes).not.toContain(noPhotos);
+    // A linked PAGE refused by robots is not an image-server refusal: other download failures keep the generic wording.
+    expect(emptyGalleryNote(gallery({
+      pagesRead: ["https://synthetic-cafe.example/"], candidatesFound: 1, attempted: 1,
+      skipped: [{ imageUrl: "https://synthetic-cafe.example/a.jpg", reason: "fetch_failed" }],
+      warnings: ["Linked page skipped: ROBOTS_RESTRICTED: Official media access is restricted by robots.txt.", "candidate_0123456789abcdef0123: HTTP_UNAVAILABLE: Official image returned HTTP 404."],
+    }))).toBe(downloadsFailed);
+    // A site whose own pages could not be read keeps the could-not-read wording even with robots warnings.
+    expect(emptyGalleryNote(gallery({ warnings: ["ROBOTS_RESTRICTED: Official site access restrictions could not be cleared."] }))).toBe(unreadable);
+  });
+
   test("any harvested photo means no empty-gallery note", () => {
     expect(emptyGalleryNote({ status: "partial", pagesRead: [], assets: [{} as OfficialGalleryResult["assets"][number]], skipped: [] })).toBeNull();
   });

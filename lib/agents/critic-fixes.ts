@@ -12,8 +12,11 @@ import type { CriticBoundAsset, CriticCampaignChannel, CriticFinding, CriticRule
  * firm one: it goes to the owner instead. A missing call to action is restored only from
  * existing channel copy. Every asset a remedy changes must be critiqued again and its new bytes
  * approved by the owner. A critical finding that no remedy resolves withholds its asset.
+ * The mandatory provenance/concept footer label ("WEBSITE IMAGE · SAM CUTOUT", "CONCEPT · REVIEW
+ * REQUIRED") is required disclosure: a review-language finding about it alone is dismissed, never
+ * withheld or sent for review, so honesty labels can never empty the kit.
  */
-export const CRITIC_FIXES_VERSION = "critic-fixes-2" as const;
+export const CRITIC_FIXES_VERSION = "critic-fixes-3" as const;
 
 export type WithholdReason = "claim_not_supported" | "unapproved_offer" | "person_without_consent" | "third_party_branding" | "unresolved_critical";
 export type CopyField = "headline" | "body" | "caption" | "cta";
@@ -47,11 +50,16 @@ export interface AssetFixDisposition {
   recheck: boolean;
 }
 
+/** A finding the planner dismissed instead of remedying, kept for the record. */
+export interface DismissedFinding { findingId: string; assetId: string; reason: "mandatory_provenance_label" }
+
 export interface DeterministicFixPlan {
   rulesVersion: typeof CRITIC_FIXES_VERSION;
   critiqueRulesVersion: CritiqueReport["rulesVersion"];
   critiqueInputHash: string | null;
   remedies: FixRemedy[];
+  /** Findings with no remedy because they only object to required disclosure (never withheld). */
+  dismissedFindings: DismissedFinding[];
   assets: AssetFixDisposition[];
   withheldAssetIds: string[];
   /** Assets (not withheld) whose bytes the remedies change: they need a new critique and a new owner approval. */
@@ -135,6 +143,41 @@ export function stripReviewLanguage(value: string): { text: string; removed: str
   return { text, removed };
 }
 
+/**
+ * Words of Tickr's mandatory provenance/concept footer labels (lib/campaign/render.ts,
+ * lib/autopilot/produce.ts, the cinema renderers): "OWNER PHOTO · SAM CUTOUT · AI BACKDROP",
+ * "WEBSITE IMAGE · SAM CUTOUT", "OWNER INSTAGRAM PHOTO", "OWNER VIDEO", "ILLUSTRATIVE IMAGE", "ILLUSTRATION",
+ * "CONCEPT · REVIEW REQUIRED", "SYNTHETIC DEMO · CONCEPT".
+ */
+const PROVENANCE_LABEL_WORDS: ReadonlySet<string> = new Set([
+  "owner", "photo", "photos", "video", "website", "image", "source", "instagram", "facebook", "sam", "cutout", "ai", "backdrop",
+  "illustrative", "illustration", "concept", "review", "required", "synthetic", "demo",
+]);
+
+/** True when `text` is made only of provenance/concept label words and separators (e.g. "WEBSITE IMAGE · SAM CUTOUT"). */
+export function isProvenanceLabelText(text: string): boolean {
+  const words = text.normalize("NFKC").toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+  return words.length > 0 && words.every((word) => PROVENANCE_LABEL_WORDS.has(word));
+}
+
+const QUOTED = /"([^"\n]{1,160})"|“([^”\n]{1,160})”|«([^»\n]{1,160})»|‘([^’\n]{1,160})’|(?<![\p{L}\p{N}])'([^'\n]{1,160})'(?![\p{L}\p{N}])/gu;
+/** Unquoted on-image text the critic usually writes in capitals ("kicker TASTE OF HOME STORY"). */
+const CAPITALS = /(?<![\p{L}\p{N}])\p{Lu}[\p{Lu}\p{N}]+(?:[\s·•|/—–-]+\p{Lu}[\p{Lu}\p{N}]*)*(?![\p{L}\p{N}])/gu;
+
+/**
+ * Whether a review-language finding objects ONLY to the mandatory provenance/concept label: every
+ * piece of on-image text it quotes (and every unquoted all-capitals run) is label text, and it
+ * cites at least one. A finding that also cites other wording (a planning kicker, "draft copy")
+ * is kept, so legitimate review language is still remedied, reviewed or withheld.
+ */
+export function isProvenanceLabelFinding(finding: Pick<CriticFinding, "rule" | "description">): boolean {
+  if (finding.rule !== "review_language_in_consumer_copy") return false;
+  const quoted = [...finding.description.matchAll(QUOTED)].map((match) => match.slice(1).find((group) => group !== undefined) ?? "");
+  const rest = finding.description.replace(QUOTED, " ");
+  const cited = [...quoted, ...[...rest.matchAll(CAPITALS)].map((match) => match[0])].filter((text) => /[\p{L}\p{N}]/u.test(text));
+  return cited.length > 0 && cited.every(isProvenanceLabelText);
+}
+
 const WITHHOLD_RULES: ReadonlySet<CriticRule> = new Set(["claim_not_supported", "unapproved_offer", "person_without_consent", "third_party_branding"]);
 const COPY_FIELDS: readonly CopyField[] = ["headline", "body", "caption", "cta"];
 const SEVERITY_RANK: Record<CriticSeverity, number> = { critical: 3, major: 2, minor: 1 };
@@ -149,6 +192,7 @@ const hasRegion = (finding: CriticFinding) => Boolean(finding.gridBox);
  * - subject_occluded_or_cropped (localized) → relayout_text_away_from_subject, plus recrop_to_subject for stills.
  * - review_language_in_consumer_copy → resolved only when strip_review_language rewrites copy of the asset's own
  *   channel and no field of that channel is left for a manual copy edit; otherwise manual review.
+ *   A review_language finding that only cites the mandatory provenance/concept label is dismissed (no remedy, never withheld).
  * - placement_unsuitable, brand_inconsistency, visual_quality, other, or an unlocalized subject issue → manual_review.
  * A critical finding with no deterministic remedy withholds its asset. A critical finding for an unknown asset blocks the plan.
  * Copy fields are always checked, with or without a finding: listed internal phrases are stripped; tentative or
@@ -173,8 +217,14 @@ export function planDeterministicFixes(
     if (finding.severity === "critical") withhold(finding.assetId, "unresolved_critical", finding.id);
   };
 
+  // Required disclosure is never a defect: these findings get no remedy and can never withhold.
+  const dismissedFindings: DismissedFinding[] = report.findings
+    .filter((finding) => assets.has(finding.assetId) && isProvenanceLabelFinding(finding))
+    .map((finding) => ({ findingId: finding.id, assetId: finding.assetId, reason: "mandatory_provenance_label" as const }));
+  const dismissed = new Set(dismissedFindings.map((item) => item.findingId));
+
   // Copy is shared by every asset rendered for a channel (stills and a reel linked to it).
-  const reviewFindings = report.findings.filter((finding) => finding.rule === "review_language_in_consumer_copy" && assets.has(finding.assetId));
+  const reviewFindings = report.findings.filter((finding) => finding.rule === "review_language_in_consumer_copy" && assets.has(finding.assetId) && !dismissed.has(finding.id));
   const copyState = new Map<string, "stripped" | "manual">();
   for (const channel of campaignChannels) {
     const channelAssets = report.boundAssets.filter((asset) => asset.channel === channel.id).map((asset) => asset.assetId);
@@ -202,6 +252,7 @@ export function planDeterministicFixes(
   for (const finding of report.findings) {
     const asset = assets.get(finding.assetId);
     if (!asset) continue; // The critic never emits these; a tampered report cannot redirect remedies.
+    if (dismissed.has(finding.id)) continue;
     if (WITHHOLD_RULES.has(finding.rule)) { withhold(asset.assetId, finding.rule as WithholdReason, finding.id); continue; }
     switch (finding.rule) {
       case "unreadable_text":
@@ -261,6 +312,7 @@ export function planDeterministicFixes(
     critiqueRulesVersion: report.rulesVersion,
     critiqueInputHash: report.inputHash ?? null,
     remedies: finalRemedies,
+    dismissedFindings,
     assets: dispositions,
     withheldAssetIds: dispositions.filter((asset) => asset.disposition === "withheld").map((asset) => asset.assetId),
     recheckAssetIds: dispositions.filter((asset) => asset.recheck).map((asset) => asset.assetId),

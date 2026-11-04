@@ -847,7 +847,9 @@ describe("Autopilot pipeline helpers", () => {
     const withoutFocus = { ...copy, creativeBrief: { ...copy.creativeBrief!, focus: { ...copy.creativeBrief!.focus, offeringId: null } } } as CampaignCopy;
     expect(illustrationSubjectPhrase({ copy, enrichment: enrichment("b"), business: { vertical: "cafe" } })).toBe("Flat white");
     expect(illustrationSubjectPhrase({ copy, enrichment: undefined, business: { vertical: " Family\nbakery " } })).toBe("Family bakery item");
-    expect(illustrationSubjectPhrase({ copy: withoutFocus, enrichment: enrichment("b"), business: { vertical: "florist" } })).toBe("florist item");
+    // A story-led brief still illustrates the reported offering kind its focus names, never a category example.
+    expect(illustrationSubjectPhrase({ copy: withoutFocus, enrichment: enrichment("b"), business: { vertical: "florist" } })).toBe("Flat white");
+    expect(illustrationSubjectPhrase({ copy: withoutFocus, enrichment: { ...enrichment("b"), offerings: [] }, business: { vertical: "florist" } })).toBe("florist item");
     expect(illustrationSubjectPhrase({ copy, enrichment: undefined, business: { vertical: " " } })).toBe("botanical forms");
   });
 

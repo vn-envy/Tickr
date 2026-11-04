@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import sharp from "sharp";
 import { describe, expect, test, vi } from "vitest";
-import { buildGroundedImagePrompt, prepareCampaignVisual, type PrepareCampaignVisualInput } from "../../lib/campaign/visual";
+import { buildGroundedImagePrompt, illustrationSubjectPhrase, prepareCampaignVisual, type PrepareCampaignVisualInput } from "../../lib/campaign/visual";
 import type { CampaignCopy } from "../../lib/campaign/copy";
 import type { MetaImageResult } from "../../lib/meta/image";
 import { generateMetaImage } from "../../lib/meta/image";
@@ -35,13 +35,77 @@ describe("grounded campaign visuals", () => {
     const fixture = input("/tmp");
     expect(buildGroundedImagePrompt(fixture)).toContain("Cocoa brownie described on the menu");
     fixture.copy.creativeBrief!.focus.offeringId = null;
-    // Without a named offering: a generic, unbranded example of the category (quoted as data), never an invented product.
+    fixture.enrichment = { ...fixture.enrichment!, offerings: [] };
+    // Without any discovered offering: a generic, unbranded example of the category (quoted as data), never an invented product.
     const generic = buildGroundedImagePrompt(fixture);
     expect(generic).toContain('item typical of this business category: "bakery"');
     expect(generic).toContain("do not invent a signature product");
     expect(generic).toContain("Do not depict people, hands, premises, storefronts, founder portraits or invented logos");
     expect(generic).not.toContain("Cocoa brownie");
+    // No example of a different product biases the image model (a "loaf" example drew bread for a brownie campaign).
+    expect(generic).not.toMatch(/\bloaf\b|\bbread\b|for example, an unbranded/i);
     expect(buildGroundedImagePrompt(fixture)).toBe(generic);
+    expect(illustrationSubjectPhrase(fixture)).toBe("bakery item");
+  });
+
+  // Live regression (patisserie selling brownies and cheesecake): a story-led brief (no offering id)
+  // must not fall back to a generic bakery example; the generic item is of the reported kind.
+  function storyLedPatisserie() {
+    const fixture = input("/tmp");
+    fixture.business = { ...fixture.business, vertical: "bakery" };
+    fixture.copy.creativeBrief!.focus = { ...fixture.copy.creativeBrief!.focus, offeringId: null, name: "Taste of home", description: "Our cheesecakes and brownies, baked like at home." };
+    fixture.enrichment = { ...fixture.enrichment!, offerings: [
+      { id: "brownie", name: "Fudge Brownie", description: "Rich cocoa brownie with walnuts and a salted caramel drizzle.", sourceIds: ["s1"] },
+      { id: "cheesecake", name: "Baked New York Cheesecake", description: "Classic baked cheesecake.", sourceIds: ["s1"] },
+    ] };
+    return fixture;
+  }
+
+  test("a story-led focus that names a reported offering kind illustrates a generic item of that kind", () => {
+    const fixture = storyLedPatisserie();
+    const prompt = buildGroundedImagePrompt(fixture);
+    // Both offerings are named by head word; the longer whole-name match would win, otherwise research order.
+    expect(prompt).toContain('this kind of item, which the business is reported to offer: "Fudge Brownie"');
+    expect(prompt).toContain("Depict exactly that kind of item");
+    expect(prompt).toContain("Do not show any other kind of product");
+    expect(prompt).toContain("do not invent a signature product or recipe, distinctive decorations, fillings, toppings, garnishes, packaging, labels, prices or brand cues");
+    expect(prompt).toContain("hand-painted illustrative treatment, never photorealistic");
+    expect(prompt).not.toMatch(/\bloaf\b|\bbread\b/i);
+    expect(prompt).not.toContain("typical of this business category");
+    // Only the generic kind is named: the offering's unverified details (toppings, drizzle) are never asked for.
+    expect(prompt).not.toContain("salted caramel");
+    expect(prompt).toContain("This image will be labelled an AI illustration for review, never original business photography.");
+    // The SAM concept phrase names the same subject the prompt asks for.
+    expect(illustrationSubjectPhrase(fixture)).toBe("Fudge Brownie");
+
+    fixture.copy.creativeBrief!.focus.description = "Celebrate with a classic baked New York cheesecake.";
+    expect(buildGroundedImagePrompt(fixture)).toContain('reported to offer: "Baked New York Cheesecake"');
+    expect(illustrationSubjectPhrase(fixture)).toBe("Baked New York Cheesecake");
+    fixture.copy.creativeBrief!.focus = { ...fixture.copy.creativeBrief!.focus, name: "Cheesecakes", description: "Slices for the weekend." };
+    expect(illustrationSubjectPhrase(fixture)).toBe("Baked New York Cheesecake");
+  });
+
+  test("a focus that names no offering still illustrates a reported offering kind, never a category example", () => {
+    const fixture = storyLedPatisserie();
+    fixture.copy.creativeBrief!.focus = { ...fixture.copy.creativeBrief!.focus, name: "Taste of home", description: "A family recipe story." };
+    expect(buildGroundedImagePrompt(fixture)).toContain('reported to offer: "Fudge Brownie"');
+    expect(illustrationSubjectPhrase(fixture)).toBe("Fudge Brownie");
+  });
+
+  test("the saved illustration description says a generic kind is not the real product", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "tickr-visual-kind-"));
+    try {
+      const fixture = { ...storyLedPatisserie(), outputDir: dir };
+      const prompts: string[] = [];
+      const generateImage = vi.fn(async (request: { prompt: string }) => { prompts.push(request.prompt); return result(); });
+      const prepared = await prepareCampaignVisual(fixture, { generateImage });
+      expect(prompts).toHaveLength(1);
+      expect(prompts[0]).toContain('reported to offer: "Fudge Brownie"');
+      expect(prepared.visual.kind).toBe("meta_illustration");
+      expect(prepared.visual.description).toContain("generic, unbranded example of a reported offering kind (“Fudge Brownie”)");
+      expect(prepared.visual.description).toContain("not the business's real product");
+      expect(prepared.image?.provenance).toBe("meta_illustration");
+    } finally { await rm(dir, { recursive: true, force: true }); }
   });
 
   test("reuses exact generated bytes and usage without paying again, and rejects changed bytes", async () => {
