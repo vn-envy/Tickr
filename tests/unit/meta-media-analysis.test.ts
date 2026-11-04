@@ -1,3 +1,4 @@
+import type { MetaClient } from "../../lib/meta/client";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -55,7 +56,8 @@ function sparkResponse(output: unknown, extra: Entry = {}) {
 function client(response: unknown) {
   const bodies: Array<Record<string, unknown>> = [];
   const requestJson = vi.fn(async (_path: string, init?: { body?: Record<string, unknown> }) => { bodies.push(init!.body!); return response; });
-  return { requestJson, bodies };
+  // The fake returns whatever the test supplies; type it as the generic client method for the adapter seam.
+  return { requestJson: requestJson as typeof requestJson & MetaClient["requestJson"], bodies };
 }
 
 /** Strict structured outputs: every object closed and every property required. */

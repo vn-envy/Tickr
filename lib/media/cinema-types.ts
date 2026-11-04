@@ -26,8 +26,9 @@ export interface NormalizedClip {
   posterPath: string;
   /** Owner audio, kept privately for later transcription; null when absent or dropped. */
   audioPath: string | null;
-  original: { bytes: number; sha256: string; container: string; videoCodec: string; durationSeconds: number; width: number; height: number };
-  provenance: "owner_upload";
+  original: { bytes: number; sha256: string; container: string; videoCodec: string; durationSeconds: number; width: number; height: number; dynamicRange?: "sdr" | "wide_gamut_sdr" | "hdr" };
+  /** Owner uploads and owner-connected Instagram/Facebook media; all require the owner's consent attestation. */
+  provenance: "owner_upload" | "owner_instagram" | "owner_facebook";
   consent: OwnerMediaConsent;
   createdAt: string;
 }

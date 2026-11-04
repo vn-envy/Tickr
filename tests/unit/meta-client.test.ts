@@ -65,6 +65,15 @@ describe("Meta transport boundary", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it("validates request timeouts up to the ten-minute ceiling before making a request", () => {
+    const fetch = vi.fn<typeof globalThis.fetch>();
+    for (const timeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 600_001]) {
+      expect(() => new MetaClient({ apiKey: "test-only-key", fetch, timeoutMs })).toThrow("between 1 and 600000 milliseconds");
+    }
+    for (const timeoutMs of [1, 120_000, 300_000, 600_000]) expect(() => new MetaClient({ apiKey: "test-only-key", fetch, timeoutMs })).not.toThrow();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("rejects an oversized declared length before reading any body bytes", async () => {
     const pull = vi.fn();
     const cancel = vi.fn();

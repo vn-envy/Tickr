@@ -89,8 +89,9 @@ export class MetaClient {
     this.#models = { ...(options.models ?? getMetaModelConfig(environment)) };
     this.#fetch = options.fetch ?? globalThis.fetch;
     this.#timeoutMs = options.timeoutMs ?? 30_000;
-    if (!Number.isFinite(this.#timeoutMs) || this.#timeoutMs <= 0 || this.#timeoutMs > 120_000) {
-      throw new MetaClientError("INVALID_TIMEOUT", "Meta request timeout must be between 1 and 120000 milliseconds");
+    // Video segmentation of an inline clip can legitimately take minutes; 10 minutes is the hard ceiling.
+    if (!Number.isFinite(this.#timeoutMs) || this.#timeoutMs <= 0 || this.#timeoutMs > 600_000) {
+      throw new MetaClientError("INVALID_TIMEOUT", "Meta request timeout must be between 1 and 600000 milliseconds");
     }
     this.#maxResponseBytes = options.maxResponseBytes ?? 4 * 1024 * 1024;
     if (!Number.isSafeInteger(this.#maxResponseBytes) || this.#maxResponseBytes <= 0 || this.#maxResponseBytes > 32 * 1024 * 1024) {

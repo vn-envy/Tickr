@@ -34,6 +34,36 @@ A persistent local worker claims one run with a database lease; API handlers cre
 The same deployment contains Next.js, the worker, Prisma/SQLite and local media. `scripts/start.sh` starts the web app and worker together. A Python service is unnecessary unless a specific allowed processing task requires it.
 Long-running jobs and SQLite/assets need persistent storage; an ephemeral request-only deployment is insufficient.
 
+## One-shot Autopilot (4 November 2026)
+
+With `autopilot: true`, the owner's link and goal start one durable run that continues without further input until it reaches a review-ready kit:
+
+```mermaid
+flowchart LR
+  L[Link + goal (+ optional uploads / Meta login)] --> D[Discover + enrich]
+  D --> R[Analysis report]
+  R -->|deterministic choice, recorded basis| S[Selection]
+  S --> H[Harvest media: website gallery, owner uploads, owner Meta media]
+  H --> A[Spark analyzes every image + shot logs for videos]
+  A --> P[Deterministic director plan]
+  P --> G[SAM 3.1 box-prompted cutouts]
+  P --> T[SAM 3.1 video tracking]
+  G --> K[Channel stills + carousel from real photos]
+  T --> V[Tracked cinema Reel + SAM overlay]
+  G --> V2[Depth Reel fallback]
+  K --> C[Spark critic + deterministic fixes]
+  V --> C
+  V2 --> C
+  C --> E[Export + quality record]
+  E --> O[Owner's single hash-bound approval]
+```
+
+- The research report's recommendation (or the highest complete score) is selected automatically and stored as an immutable `selection` checkpoint with its basis; manual runs still wait for the owner.
+- Autopilot runs carry a larger, explicit per-run ceiling (`modelCallLimit`) and per-role caps (`lib/autopilot/budget.ts`); every paid step still writes its requested-marker first and is never retried automatically.
+- The director (`lib/autopilot/director.ts`) is deterministic. It excludes possible minors, people without recorded consent, third-party branding and unapproved price/offer text before ranking.
+- Progress is written to a validated "director's room" state (`lib/autopilot/public-state.ts`) that lists only derived previews; private originals, raw responses and tokens never appear there.
+- Approval (`lib/jobs/approval.ts`) re-hashes every approvable file and binds to a manifest digest; it records approval of concept material and never publishes.
+
 ## Artifact contracts
 
 All stage outputs validate against versioned Zod schemas. JSON schemas constrain model output when the verified endpoint supports them; server-side validation remains mandatory.
@@ -89,10 +119,11 @@ tests/evaluation/            Frozen-input comparisons and score reports
 
 ## Network boundary
 
-There are two primary network paths, plus a fixed-host link-routing resolver described below:
+There are three primary network paths, plus a fixed-host link-routing resolver described below:
 
-1. **Meta API client:** server-side requests to account-verified Meta-hosted inference endpoints, initially `api.meta.ai`, with inline image bytes; no external generated-image download is required. No third-party or local inference fallback.
+1. **Meta API client:** server-side requests to account-verified Meta-hosted inference endpoints, initially `api.meta.ai`, with inline image and video bytes; no external generated-image download is required. No third-party or local inference fallback.
 2. **Restricted public-site reader:** HTTP retrieval of permitted official business/competitor pages. A URL does not authorize general crawling or unrestricted model-directed networking.
+3. **Owner-authorized Meta Graph connector (optional):** after the owner signs in with Meta and attests to their media rights, a fixed-origin client calls `graph.facebook.com` to list the owner's own Page and linked Instagram professional-account media. Media bytes are downloaded only from allowlisted Meta CDN hosts through the same SSRF-safe pinned transport; no token or credential is ever sent to a CDN. Tokens are encrypted at rest with `TICKR_SECRET_KEY` and can be revoked. The connector is disabled unless `META_APP_ID`, `META_APP_SECRET`, `META_OAUTH_REDIRECT_URI` and `TICKR_SECRET_KEY` are configured.
 
 All other external runtime APIs are excluded: Google Places, search providers, Treg services, storage services, hosted image/video utilities and non-Meta model hosts.
 Meta social/marketing adapters are optional, credential-scoped additions; they do not share arbitrary owner-token access with research tools.
