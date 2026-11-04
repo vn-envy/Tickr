@@ -18,7 +18,7 @@ Files: `deploy/modal_app.py` (image, container and single-writer lease), `deploy
 | Container | Class `Tickr`, `min_containers=1`, `max_containers=1`, 8 CPU, 16 GiB, `@modal.concurrent(max_inputs=500)`, 3600 s per-request timeout. Preemptible (the SDK default); see "Preemption" below. |
 | Web | `@modal.web_server(3000, startup_timeout=600, label="tickr")` → `https://<workspace>--tickr.modal.run` (outside the default environment, Modal adds the environment name; use the URL `modal deploy` prints) |
 | Volume | `tickr-data` (VolumeFS v2) at `/data`: `/data/state` holds everything under `.data` (run outputs, uploads, encrypted connections, research records); `/data/db` holds SQLite snapshots |
-| Secret | `tickr-runtime` (required keys are checked at deploy time) |
+| Secrets | `tickr-runtime` (rotatable settings) and `tickr-keys` (create-once `TICKR_SECRET_KEY`); required keys are checked at deploy time |
 | Writer lease | Modal Dict `tickr-writer-lease` holding one record: a container id and a heartbeat time (no secrets, no owner data) |
 | Environment | `TICKR_SERVER_MODE=production`, `TICKR_DEPLOYMENT=modal`, `DATABASE_URL=file:/var/lib/tickr/tickr.db` (container-local; `modal-start.sh` enforces it) |
 
@@ -44,33 +44,31 @@ python3 -m pip install 'modal==1.6.3'   # the SDK version these files were check
 modal setup                              # browser login; stores the Modal token in ~/.modal.toml
 ```
 
-## 2. Create the runtime Secret (names only here; never paste values into chat or files)
+## 2. Create the Secrets (names only here; never paste values into chat or files)
 
-| Key | Required | Meaning |
-| --- | --- | --- |
-| `META_API_KEY` | yes | Meta-hosted inference |
-| `TICKR_SECRET_KEY` | yes | 32 random bytes, base64 (`openssl rand -base64 32`). Encrypts owner tokens and keys the media-library integrity records. Also feeds the access-cookie key. |
-| `TICKR_ACCESS_CODE` | yes | Owner access code, **16–256 characters** (for example `openssl rand -base64 24`). A shorter code counts as misconfigured and the app fails closed. |
-| `TICKR_ALLOWED_HOSTS` | yes | The public host, for example `<workspace>--tickr.modal.run`. Without it, every browser write is rejected as cross-origin. |
-| `META_APP_ID`, `META_APP_SECRET`, `META_OAUTH_REDIRECT_URI` | optional | Owner Instagram/Facebook connection. All three plus `TICKR_SECRET_KEY` enable it. |
-| `META_CRITIC_MODEL` | optional | `muse-spark-1.3` (default) or `muse-wonder-1.0` |
+There are two Secrets:
 
-Find the workspace name with `modal profile current`; the host is then `<workspace>--tickr.modal.run`. If you are unsure, deploy once, read the printed URL, then update the Secret and redeploy.
+- **`tickr-keys`: create once, never `--force`.** It holds `TICKR_SECRET_KEY` (32 random bytes, base64). That key encrypts owner Meta tokens, keys the media-library integrity records and feeds the access-cookie key. Modal cannot show a Secret's value later, so replacing it would orphan stored owner connections and records.
+- **`tickr-runtime`: safe to recreate with `--force`** whenever a setting changes.
 
-In a shell where the values are already exported (for example, loaded from your password manager), check them by **name** only:
+| Secret | Key | Required | Meaning |
+| --- | --- | --- | --- |
+| `tickr-keys` | `TICKR_SECRET_KEY` | yes | See above. Generate it inside the create command so it is never displayed. |
+| `tickr-runtime` | `META_API_KEY` | yes | Meta-hosted inference |
+| `tickr-runtime` | `TICKR_ACCESS_CODE` | yes | Owner access code, **16–256 characters** (for example `openssl rand -base64 24`). A shorter code counts as misconfigured and the app fails closed. |
+| `tickr-runtime` | `TICKR_ALLOWED_HOSTS` | yes | The public host, for example `<workspace>--tickr.modal.run`. Without it, every browser write is rejected as cross-origin. |
+| `tickr-runtime` | `META_APP_ID`, `META_APP_SECRET`, `META_OAUTH_REDIRECT_URI` | optional | Owner Instagram/Facebook connection |
+| `tickr-runtime` | `META_CRITIC_MODEL` | optional | `muse-spark-1.3` (default) or `muse-wonder-1.0` |
 
-```bash
-for k in META_API_KEY TICKR_SECRET_KEY TICKR_ACCESS_CODE TICKR_ALLOWED_HOSTS; do
-  [[ -n "${!k:-}" ]] && echo "$k set" || echo "$k MISSING"
-done
-```
-
-Then create or replace the Secret. Each `KEY="$KEY"` passes the value from the environment without echoing it. Values do appear briefly in the local process list while the command runs, so run it on your own machine with `set +x`.
+Find the workspace name with `modal profile current`; the host is then `<workspace>--tickr.modal.run`. If you are unsure, deploy once, read the printed URL, then recreate `tickr-runtime` and redeploy.
 
 ```bash
+# Once only. Skip if `modal secret list` already shows tickr-keys.
+modal secret create tickr-keys TICKR_SECRET_KEY="$(openssl rand -base64 32)"
+
+# Any time a setting changes. Each KEY="$KEY" passes the value from the environment without echoing it.
 modal secret create tickr-runtime --force \
   META_API_KEY="$META_API_KEY" \
-  TICKR_SECRET_KEY="$TICKR_SECRET_KEY" \
   TICKR_ACCESS_CODE="$TICKR_ACCESS_CODE" \
   TICKR_ALLOWED_HOSTS="$TICKR_ALLOWED_HOSTS"
 # Optional owner Meta connection (add to the same command when used):

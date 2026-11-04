@@ -20,7 +20,7 @@ Design rules (AGENTS.md):
   sees another holder fences itself (no more snapshots) and stops.
 - SQLite lives on container-local disk; deploy/modal-start.sh snapshots it to the Volume every
   30 s and on shutdown. Run files, uploads and encrypted connections live on the Volume.
-- Credentials come only from the Modal Secret "tickr-runtime"; nothing secret is baked into the
+- Credentials come only from the Modal Secrets "tickr-runtime" and "tickr-keys"; nothing secret is baked into the
   image, written to files or logged.
 
 Verified against the Modal Python SDK 1.6.3 signatures (see deploy/README.md).
@@ -50,7 +50,12 @@ NODE_VERSION = "24.22.1"
 NODE_SHA256 = "6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6"
 NODE_TARBALL = f"node-v{NODE_VERSION}-linux-x64.tar.xz"
 
-REQUIRED_SECRET_KEYS = ["META_API_KEY", "TICKR_SECRET_KEY", "TICKR_ACCESS_CODE", "TICKR_ALLOWED_HOSTS"]
+# Rotatable runtime settings live in "tickr-runtime" (safe to recreate with --force).
+REQUIRED_SECRET_KEYS = ["META_API_KEY", "TICKR_ACCESS_CODE", "TICKR_ALLOWED_HOSTS"]
+# TICKR_SECRET_KEY encrypts owner tokens and keys media-library integrity records. Modal secrets
+# cannot be read back, so it lives in its own create-once Secret "tickr-keys" that is never
+# recreated with --force; replacing it would orphan stored owner connections and records.
+KEY_SECRET_KEYS = ["TICKR_SECRET_KEY"]
 
 LOCAL_DB_DIR = "/var/lib/tickr"
 FENCE_FILE = f"{LOCAL_DB_DIR}/.writer-fenced"  # read by deploy/modal-start.sh and scripts/db-persist.ts
@@ -121,6 +126,7 @@ image = (
 app = modal.App(APP_NAME)
 data_volume = modal.Volume.from_name("tickr-data", create_if_missing=True, version=2)
 runtime_secret = modal.Secret.from_name("tickr-runtime", required_keys=REQUIRED_SECRET_KEYS)
+key_secret = modal.Secret.from_name("tickr-keys", required_keys=KEY_SECRET_KEYS)
 writer_lease = modal.Dict.from_name("tickr-writer-lease", create_if_missing=True)
 
 
@@ -184,7 +190,7 @@ class WriterLease:
 
 @app.cls(
     image=image,
-    secrets=[runtime_secret],
+    secrets=[runtime_secret, key_secret],
     volumes={"/data": data_volume},
     env={
         "TICKR_SERVER_MODE": "production",
