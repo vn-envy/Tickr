@@ -1,8 +1,9 @@
 /**
  * SYNTHETIC test helper: builds SAM 3.1 wire text with genuine one-bit mask payloads.
  * It uses the official parser's internal conformance encoder (not part of its public
- * exports) so fixtures round-trip through the real decoder. Test-only; never imported
- * by application code and never sent to Meta.
+ * exports) so fixtures round-trip through the real decoder. Never imported by application
+ * code and never sent to Meta. Sanctioned consumers: vitest suites and the offline
+ * `scripts/autopilot-live-check.ts --dry` path (fake clients only; the live path never loads it).
  */
 // Internal conformance encoder (no public export path); test-only.
 import { encodeSegmentationMask } from "../../node_modules/@meta-sam/parser/dist/mask-codec.js";

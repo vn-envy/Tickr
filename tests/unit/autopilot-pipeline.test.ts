@@ -1,0 +1,543 @@
+import { execFile } from "node:child_process";
+import { copyFile, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
+import sharp from "sharp";
+import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
+import { critiqueCampaign, type CritiqueReport } from "../../lib/agents/critic";
+import type { renderStillDepthReel } from "../../lib/campaign/cinema/still-depth";
+import type { renderTrackedReel } from "../../lib/campaign/cinema/tracked";
+import type { CampaignCopy } from "../../lib/campaign/copy";
+import { prepareCampaignVisual } from "../../lib/campaign/visual";
+import type { CampaignCopyResult, CreateCampaignInput } from "../../lib/campaign/index";
+import type { NormalizedClip, OwnerMediaConsent } from "../../lib/media/cinema-types";
+import type { OfficialGalleryResult } from "../../lib/media/gallery";
+import { approvableFiles } from "../../lib/jobs/approval-shared";
+import { MediaLibrary, type MediaAssetRecord } from "../../lib/media/library";
+import type { MetaClient } from "../../lib/meta/client";
+import { analyzeMediaAssets } from "../../lib/meta/media-analysis";
+import { trackMetaVideo, type SamVideoRequest } from "../../lib/meta/sam-video";
+import { segmentMetaImage, type MetaSegmentationRequest } from "../../lib/meta/segmentation";
+import { analyzeClipShots } from "../../lib/meta/video-understanding";
+import { AUTOPILOT_ROLE_CAPS, createAutopilotBudget, type AutopilotBudget } from "../../lib/autopilot/budget";
+import type { AutopilotRole } from "../../lib/autopilot/contracts";
+import { applyDeterministicFixes, type CritiqueSnapshot } from "../../lib/autopilot/critique";
+import { officialWebsiteFor, selectHarvest } from "../../lib/autopilot/harvest";
+import { defaultAutopilotDependencies, produceAutopilotCampaign, type AutopilotDependencies } from "../../lib/autopilot/pipeline";
+import { heroTrack } from "../../lib/autopilot/produce";
+import { AutopilotResumableError, AutopilotQualitySchema, type AutopilotProductionInput } from "../../lib/autopilot/production-types";
+import { readPublicFile, readPublicState, type AutopilotPublicState } from "../../lib/autopilot/public-state";
+import type { BusinessEnrichment, CollectedSource, ResearchOpportunity, ResearchReport } from "../../lib/research/contracts";
+import { ChannelSchema } from "../../lib/schemas/common";
+import { samImageWire, samResponse, samVideoWire } from "../helpers/sam-wire";
+
+// Every image, clip, business, claim and model response in this file is SYNTHETIC and generated
+// locally (sharp shapes, FFmpeg lavfi testsrc2/color). Meta adapters run for real with injected
+// fake clients; no network request is made and META_API_KEY is never set.
+const run = promisify(execFile);
+const consent: OwnerMediaConsent = { ownsOrLicensedMedia: true, peopleVisibleHaveConsented: "no_people", attestedAt: "2026-11-04T00:00:00.000Z" };
+const score = { value: null, rationale: "Not measured in this synthetic fixture." };
+const opportunity: ResearchOpportunity = {
+  id: "op-1", title: "Morning flat white push", hypothesis: "Synthetic hypothesis.", whyNow: "Synthetic timing.", evidenceIds: ["fact-1"], comparison: "Not compared.",
+  customerAction: "Visit for a flat white", test: "Count visits.", uncertainties: ["Synthetic."], scores: { impact: score, evidence: score, differentiation: score, feasibility: score, confidence: score },
+};
+const report: ResearchReport = {
+  summary: "Synthetic test only.", evidence: [{ id: "fact-1", sourceId: "s1", claim: "The cafe serves flat whites.", quote: "We serve flat whites.", subject: "business", kind: "fact" }],
+  findings: [], opportunities: [opportunity], recommendedOpportunityId: "op-1", unknowns: [], ownerQuestions: [], coverage: { sources: 1, competitorSources: 0, customerSources: 0 }, generatedAt: "2026-11-01T00:00:00Z", mode: "live",
+};
+const source: CollectedSource = { id: "s1", kind: "owner_statement", title: "Synthetic owner note", url: null, text: "We serve flat whites.", retrievedAt: "2026-11-02T00:00:00Z", acquisition: "owner_supplied" };
+const enrichment = (businessId: string): BusinessEnrichment => ({ status: "enriched", businessId, offerings: [{ id: "offering-1", name: "Flat white", description: "A synthetic flat white.", sourceIds: ["s1"] }], brandSignals: [], sourceIds: ["s1"], unknowns: [], warnings: [], queries: [], completedToolCalls: 0, enrichedAt: "2026-11-02T00:00:00Z" });
+
+function copyFixture(options: { reelDraft?: boolean } = {}): CampaignCopy {
+  return {
+    name: "Synthetic morning cups", objective: "Invite morning visits.", audienceHypothesis: "Synthetic commuters.", coreMessage: "A calm flat white before work.", primaryCta: "Visit this morning", evidenceIds: ["fact-1"], reviewNotes: ["Confirm opening hours."],
+    channels: ChannelSchema.options.map((id) => ({ id, title: id, headline: "A flat white before work", body: id === "instagram_feed" || (options.reelDraft && id === "instagram_reels") ? `${id === "instagram_feed" ? "Morning cups" : "Reel cups"}, made slowly. (draft copy)` : "Made slowly for the morning.", caption: "Stop by for a flat white.", cta: "Visit this morning", evidenceIds: ["fact-1"] })),
+    conversation: { opener: "Hello!", commonReplies: Array.from({ length: 3 }, () => ({ question: "Open early?", answer: "The team can confirm hours." })), qualificationQuestion: "When do you pass by?", nextAction: "Ask the team." },
+    creativeBrief: {
+      focus: { offeringId: "offering-1", name: "Flat white", description: "A synthetic flat white.", evidenceIds: ["fact-1"], sourceIds: ["s1"] },
+      brandStory: { signalIds: [], narrative: "", evidenceIds: [], sourceIds: [] },
+      visualDirection: { status: "proposed", description: "Cream and forest ink.", palette: ["#F6EEDD", "#263A30", "#BB4D2F"], sourceIds: [] },
+      scenes: (["hook", "proof", "occasion", "action"] as const).map((role) => ({ role, headline: "A calm flat white", body: "Made slowly for the morning." })),
+    },
+  };
+}
+
+type Calls = Record<"copy" | "media" | "shotlog" | "samImage" | "samVideo" | "critic", number>;
+const zeroCalls = (): Calls => ({ copy: 0, media: 0, shotlog: 0, samImage: 0, samVideo: 0, critic: 0 });
+type Finding = { assetId: string; severity: "critical" | "major" | "minor"; rule: string; description: string; box: { x_min: number; y_min: number; x_max: number; y_max: number } | null; timeSeconds: number | null };
+
+const sparkEnvelope = (output: unknown) => ({
+  id: "resp_synthetic", model: "muse-spark-1.3", status: "completed",
+  output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: JSON.stringify(output) }] }],
+  usage: { input_tokens: 120, output_tokens: 40, total_tokens: 160 },
+});
+const fakeClient = (respond: (body: Record<string, unknown>) => unknown | Promise<unknown>) => ({
+  requestJson: vi.fn(async (_path: string, init?: { body?: Record<string, unknown> }) => respond(init!.body!)),
+}) as unknown as Pick<MetaClient, "requestJson">;
+
+function mediaResponse(body: Record<string, unknown>, risks: ReadonlyArray<{ kind: string; box: null; note: string }> = []) {
+  const content = (body.input as Array<{ content: Array<{ type: string; text?: string }> }>)[0].content;
+  const last = content.filter((part) => part.type === "input_text").at(-1)!.text!;
+  const ids = JSON.parse(last.slice(last.indexOf("exactly once: ") + "exactly once: ".length).replace(/\.$/, "")) as string[];
+  return sparkEnvelope({ assets: ids.map((assetId, index) => ({
+    assetId, depicts: "A synthetic cup shape on a plain background", subjectKind: "dish_or_drink", matchedOfferingIds: ["offering-1"],
+    primarySubject: { label: "synthetic cup", box: { x_min: 300, y_min: 250, x_max: 700, y_max: 750 } },
+    technicalQuality: { sharpness: "good", lighting: "good", composition: "good" }, goalFit: "strong", goalReason: "Shows a drink", heroWorthy: index === 0, heroReason: "Centered",
+    suitableFor: ["reel_hero", "carousel", "story", "feed", "ad", "whatsapp"], risks, visibleText: "",
+  })) });
+}
+
+async function samImageResponse(request: MetaSegmentationRequest) {
+  const { width, height } = await sharp(request.bytes).metadata();
+  const box = request.geometry?.[0].prompts[0].box ?? { x1: Math.round(width! * .3), y1: Math.round(height! * .3), x2: Math.round(width! * .7), y2: Math.round(height! * .7) };
+  return samResponse(samImageWire([{ id: request.geometry ? 0 : 1, box, confidence: 0.92 }], { width: width!, height: height! }));
+}
+
+function samVideoResponse(clip: NormalizedClip) {
+  const frames = Array.from({ length: clip.frameCount }, (_, frame) => {
+    const x1 = 40 + Math.round(frame * 0.8);
+    return { frame, objects: [{ id: 0, box: { x1, y1: 50, x2: x1 + 110, y2: 170 }, confidence: 0.9 }] };
+  });
+  return samResponse(samVideoWire(frames, { width: clip.width, height: clip.height }), { frames_processed: clip.frameCount });
+}
+
+const shotResponse = () => sparkEnvelope({
+  moments: [{ startSeconds: 0, endSeconds: 2.9, kind: "hero_product", description: "A synthetic test pattern", steadiness: "steady", subjectLabel: "synthetic cup", goalFit: "strong" }],
+  heroMomentSeconds: 1.5, peopleVisible: false, speech: { present: false, excerpt: null, language: null },
+});
+
+let root = "";
+let reelFixture = "", coverFixture = "";
+
+/** A contract-valid 12 s 1080×1920 Reel (synthetic colour field) reused by fast fake renderers. */
+async function fakeReelFiles(outputPath: string, coverPath: string) {
+  await mkdir(join(outputPath, ".."), { recursive: true });
+  await copyFile(reelFixture, outputPath);
+  await copyFile(coverFixture, coverPath);
+}
+const ledger = { frames: 360, meanSubjectSourceFraction: 0.2, meanTreatedSourceFraction: 0.5, meanGeneratedFraction: 0, meanForegroundGraphicsFraction: 0.1, maxSubjectOcclusion: 0, framesSubjectCropped: 0, framesWithoutSubject: 0, generatedPixelsOnSubject: 0 as const };
+const fakeStillDepth = (async (input: Parameters<typeof renderStillDepthReel>[0]) => {
+  await fakeReelFiles(input.outputPath, input.coverPath);
+  return { reel: { sha256: "0".repeat(64), bytes: 1, frames: 360, durationSeconds: 12, width: 1080, height: 1920, fps: 30 }, cover: { sha256: "0".repeat(64), bytes: 1, width: 1080, height: 1920, frame: 60 }, ledger,
+    layout: { provenanceLabel: input.provenanceLabel }, qa: { violations: [], framesSubjectHiddenByTransition: 0 } };
+}) as unknown as typeof renderStillDepthReel;
+const fakeTracked = (async (input: Parameters<typeof renderTrackedReel>[0]) => {
+  await fakeReelFiles(input.outputPath, input.coverPath);
+  return { ledger, layout: { conceptLabel: "CONCEPT", provenanceLabel: input.provenanceLabel, calloutLabel: "synthetic cup", calloutSide: "above", truncatedText: [] }, qa: { violations: [], framesSubjectHiddenByTransition: 0, footageFramesWithoutMask: 0, headlineOcclusion: { mean: 0, max: 0 } } };
+}) as unknown as typeof renderTrackedReel;
+
+interface Harness {
+  input: AutopilotProductionInput;
+  deps: AutopilotDependencies;
+  calls: Calls;
+  stages: string[];
+  phases: Array<AutopilotPublicState["phase"] | null>;
+  runCalls: { count: number };
+  budget: AutopilotBudget;
+}
+
+async function syntheticPhoto(path: string, background: string, cup: string, variant = 0) {
+  // Distinct layouts per variant so the library's near-duplicate check keeps every synthetic photo.
+  const cx = [320, 200, 450][variant % 3], bars = Array.from({ length: variant + 1 }, (_, index) => `<rect x="${40 + index * 150}" y="${variant % 2 ? 30 : 400}" width="90" height="50" fill="#222"/>`).join("");
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="640" height="480"><rect width="640" height="480" fill="${background}"/><ellipse cx="${cx}" cy="240" rx="120" ry="110" fill="${cup}"/>${bars}</svg>`;
+  await writeFile(path, await sharp(Buffer.from(svg)).png().toBuffer());
+}
+
+async function harness(name: string, options: {
+  photos?: number; clip?: boolean; website?: boolean; caps?: Partial<Record<AutopilotRole, number>>; findings?: Finding[];
+  realStillDepth?: boolean; realTracked?: boolean; renderKit?: AutopilotDependencies["renderKit"];
+  /** Risks reported for every analyzed image (e.g. a possible minor excludes them all). */
+  imageRisks?: Array<{ kind: string; box: null; note: string }>;
+  /** The instagram_reels body carries removable review wording, so the critic's fix re-renders the Reel. */
+  reelDraft?: boolean;
+} = {}): Promise<Harness> {
+  const base = join(root, name);
+  const outputDir = join(base, "run"), businessMediaDir = join(base, "business", "media"), staging = join(base, "staging");
+  await mkdir(staging, { recursive: true });
+  const businessId = "6c1f0a5e-2b7d-4c1e-9a3f-0d5e8b7c6a41";
+  if (options.photos || options.clip) {
+    const library = await MediaLibrary.open(businessMediaDir);
+    for (let index = 0; index < (options.photos ?? 0); index++) {
+      const path = join(staging, `photo-${index}.png`);
+      await syntheticPhoto(path, ["#e8dcc8", "#d8e4ee", "#efe0e8"][index % 3], ["#7a4b2a", "#2a5b7a", "#7a2a5b"][index % 3], index + 1);
+      await library.addAsset({ kind: "image", provenance: "owner_upload", filePath: path, mimeType: "image/png", consent, hints: { originalName: `synthetic-${index}.png` } });
+    }
+    if (options.clip) {
+      const path = join(staging, "clip.mp4");
+      await run("ffmpeg", ["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30:duration=3", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", path], { timeout: 60_000 });
+      await library.addAsset({ kind: "video", provenance: "owner_upload", filePath: path, mimeType: "video/mp4", consent, hints: { originalName: "synthetic.mp4" } });
+    }
+  }
+  const calls = zeroCalls();
+  const findings = options.findings ?? [];
+  const runCalls = { count: 0 };
+  const budget = createAutopilotBudget(outputDir, async () => { runCalls.count++; }, { ...AUTOPILOT_ROLE_CAPS, ...options.caps });
+  const stages: string[] = [];
+  const phases: Harness["phases"] = [];
+  const gallery = async (input: { officialWebsite: string; outputDir: string }): Promise<OfficialGalleryResult> => {
+    await mkdir(input.outputDir, { recursive: true });
+    const path = join(input.outputDir, "synthetic-website.png");
+    await syntheticPhoto(path, "#f1efe6", "#3b6b3b");
+    const bytes = await readFile(path);
+    const sha256 = (await import("node:crypto")).createHash("sha256").update(bytes).digest("hex");
+    return {
+      status: "acquired", officialWebsite: input.officialWebsite, pagesRead: [input.officialWebsite], candidatesFound: 1, attempted: 1, skipped: [], warnings: [], retrievedAt: "2026-11-04T00:00:00.000Z",
+      localFiles: { "gallery-1": path },
+      assets: [{ id: "gallery-1", role: "product", roleSource: "page_metadata", candidateKind: "content_image", discoveredVia: "img", label: "Synthetic flat white", productName: "Flat white",
+        sourceUrl: "https://www.synthetic-cafe-fixture.com/media/cup.png", sourcePageUrl: "https://www.synthetic-cafe-fixture.com/", duplicateSourceUrls: [], retrievedAt: "2026-11-04T00:00:00.000Z",
+        sourceMimeType: "image/png", mimeType: "image/png", filename: "synthetic-website.png", width: 640, height: 480, bytes: bytes.length, sha256, sourceSha256: sha256, dHash: "0123456789abcdef",
+        normalization: "auto_orient_and_fit_1600_png", rights: "unknown_review_required", usage: "private_concept_review", requiresPublicationReview: true }] as unknown as OfficialGalleryResult["assets"],
+    };
+  };
+  const deps: AutopilotDependencies = {
+    ...defaultAutopilotDependencies,
+    openBusinessLibrary: async (directory) => (await lstat(directory).then(() => true, () => false)) ? MediaLibrary.open(directory) : null,
+    collectGallery: gallery,
+    harvestOwnerMeta: async () => ({ connected: false, imported: 0, notes: [] }),
+    analyzeMedia: (request, dependencies) => analyzeMediaAssets(request, { ...dependencies, client: fakeClient((body) => { calls.media++; return mediaResponse(body, options.imageRisks); }) }),
+    analyzeShots: (request, dependencies) => analyzeClipShots(request, { ...dependencies, client: fakeClient(() => { calls.shotlog++; return shotResponse(); }) }),
+    segment: (request, dependencies) => segmentMetaImage(request, { ...dependencies, client: fakeClient(() => { calls.samImage++; return samImageResponse(request); }) }),
+    trackVideo: (request: SamVideoRequest, dependencies) => trackMetaVideo(request, { ...dependencies, client: fakeClient(() => { calls.samVideo++; return samVideoResponse(request.clip); }) }),
+    critique: (request, dependencies) => critiqueCampaign(request, { ...dependencies, client: fakeClient(() => { calls.critic++; return sparkEnvelope({ findings, summary: "Synthetic critique summary." }); }) }),
+    ensureCopy: async (input: CreateCampaignInput, copyOptions?: { reserveCopyCall?: () => Promise<void> }): Promise<CampaignCopyResult> => {
+      const marker = join(input.outputDir, "synthetic-copy-done.txt");
+      if (!(await lstat(marker).then(() => true, () => false))) {
+        await copyOptions?.reserveCopyCall?.();
+        calls.copy++;
+        await writeFile(marker, "synthetic");
+      }
+      return { copy: copyFixture({ reelDraft: options.reelDraft }), usage: { model: "muse-spark-1.3", inputTokens: 10, outputTokens: 20, elapsedMs: 100 } };
+    },
+    renderTracked: options.realTracked ? defaultAutopilotDependencies.renderTracked : fakeTracked,
+    renderStillDepth: options.realStillDepth ? defaultAutopilotDependencies.renderStillDepth : fakeStillDepth,
+    ...(options.renderKit ? { renderKit: options.renderKit } : {}),
+  };
+  const business = { id: businessId, name: "Synthetic Fixture Cafe", locality: "Fixture town", vertical: "cafe", goal: "Bring weekday commuters in for a morning flat white", website: options.website ? "https://www.synthetic-cafe-fixture.com/" : null };
+  const input: AutopilotProductionInput = {
+    business, report, opportunityId: "op-1", sources: [source], mode: "live", outputDir, enrichment: enrichment(businessId),
+    runId: `run-${name}`, goal: business.goal, budget, businessMediaDir, connectionsDir: join(base, "connections"),
+    progress: async (stage) => { stages.push(stage); phases.push((await readPublicState(outputDir))?.phase ?? null); },
+    leaseLost: () => false,
+  };
+  return { input, deps, calls, stages, phases, runCalls, budget };
+}
+
+beforeAll(async () => {
+  root = await mkdtemp(join(tmpdir(), "tickr-autopilot-pipeline-"));
+  reelFixture = join(root, "fixture-reel.mp4");
+  coverFixture = join(root, "fixture-cover.png");
+  await run("ffmpeg", ["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-f", "lavfi", "-i", "color=c=0x335577:s=1080x1920:r=30:d=12", "-frames:v", "360", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-movflags", "+faststart", reelFixture], { timeout: 120_000 });
+  await writeFile(coverFixture, await sharp({ create: { width: 1080, height: 1920, channels: 3, background: "#335577" } }).png().toBuffer());
+}, 180_000);
+afterAll(async () => { await rm(root, { recursive: true, force: true }); });
+beforeEach(() => {
+  vi.stubEnv("META_API_KEY", "");
+  vi.stubEnv("TICKR_SECRET_KEY", "");
+});
+
+const kitFile = (outputDir: string, name: string) => readFile(join(outputDir, name), "utf8");
+
+describe("Autopilot production pipeline", () => {
+  test("owner photos and an owner clip become a SAM-tracked Reel with cutouts, a self-critique, safe fixes and a director's room", async () => {
+    const h = await harness("tracked", {
+      photos: 2, clip: true, realTracked: true,
+      findings: [
+        { assetId: "facebook_ads", severity: "critical", rule: "third_party_branding", description: "A synthetic third-party mark is prominent.", box: { x_min: 100, y_min: 100, x_max: 300, y_max: 300 }, timeSeconds: null },
+        { assetId: "reel", severity: "minor", rule: "visual_quality", description: "Synthetic minor note.", box: null, timeSeconds: 2 },
+      ],
+    });
+    const result = await produceAutopilotCampaign(h.input, h.deps);
+    const outputDir = h.input.outputDir;
+
+    // Paid requests: one per step, each reserved once in the role budget and the run ceiling.
+    expect(h.calls).toEqual({ copy: 1, media: 1, shotlog: 1, samImage: 2, samVideo: 1, critic: 1 });
+    expect(await h.budget.counts()).toEqual({ spark_copy: 1, spark_media: 1, spark_shotlog: 1, sam_image: 2, sam_video: 1, muse_image: 0, spark_critic: 1 });
+    expect(h.runCalls.count).toBe(7);
+
+    // Quality record.
+    const quality = AutopilotQualitySchema.parse(result.quality);
+    expect(quality.reelMode).toBe("tracked_video");
+    expect(quality.planVersion).toBe("autopilot-plan-1");
+    expect(quality.mediaAnalyzed).toBe(3);
+    expect(quality.mediaExcluded).toBe(0);
+    expect(quality.criticVerdict).toBe("blocking_findings");
+    expect(quality.findings).toBe(2);
+    // The concept archive bundles the withheld file, so it is withheld with it.
+    expect(quality.withheldFiles).toEqual(["campaign-concept.zip", "facebook_ads.png"]);
+    const approvable = approvableFiles(result.campaign, quality.withheldFiles).map((file) => file.filename);
+    expect(approvable).not.toContain("facebook_ads.png");
+    expect(approvable).not.toContain("campaign-concept.zip");
+    expect(approvable).toContain("instagram_feed.png");
+    expect(quality.notes.join(" ")).toMatch(/campaign-concept\.zip contains the withheld files/);
+    expect(quality.fixesApplied.some((fix) => fix.includes("Withheld facebook_ads"))).toBe(true);
+    expect(quality.fixesApplied.some((fix) => fix.includes("instagram_feed body"))).toBe(true);
+    expect(quality.roleCounts).toMatchObject({ sam_video: 1, spark_critic: 1 });
+    expect(result.usage.model).toBe("muse-spark-1.3");
+    expect(result.additionalUsage.map((usage) => usage.model).sort()).toEqual(["muse-spark-1.3", "muse-spark-1.3", "muse-spark-1.3", "sam-3.1", "sam-3.1", "sam-3.1"]);
+
+    // The exported kit: tracked Reel, overlay preview, reports, and the stripped copy.
+    const files = result.campaign.assets.map((asset) => asset.filename);
+    expect(files).toEqual(expect.arrayContaining(["instagram_reel.mp4", "instagram_reel_cover.png", "sam-tracking-overlay.mp4", "director-report.json", "critic-report.json", "campaign-concept.zip"]));
+    expect(files.filter((file) => file.startsWith("sam-mask-"))).toHaveLength(2);
+    expect(result.campaign.channels.find((channel) => channel.id === "instagram_feed")!.body).toBe("Morning cups, made slowly.");
+    const director = await kitFile(outputDir, "director-report.json");
+    const critic = await kitFile(outputDir, "critic-report.json");
+    for (const text of [director, critic]) {
+      expect(text).not.toContain(root);
+      expect(text).not.toContain("output_text");
+    }
+    const directorJson = JSON.parse(director) as { reel: { mode: string; trackedObject: { label: string } }; segmentation: Array<{ status: string; origin: string }>; budgetRoleCounts: Record<string, number> };
+    expect(directorJson.reel.mode).toBe("tracked_video");
+    expect(directorJson.reel.trackedObject.label).toBe("synthetic cup");
+    expect(directorJson.segmentation.map((record) => record.status)).toEqual(["segmented", "segmented", "tracked"]);
+    expect(directorJson.segmentation[0].origin).toBe("spark_grounding");
+    const criticJson = JSON.parse(critic) as { verdict: string; withheldFiles: string[]; changedAfterCritique: string[] };
+    expect(criticJson.verdict).toBe("blocking_findings");
+    expect(criticJson.withheldFiles).toEqual(["facebook_ads.png"]);
+    expect(criticJson.changedAfterCritique).toContain("instagram_feed.png");
+
+    // Director's room: progression, previews and the critic panel.
+    expect(h.stages).toEqual(["harvest", "copy", "analyze", "direct", "segment", "reel", "render", "critique", "export"]);
+    // Each progress event is observed after the previous step's director's-room state was written.
+    expect(h.phases).toEqual([null, "harvest", "copy", "direct", "direct", "segment", "render", "render", "critique"]);
+    const state = (await readPublicState(outputDir))!;
+    expect(state.phase).toBe("done");
+    expect(state.media).toHaveLength(3);
+    expect(state.media.every((media) => media.thumb && media.status === "selected")).toBe(true);
+    expect(state.plan?.reelMode).toBe("tracked_video");
+    expect(state.sam.map((record) => record.status)).toEqual(["segmented", "segmented", "tracked"]);
+    expect(state.sam[2].overlayVideo).toBe("sam-overlay.mp4");
+    expect(state.critic?.withheld).toEqual(["campaign-concept.zip", "facebook_ads.png"]);
+    for (const name of [state.media[0].thumb!, state.sam[0].preview!, "sam-overlay.mp4", "reel-cover.jpg"]) expect(await readPublicFile(outputDir, name)).not.toBeNull();
+    expect(JSON.stringify(state)).not.toContain(root);
+  }, 400_000);
+
+  test("a single official-website image drives a still-depth Reel with website provenance", async () => {
+    const h = await harness("website", { website: true, realStillDepth: true });
+    const result = await produceAutopilotCampaign(h.input, h.deps);
+    expect(result.quality.reelMode).toBe("still_depth");
+    expect(result.quality.criticVerdict).toBe("no_blocking_findings");
+    expect(result.quality.withheldFiles).toEqual([]);
+    expect(h.calls).toEqual({ copy: 1, media: 1, shotlog: 0, samImage: 1, samVideo: 0, critic: 1 });
+    const state = (await readPublicState(h.input.outputDir))!;
+    expect(state.sources).toEqual({ officialWebsite: 1, ownerUploads: 0, ownerInstagram: 0, ownerFacebook: 0, connected: false });
+    expect(state.media[0]).toMatchObject({ provenance: "official_website", rights: "unknown_review_required", status: "selected" });
+    const director = JSON.parse(await kitFile(h.input.outputDir, "director-report.json")) as { reel: { provenanceLabel: string; ledger: { generatedPixelsOnSubject: number } }; sources: { officialWebsite: string }; media: Array<{ sourcePageUrl: string }> };
+    expect(director.reel.provenanceLabel).toMatch(/^WEBSITE IMAGE · SAM DEPTH/);
+    expect(director.reel.ledger.generatedPixelsOnSubject).toBe(0);
+    expect(director.sources.officialWebsite).toBe("https://www.synthetic-cafe-fixture.com/");
+    expect(director.media[0].sourcePageUrl).toBe("https://www.synthetic-cafe-fixture.com/");
+    expect(result.campaign.reviewNotes.some((note) => note.includes("unknown reuse rights"))).toBe(true);
+  }, 400_000);
+
+  test("an exhausted budget skips optional SAM, shot-log and critic steps without paid requests", async () => {
+    const h = await harness("budget", { photos: 2, clip: true, caps: { sam_image: 0, spark_shotlog: 0, sam_video: 0, spark_critic: 0 } });
+    const result = await produceAutopilotCampaign(h.input, h.deps);
+    expect(h.calls).toEqual({ copy: 1, media: 1, shotlog: 0, samImage: 0, samVideo: 0, critic: 0 });
+    expect(h.runCalls.count).toBe(2);
+    const quality = result.quality;
+    expect(quality.reelMode).toBe("legacy");
+    expect(quality.criticVerdict).toBe("not_run");
+    expect(quality.mediaExcluded).toBe(1);
+    expect(quality.notes.join(" ")).toMatch(/shot-log budget/);
+    expect(quality.notes.join(" ")).toMatch(/SAM budget/);
+    expect(quality.notes.join(" ")).toMatch(/critic budget/);
+    const state = (await readPublicState(h.input.outputDir))!;
+    expect(state.critic?.verdict).toBe("not_run");
+    expect(state.sam.every((record) => record.status === "skipped")).toBe(true);
+    expect(state.media.find((media) => media.kind === "video")?.status).toBe("excluded");
+    expect(result.campaign.assets.some((asset) => asset.filename === "instagram_reel.mp4")).toBe(true);
+  }, 400_000);
+
+  test("a crash after every paid step resumes from checkpoints and stored responses with zero additional paid requests", async () => {
+    let renders = 0;
+    const crashing: AutopilotDependencies["renderKit"] = async (...args) => {
+      renders++;
+      if (renders === 2) throw new Error("Simulated local crash during export.");
+      return defaultAutopilotDependencies.renderKit(...args);
+    };
+    const h = await harness("resume", { photos: 2, clip: true, renderKit: crashing });
+    await expect(produceAutopilotCampaign(h.input, h.deps)).rejects.toBeInstanceOf(AutopilotResumableError);
+    expect((await readPublicState(h.input.outputDir))?.phase).toBe("failed");
+    const paidBefore = { ...h.calls }, countsBefore = await h.budget.counts(), runBefore = h.runCalls.count;
+    expect(paidBefore).toEqual({ copy: 1, media: 1, shotlog: 1, samImage: 2, samVideo: 1, critic: 1 });
+
+    // Remove derived checkpoints so the retry must recover through the adapters' stored responses.
+    await rm(join(h.input.outputDir, "autopilot", "analysis.json"));
+    await rm(join(h.input.outputDir, "autopilot", "reel.json"));
+    await rm(join(h.input.outputDir, "autopilot", "critique.json"));
+    h.deps.renderKit = defaultAutopilotDependencies.renderKit;
+    const result = await produceAutopilotCampaign(h.input, h.deps);
+    expect(h.calls).toEqual(paidBefore);
+    expect(await h.budget.counts()).toEqual(countsBefore);
+    expect(h.runCalls.count).toBe(runBefore);
+    expect(result.quality.reelMode).toBe("tracked_video");
+    expect(result.additionalUsage.length).toBeGreaterThanOrEqual(5);
+    expect((await readPublicState(h.input.outputDir))?.phase).toBe("done");
+  }, 400_000);
+
+  test("removable review wording in the Reel copy re-renders the Reel into its own files, and a crash during export resumes with zero paid requests", async () => {
+    let renders = 0;
+    const crashing: AutopilotDependencies["renderKit"] = async (...args) => {
+      renders++;
+      if (renders === 2) throw new Error("Simulated local crash during the final export.");
+      return defaultAutopilotDependencies.renderKit(...args);
+    };
+    const h = await harness("reel-revision", { photos: 2, clip: true, reelDraft: true, renderKit: crashing });
+    await expect(produceAutopilotCampaign(h.input, h.deps)).rejects.toBeInstanceOf(AutopilotResumableError);
+    const paidBefore = { ...h.calls }, countsBefore = await h.budget.counts(), runBefore = h.runCalls.count;
+    expect(paidBefore).toEqual({ copy: 1, media: 1, shotlog: 1, samImage: 2, samVideo: 1, critic: 1 });
+    const autopilot = join(h.input.outputDir, "autopilot");
+    const critiquedReel = await readFile(join(autopilot, "reel.json"), "utf8");
+
+    h.deps.renderKit = defaultAutopilotDependencies.renderKit;
+    const result = await produceAutopilotCampaign(h.input, h.deps);
+    expect(h.calls).toEqual(paidBefore);
+    expect(await h.budget.counts()).toEqual(countsBefore);
+    expect(h.runCalls.count).toBe(runBefore);
+    // The critiqued Reel's record and files are untouched; the revision has its own.
+    expect(await readFile(join(autopilot, "reel.json"), "utf8")).toBe(critiquedReel);
+    for (const name of ["reel-revised.json", "reel/tracked-revised.mp4", "reel/tracked-revised-cover.png", "reel/tracked.mp4"]) expect((await lstat(join(autopilot, name))).isFile()).toBe(true);
+    expect(result.quality.reelMode).toBe("tracked_video");
+    expect(result.quality.fixesApplied.some((fix) => fix.includes("instagram_reels body"))).toBe(true);
+    expect(result.campaign.channels.find((channel) => channel.id === "instagram_reels")!.body).toBe("Reel cups, made slowly.");
+    expect(result.campaign.assets.some((asset) => asset.filename === "instagram_reel.mp4")).toBe(true);
+    const critic = JSON.parse(await kitFile(h.input.outputDir, "critic-report.json")) as { changedAfterCritique: string[] };
+    expect(critic.changedAfterCritique).toContain("instagram_reel.mp4");
+
+    // A third, uninterrupted pass over the same checkpoints also completes without paying again.
+    await produceAutopilotCampaign(h.input, h.deps);
+    expect(h.calls).toEqual(paidBefore);
+  }, 400_000);
+
+  test("excluded website images never come back as a hero through the visual stage", async () => {
+    const possibleMinor = [{ kind: "possible_minor", box: null, note: "A synthetic small figure." }];
+    const h = await harness("excluded-website", { website: true, imageRisks: possibleMinor });
+    const visualWebsites: Array<string | null | undefined> = [];
+    let collected = 0;
+    h.deps.prepareVisual = (input) => {
+      visualWebsites.push(input.business.website);
+      return prepareCampaignVisual(input, {
+        collectMedia: async () => { collected++; throw new Error("The visual stage must not read the website again."); },
+        generateImage: async () => {
+          const bytes = await sharp({ create: { width: 1024, height: 1536, channels: 3, background: "#c8a26b" } }).png().toBuffer();
+          return { bytes, mimeType: "image/png", width: 1024, height: 1536, sha256: "0".repeat(64), model: "muse-image-1.0", endpoint: "/images/generations", createdAt: null, usage: { inputTokens: 5, outputTokens: 0, totalTokens: 5 },
+            provenance: { kind: "meta_generated_illustration", originalBusinessPhoto: false, referencePreservationVerified: false, referenceAssetIds: [], promptSha256: "0".repeat(64), implicitSearchEnabled: false, externalImageDownloads: false, requiresOwnerReview: true } };
+        },
+      });
+    };
+    const result = await produceAutopilotCampaign(h.input, h.deps);
+    expect(visualWebsites).toEqual([null]);
+    expect(collected).toBe(0);
+    expect(result.quality.mediaExcluded).toBe(1);
+    expect(result.quality.reelMode).toBe("illustration");
+    expect(result.campaign.visual?.kind).toBe("meta_illustration");
+    expect(h.calls.samImage).toBe(0);
+    const state = (await readPublicState(h.input.outputDir))!;
+    expect(state.media[0]).toMatchObject({ provenance: "official_website", status: "excluded" });
+  }, 400_000);
+
+  test("a tracked footage Reel with every photo excluded declares text-led stills, not a source photo", async () => {
+    const possibleMinor = [{ kind: "possible_minor", box: null, note: "A synthetic small figure." }];
+    const h = await harness("footage-only", { photos: 2, clip: true, imageRisks: possibleMinor });
+    let visuals = 0;
+    h.deps.prepareVisual = async () => { visuals++; throw new Error("No illustration is needed when footage carries the Reel."); };
+    const result = await produceAutopilotCampaign(h.input, h.deps);
+    expect(visuals).toBe(0);
+    expect(result.quality.reelMode).toBe("tracked_video");
+    expect(result.quality.mediaExcluded).toBe(2);
+    expect(result.campaign.visual?.kind).toBe("typography");
+    expect(result.quality.notes.join(" ")).toMatch(/only the Reel uses real media/);
+    expect(h.calls).toMatchObject({ samImage: 0, samVideo: 1 });
+  }, 400_000);
+
+  test("without usable media the campaign uses one labelled Muse illustration, and typography once that budget is gone", async () => {
+    let images = 0;
+    const withIllustration = async (caps?: Partial<Record<AutopilotRole, number>>, name = "illustration") => {
+      const h = await harness(name, { caps });
+      h.deps.prepareVisual = (input) => prepareCampaignVisual(input, { generateImage: async () => {
+        images++;
+        const bytes = await sharp({ create: { width: 1024, height: 1536, channels: 3, background: "#c8a26b" } }).png().toBuffer();
+        return { bytes, mimeType: "image/png", width: 1024, height: 1536, sha256: "0".repeat(64), model: "muse-image-1.0", endpoint: "/images/generations", createdAt: null, usage: { inputTokens: 5, outputTokens: 0, totalTokens: 5 },
+          provenance: { kind: "meta_generated_illustration", originalBusinessPhoto: false, referencePreservationVerified: false, referenceAssetIds: [], promptSha256: "0".repeat(64), implicitSearchEnabled: false, externalImageDownloads: false, requiresOwnerReview: true } };
+      } });
+      return { h, result: await produceAutopilotCampaign(h.input, h.deps) };
+    };
+    const { h, result } = await withIllustration();
+    expect(images).toBe(1);
+    expect(result.quality.reelMode).toBe("illustration");
+    expect(result.campaign.visual?.kind).toBe("meta_illustration");
+    expect(result.additionalUsage.map((usage) => usage.model)).toContain("muse-image-1.0");
+    expect((await h.budget.counts()).muse_image).toBe(1);
+    expect((await readPublicState(h.input.outputDir))?.plan).toMatchObject({ heroAssetId: null, reelMode: "illustration" });
+
+    const typography = await withIllustration({ muse_image: 0 }, "typography");
+    expect(images).toBe(1);
+    expect(typography.result.quality.reelMode).toBe("legacy");
+    expect(typography.result.campaign.visual?.kind).toBe("typography");
+    expect(typography.result.quality.notes.join(" ")).toMatch(/illustration budget/);
+  }, 400_000);
+
+  test("a lost lease stops before the first paid request", async () => {
+    const h = await harness("lease", { photos: 1 });
+    h.input.leaseLost = () => true;
+    await expect(produceAutopilotCampaign(h.input, h.deps)).rejects.toThrow(/lease was lost/);
+    expect(h.calls).toEqual(zeroCalls());
+    expect(h.runCalls.count).toBe(0);
+  }, 120_000);
+});
+
+describe("Autopilot pipeline helpers", () => {
+  test("only an official website is read; Maps, social and listing links stay references", () => {
+    expect(officialWebsiteFor({ website: "https://maps.app.goo.gl/AbCdEf123" }, [])).toBeNull();
+    expect(officialWebsiteFor({ website: "https://www.instagram.com/synthetic.cafe/" }, [])).toBeNull();
+    expect(officialWebsiteFor({ website: "https://www.google.com/maps/place/Synthetic" }, [{ kind: "official_website", url: "https://www.synthetic-cafe-fixture.com/menu" }])).toBe("https://www.synthetic-cafe-fixture.com/menu");
+    expect(officialWebsiteFor({ website: null }, [{ kind: "competitor", url: "https://competitor-fixture.com/" }])).toBeNull();
+  });
+
+  test("harvest selection caps media and prefers recent owner media over website images", () => {
+    const asset = (id: number, kind: "image" | "video", provenance: MediaAssetRecord["provenance"], addedAt: string): MediaAssetRecord => ({
+      id: `asset_${String(id).padStart(24, "0")}`, kind, provenance, rights: provenance === "official_website" ? "unknown_review_required" : "owner_attested", sha256: String(id).padStart(64, "0"), bytes: 10,
+      width: 640, height: 480, durationSeconds: kind === "video" ? 3 : null, mimeType: kind === "video" ? "video/mp4" : "image/png", dHash: kind === "video" ? null : "0".repeat(16),
+      sourceUrl: null, sourcePageUrl: null, sourceId: null, caption: null, capturedAt: null, addedAt, consent: null, hints: { pageRole: null, productName: null, originalName: null }, duplicates: [], localPath: "/synthetic",
+    });
+    const assets = [
+      ...Array.from({ length: 30 }, (_, index) => asset(index, "image", "official_website", `2026-01-01T00:00:${String(index).padStart(2, "0")}Z`)),
+      ...Array.from({ length: 15 }, (_, index) => asset(100 + index, "image", "owner_upload", `2026-02-01T00:00:${String(index).padStart(2, "0")}Z`)),
+      ...Array.from({ length: 6 }, (_, index) => asset(200 + index, "video", "owner_upload", `2026-03-01T00:00:${String(index).padStart(2, "0")}Z`)),
+    ];
+    const { selected, overflow } = selectHarvest(assets);
+    expect(selected.filter((item) => item.kind === "image")).toHaveLength(40);
+    expect(selected.filter((item) => item.kind === "video").map((item) => item.addedAt)).toEqual(["2026-03-01T00:00:05Z", "2026-03-01T00:00:04Z", "2026-03-01T00:00:03Z", "2026-03-01T00:00:02Z"]);
+    expect(selected[0].provenance).toBe("owner_upload");
+    expect(selected[0].addedAt).toBe("2026-02-01T00:00:14Z");
+    expect(selected.filter((item) => item.provenance === "official_website")).toHaveLength(25);
+    expect(overflow).toEqual({ images: 5, videos: 2 });
+  });
+
+  test("the hero track is the longest steady, sizeable track", () => {
+    const objects = [
+      { objectId: "1", framesPresent: 90, meanCoverage: 0.02, label: "a" },
+      { objectId: "2", framesPresent: 80, meanCoverage: 0.2, label: "b" },
+      { objectId: "3", framesPresent: 20, meanCoverage: 0.9, label: "c" },
+    ];
+    expect(heroTrack(objects, 90)?.objectId).toBe("2");
+    expect(heroTrack([{ objectId: "1", framesPresent: 90, meanCoverage: 0.001, label: "a" }], 90)).toBeNull();
+  });
+
+  test("withholding the Reel withholds its cover, and copy fixes only delete listed wording", () => {
+    const snapshot: CritiqueSnapshot = { version: 1, stills: [{ assetId: "instagram_feed", filename: "instagram_feed.png", channel: "instagram_feed", sha256: "a".repeat(64), width: 1080, height: 1350, path: "/synthetic" }], reel: { filename: "instagram_reel.mp4", sha256: "b".repeat(64), path: "/synthetic", durationSeconds: 12, width: 1080, height: 1920 }, notes: [] };
+    const report = {
+      rulesVersion: "critic-1", boundAssets: [{ assetId: "instagram_feed", filename: "instagram_feed.png", sha256: "a".repeat(64), kind: "still", channel: "instagram_feed" }, { assetId: "reel", filename: "instagram_reel.mp4", sha256: "b".repeat(64), kind: "reel", channel: "instagram_reels" }],
+      findings: [{ id: "f1", assetId: "reel", assetKind: "reel", severity: "critical", rule: "unapproved_offer", description: "Synthetic.", gridBox: null, box: null, boxBasis: null, boxRejected: false, timeSeconds: 3, timeRejected: false }],
+      discardedFindings: [], verdict: "blocking_findings",
+    } as unknown as CritiqueReport;
+    const fixes = applyDeterministicFixes(report, copyFixture(), snapshot);
+    expect(fixes.withheldFiles).toEqual(["instagram_reel.mp4", "instagram_reel_cover.png"]);
+    expect(fixes.copyChanged).toBe(true);
+    expect(fixes.reelCopyChanged).toBe(false);
+    expect(fixes.copy.channels.find((channel) => channel.id === "instagram_feed")!.body).toBe("Morning cups, made slowly.");
+    expect(applyDeterministicFixes(null, copyFixture(), snapshot)).toMatchObject({ plan: null, withheldFiles: [], copyChanged: false });
+  });
+});

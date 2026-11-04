@@ -22,6 +22,7 @@
     "db:setup": "npm run db:generate && RUST_LOG=info prisma migrate deploy",
     "media:check": "tsx scripts/media-check.ts",
     "meta:check": "NODE_USE_ENV_PROXY=1 tsx scripts/check-meta.ts",
+    "autopilot:check": "NODE_USE_ENV_PROXY=1 tsx scripts/autopilot-live-check.ts",
     "smoke": "tsx scripts/smoke.ts",
     "research:smoke": "tsx scripts/research-smoke.ts",
     "link:smoke": "tsx scripts/link-smoke.ts"
