@@ -10,6 +10,8 @@ import {
   type BusinessContext, type BusinessDiscovery, type ResearchInput, type CollectedSource, type ResearchReport, type ModelUsage, type CampaignKit,
 } from "../research/contracts";
 import { contentHash, jobs, RESEARCH_WORKFLOW_VERSION, type JobStore } from "./store";
+import { createAutopilotBudget } from "../autopilot/budget";
+import { AutopilotResumableError, type AutopilotProductionInput, type AutopilotProductionResult } from "../autopilot/production-types";
 import { prepareDiscoveryCheckpoint, prepareEnrichmentCheckpoint, discoveryNeedsIdentityConfirmation, mergeResearchSources, requiredResearchSourceIds, resolveEnrichedBusiness, type DiscoveryCheckpoint, type EnrichmentCheckpoint } from "./discovery";
 
 export interface WorkerDependencies {
@@ -24,6 +26,8 @@ export interface WorkerDependencies {
   hasCopyCheckpoint: (input: CreateCampaignInput) => Promise<boolean>;
   hasBoundCompletedCopy: (input: CreateCampaignInput) => Promise<boolean>;
   credentialPresent: () => boolean;
+  /** One-shot Autopilot production (media harvest/analysis, SAM, cinema, critic). Optional for legacy test doubles. */
+  produceAutopilotCampaign?: (input: AutopilotProductionInput) => Promise<AutopilotProductionResult>;
 }
 
 async function defaultDependencies(): Promise<WorkerDependencies> {
@@ -32,6 +36,7 @@ async function defaultDependencies(): Promise<WorkerDependencies> {
   ]);
   return {
     collectSources, analyzeBusiness, assertAnalysisInput, hasBoundCompletedAnalysis, createCampaign, assertCampaignInput, hasBoundCompletedCopy, discoverBusiness, enrichBusiness,
+    produceAutopilotCampaign: async (input) => (await import("../autopilot/pipeline")).produceAutopilotCampaign(input),
     hasCopyCheckpoint: async (input) => {
       const opportunity = input.report.opportunities.find((item) => item.id === input.opportunityId);
       return Boolean(opportunity && await readCopyCheckpoint(input, opportunity));
@@ -72,6 +77,7 @@ export async function runNextJob(options: { store?: JobStore; dependencies?: Wor
   let renderInput: CreateCampaignInput | undefined;
   let analysisInput: AnalyzeBusinessInput | undefined;
   let lostLease = false;
+  let autopilotRun = false;
   const heartbeat = setInterval(() => {
     void store.heartbeat(id, owner).then((owned) => { if (!owned) lostLease = true; }).catch(() => { lostLease = true; });
   }, 20_000);
@@ -188,6 +194,31 @@ export async function runNextJob(options: { store?: JobStore; dependencies?: Wor
       };
       try { await dependencies.assertCampaignInput(renderInput); }
       catch (error) { campaignPreflightRejected = true; throw error; }
+      if (input.autopilot && dependencies.produceAutopilotCampaign) {
+        // Autopilot owns its paid steps: each one reserves a per-role budget slot and the run-level
+        // call, writes its own requested-marker and stores its completed response before decoding.
+        if (!dependencies.credentialPresent()) {
+          await store.fail(id, owner, "Meta credentials are not available to the worker. Apply the existing environment key and retry; no Autopilot production request was made.", true);
+          return id;
+        }
+        safeBeforeModel = true;
+        autopilotRun = true;
+        const budget = createAutopilotBudget(outputDir, async () => {
+          if (lostLease) throw new Error("Worker lease was lost before the next Autopilot request.");
+          await store.reserveModelCall(id, owner);
+          paidRequestStarted = true;
+        });
+        const { reserveAdditionalModelCall: _unused, ...base } = renderInput;
+        void _unused;
+        const result = await dependencies.produceAutopilotCampaign({
+          ...base, runId: id, goal: business.goal, budget,
+          businessMediaDir: resolve(".data/businesses", business.id, "media"), connectionsDir: resolve(".data/connections"),
+          progress: (stage, message) => store.markStage(id, owner, stage, message), leaseLost: () => lostLease,
+        });
+        if (lostLease) throw new Error("Worker lease was lost.");
+        await store.completeCampaign(id, owner, result.campaign, result.usage, result.additionalUsage, { quality: result.quality });
+        return id;
+      }
       const resume = run.artifacts.find((item) => item.stage === "render_resume")?.payload as { copyCheckpointHash?: string } | undefined;
       // Any damaged paid-response artifact must fail closed. Only absence of both completed records permits a fresh request.
       safeBeforeModel = false;
@@ -244,6 +275,10 @@ export async function runNextJob(options: { store?: JobStore; dependencies?: Wor
           retrySafe = true;
         }
       } catch { /* A missing, corrupt or mismatched response never authorizes a paid analysis retry. */ }
+    }
+    if (autopilotRun && error instanceof AutopilotResumableError) {
+      message = error.message;
+      retrySafe = true;
     }
     if (error instanceof CampaignCopyValidationError && renderInput && dependencies) {
       try {

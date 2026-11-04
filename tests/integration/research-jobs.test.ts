@@ -53,7 +53,7 @@ beforeEach(async () => {
   const filename = join(directory, "test.db");
   const sqlite = new Database(filename);
   sqlite.pragma("foreign_keys = ON");
-  for (const migration of ["20261101000000_foundation", "20261101010000_research_jobs"]) sqlite.exec(await readFile(resolve("prisma/migrations", migration, "migration.sql"), "utf8"));
+  for (const migration of ["20261101000000_foundation", "20261101010000_research_jobs", "20261104000000_autopilot_budget"]) sqlite.exec(await readFile(resolve("prisma/migrations", migration, "migration.sql"), "utf8"));
   sqlite.close();
   client = new PrismaClient({ adapter: new PrismaBetterSqlite3({ url: `file:${filename}` }) });
   store = new JobStore(client);
@@ -788,4 +788,61 @@ test("an unbound completed-response error or corrupt response record never autho
     expect((await client.run.findUniqueOrThrow({ where: { id: another.id } })).retrySafe).toBe(false);
     await rm(resolve(".data/runs", another.id), { recursive: true, force: true });
   } finally { await rm(resolve(".data/runs", run.id), { recursive: true, force: true }); }
+});
+
+test("Autopilot auto-selects the recommended opportunity and continues to production in the same run", async () => {
+  const dep = dependencies();
+  const run = await store.enqueueResearch(businessId, { ...input, autopilot: true });
+  expect((await client.run.findUniqueOrThrow({ where: { id: run.id } })).modelCallLimit).toBeGreaterThan(6);
+  try {
+    await runNextJob({ store, dependencies: dep });
+    const selected = await store.view(run.id);
+    expect(selected.autopilot).toBe(true);
+    expect(selected.status).toBe("queued");
+    expect(selected.stage).toBe("creating");
+    expect(selected.selection).toEqual(expect.objectContaining({ opportunityId: "op1", selectedBy: "autopilot", basis: "report_recommendation" }));
+    // Repeating the same choice is idempotent and leaves the queued Autopilot production unchanged.
+    await store.enqueueCampaign(run.id, "op1");
+    expect((await store.view(run.id)).selection).toEqual(expect.objectContaining({ selectedBy: "autopilot" }));
+    await runNextJob({ store, dependencies: dep });
+    expect(dep.createCampaign).toHaveBeenCalledWith(expect.objectContaining({ opportunityId: "op1" }));
+    expect((await store.view(run.id)).stage).toBe("needs_review");
+  } finally { await rm(resolve(".data/runs", run.id), { recursive: true, force: true }); }
+});
+
+test("manual runs still wait for the owner's selection", async () => {
+  const run = await store.enqueueResearch(businessId, input);
+  expect((await client.run.findUniqueOrThrow({ where: { id: run.id } })).modelCallLimit).toBe(6);
+  await runNextJob({ store, dependencies: dependencies() });
+  const view = await store.view(run.id);
+  expect(view.autopilot).toBe(false);
+  expect(view.stage).toBe("awaiting_selection");
+  expect(view.selection).toBeNull();
+});
+
+test("owner approval binds to the exact bytes and rejects a changed file", async () => {
+  const { manifestDigest, approvableFiles } = await import("../../lib/jobs/approval");
+  const { createHash } = await import("node:crypto");
+  const dep = dependencies();
+  const runsRoot = join(directory, "runs");
+  const run = await store.enqueueResearch(businessId, { ...input, autopilot: true });
+  const bytes = Buffer.from("synthetic reel bytes");
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  const kit: CampaignKit = { ...campaign, id: "kit-approval", assets: [{ id: "reel", channel: "instagram_reels", filename: "instagram_reel.mp4", mediaType: "video", width: 1080, height: 1920, sha256, bytes: bytes.length }] };
+  dep.createCampaign = vi.fn(async () => ({ campaign: kit, usage }));
+  await runNextJob({ store, dependencies: dep });
+  await runNextJob({ store, dependencies: dep });
+  await mkdir(join(runsRoot, run.id), { recursive: true });
+  await writeFile(join(runsRoot, run.id, "instagram_reel.mp4"), bytes);
+  const digest = manifestDigest(kit.id, approvableFiles(kit));
+  await expect(store.approveCampaign(run.id, "0".repeat(64), { runsRoot })).rejects.toThrow("changed since you reviewed");
+  await writeFile(join(runsRoot, run.id, "instagram_reel.mp4"), Buffer.from("tampered reel bytes!"));
+  await expect(store.approveCampaign(run.id, digest, { runsRoot })).rejects.toThrow("changed or is missing");
+  await writeFile(join(runsRoot, run.id, "instagram_reel.mp4"), bytes);
+  const approved = await store.approveCampaign(run.id, digest, { runsRoot });
+  expect(approved.approval?.manifestDigest).toBe(digest);
+  expect(approved.approval?.scope).toBe("owner_approved_concept_not_published");
+  expect(approved.stage).toBe("owner_approved");
+  await expect(store.approveCampaign(run.id, digest, { runsRoot })).rejects.toThrow("already approved");
+  await rm(resolve(".data/runs", run.id), { recursive: true, force: true });
 });

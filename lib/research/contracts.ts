@@ -21,6 +21,8 @@ export const ResearchInputSchema = z.object({
   readWebsite: z.boolean(),
   discoverFromLink: z.boolean().optional(),
   enrichFromLink: z.boolean().optional(),
+  /** One-shot Autopilot: auto-select the best-supported opportunity and continue to a review-ready kit. */
+  autopilot: z.boolean().optional(),
 }).strict();
 export type ResearchInput = z.infer<typeof ResearchInputSchema>;
 
@@ -156,12 +158,40 @@ export const CampaignKitSchema = z.object({
 }).strict();
 export type CampaignKit = z.infer<typeof CampaignKitSchema>;
 export interface RunEvent { stage: string; message: string; at: string }
+
+/** How Autopilot chose the campaign opportunity; recorded with the immutable selection checkpoint. */
+export const AutopilotSelectionSchema = z.object({
+  opportunityId: z.string().min(1), reportHash: z.string().regex(/^[a-f0-9]{64}$/),
+  selectedBy: z.literal("autopilot"), basis: z.enum(["report_recommendation", "highest_complete_score", "first_supported"]),
+  score: z.number().int().min(0).max(100).nullable(), rationale: z.string().max(600),
+}).strict();
+export type AutopilotSelection = z.infer<typeof AutopilotSelectionSchema>;
+
+/** The owner's single final approval, bound to the exact exported bytes. Publication remains a separate step. */
+export const CampaignApprovalSchema = z.object({
+  version: z.literal(1), campaignId: z.string().min(1), approvedAt: z.string().datetime(),
+  manifestDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  files: z.array(z.object({ filename: z.string(), sha256: z.string().regex(/^[a-f0-9]{64}$/), bytes: z.number().int().nonnegative() }).strict()).min(1).max(200),
+  withheldFiles: z.array(z.string()).max(200),
+  statement: z.string().max(600),
+  scope: z.literal("owner_approved_concept_not_published"),
+}).strict();
+export type CampaignApproval = z.infer<typeof CampaignApprovalSchema>;
+
 export interface RunView {
   id: string; businessId: string; stage: string; status: string; createdAt: string; updatedAt: string;
   mode: ResearchMode; error: string | null; business: BusinessContext;
   sources: CollectedSource[]; report: ResearchReport | null; campaign: CampaignKit | null;
   discovery?: BusinessDiscovery | null;
   enrichment?: BusinessEnrichment | null;
+  /** True when this run was started in one-shot Autopilot mode. */
+  autopilot?: boolean;
+  selection?: AutopilotSelection | { opportunityId: string; selectedBy: "owner" } | null;
+  approval?: CampaignApproval | null;
+  /** Autopilot production quality record (critic verdict, withheld files, plan summary). */
+  quality?: import("../autopilot/production-types").AutopilotQuality | null;
+  /** Digest of the current approvable files; the owner's approval must echo it. */
+  approvalDigest?: string | null;
   events: RunEvent[]; usage: ModelUsage[];
 }
 

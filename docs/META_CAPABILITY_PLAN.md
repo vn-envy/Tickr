@@ -6,6 +6,28 @@ Capability facts come from Meta developer docs retrieved 4 November 2026: [model
 
 ---
 
+## 0. Product decision (4 November 2026): one-shot Autopilot
+
+The owner shares **only** their listing link (Google Maps link or website) and a campaign goal. On the same first screen they may also connect Instagram/Facebook with Meta login and drop in phone photos or videos. Everything after that runs autonomously until a **review-ready** campaign kit with reel-worthy content exists. The owner then gives **one** final approval, bound to the exact file hashes.
+
+- **Google listing content is not read.** AGENTS.md forbids fetching Maps pages or using Places. The short link only provides an identity hint, and Meta-native search discovers the business from it.
+- **Media sources** are the official website (the permitted, SSRF-safe reader), the owner's own Instagram and Facebook media through the Meta Graph API (owner OAuth, bytes downloaded only from Meta CDNs), and owner uploads.
+- **Autonomous pipeline:**
+  1. Discover and enrich the business.
+  2. Harvest media from every permitted source.
+  3. Muse Spark analyses **every** image and video against the owner's goal: what it shows, its quality, its fit with the goal, risks (people, logos, offer text) and a grounded box around the subject.
+  4. Rank and select assets deterministically.
+  5. Pick the best-supported opportunity automatically, with the reasoning recorded.
+  6. Cut out the subjects of the selected stills with SAM 3.1, prompted by Spark's boxes.
+  7. Track the hero product through the owner's best clip with SAM 3.1.
+  8. Render a cinematic Reel: tracked real footage, or a "depth" Reel built from a still.
+  9. Build a carousel from several different real photos, plus every channel asset.
+  10. Spark critiques the stills and watches the Reel; deterministic fixes are applied.
+  11. Export the kit with a director's report.
+- **One final approval.** Nothing is marked ready, published or sent without the owner's explicit approval of the exact bytes.
+
+---
+
 ## 1. Where the build is today
 
 | Area | What exists | What's left unused |
