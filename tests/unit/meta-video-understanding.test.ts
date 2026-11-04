@@ -68,6 +68,17 @@ describe("frame helpers", () => {
 });
 
 describe("Muse Spark shot log", () => {
+  test("accepts owner-connected Instagram and Facebook clips (consent still required)", async () => {
+    for (const provenance of ["owner_instagram", "owner_facebook"] as const) {
+      const request = await clipRequest({ provenance });
+      const fake = client(sparkResponse(shotLog()));
+      const log = await analyzeClipShots(request, { client: fake, responseDirectory: await directory(), environment: {} });
+      expect(log.moments.length).toBeGreaterThan(0);
+    }
+    const foreign = await clipRequest({ provenance: "official_website" as never });
+    await expect(analyzeClipShots(foreign, { client: client(sparkResponse(shotLog())), responseDirectory: await directory(), environment: {} })).rejects.toThrow();
+  });
+
   test("sends the verified clip inline as input_video with strict structured output", async () => {
     const request = await clipRequest();
     const fake = client(sparkResponse(shotLog()));

@@ -378,7 +378,7 @@ async function trackedReel(context: ReelContext, reel: Extract<ReelPlan, { mode:
   const endStill = reel.fallbackStill ? context.stills.get(reel.fallbackStill.assetId) : undefined;
   const endLayer = reel.fallbackStill ? context.layers.get(reel.fallbackStill.assetId) : undefined;
   const endMask = endLayer ? await readFile(endLayer.maskPath) : null;
-  const endCard = endStill && endMask && sha256Hex(endMask) === endLayer!.maskSha256 ? { source: await sharp(endStill.bytes).png().toBuffer(), subjectMask: endMask } : undefined;
+  const endCard = endStill && endMask && sha256Hex(endMask) === endLayer!.maskSha256 ? { source: await sharp(endStill.bytes).png().toBuffer(), subjectMask: endMask, provenanceLabel: stillProvenanceLabel(endStill.provenance, true) } : undefined;
   let result: Awaited<ReturnType<typeof renderTrackedReel>>;
   try {
     result = await renderTracked({

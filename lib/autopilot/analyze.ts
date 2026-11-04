@@ -179,7 +179,6 @@ export async function analyzeHarvest(input: AnalyzeInput): Promise<AnalysisRecor
   for (const video of videos) {
     const clip = clips[video.assetId];
     if (!clip) continue;
-    if (clip.provenance !== "owner_upload") { notes.push("Shot logs for connected-account videos are not enabled yet; that footage was not used for the Reel."); continue; }
     if ((await stat(clip.path)).size > SHOTLOG_MAX_CLIP_BYTES) { notes.push("A prepared clip exceeded the shot-log size limit, so it was not analyzed."); continue; }
     const directory = join(input.directory, "spark-shotlog", video.assetId);
     const gate = await input.gate("spark_shotlog", directory, "spark-shotlog");

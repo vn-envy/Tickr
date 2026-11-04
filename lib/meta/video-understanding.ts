@@ -134,7 +134,8 @@ const clipSchema = z.object({
   fps: z.number().positive().max(240),
   frameCount: z.number().int().min(1).max(15_000),
   durationSeconds: z.number().positive().max(900),
-  provenance: z.literal("owner_upload"),
+  // Owner uploads and owner-connected Instagram/Facebook clips; all carry the owner consent attestation.
+  provenance: z.enum(["owner_upload", "owner_instagram", "owner_facebook"]),
   consent: z.object({ ownsOrLicensedMedia: z.literal(true) }).passthrough(),
 }).passthrough();
 
