@@ -43,10 +43,18 @@ const maskKeys = new Set(["x", "y", "data", "c"]);
  * grammar, but rejects unsupported fields, duplicate identities and multi-frame data.
  */
 export function preflightSegmentationWire(text: string, sourceWidth: number, sourceHeight: number): number {
+  return preflightSegmentationObjectIds(text, sourceWidth, sourceHeight).length;
+}
+
+/**
+ * The same bounded preflight, returning the declared object ids in wire order. Geometry
+ * adapters use it to reject unprompted identities before any mask payload is decoded.
+ */
+export function preflightSegmentationObjectIds(text: string, sourceWidth: number, sourceHeight: number): string[] {
   if (!Number.isSafeInteger(sourceWidth) || !Number.isSafeInteger(sourceHeight) || sourceWidth < 1 || sourceHeight < 1
     || sourceWidth * sourceHeight > MAX_SOURCE_PIXELS || Buffer.byteLength(text) > MAX_WIRE_BYTES) invalid();
   const wire = text.trim();
-  if (!wire) return 0;
+  if (!wire) return [];
   if (!wire.startsWith("<0f>")) invalid();
   const recordStart = /,?([0-9]+)(?=<\|)/y;
   const token = /<\|([A-Za-z][A-Za-z0-9_.-]*)(?:;([^|]*))?\|>/y;
@@ -85,5 +93,5 @@ export function preflightSegmentationWire(text: string, sourceWidth: number, sou
     if (!Number.isSafeInteger(pixels) || pixels > MAX_TOTAL_MASK_PIXELS) invalid();
   }
   if (!seen.size) invalid();
-  return seen.size;
+  return [...seen];
 }

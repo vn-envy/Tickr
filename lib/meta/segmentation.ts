@@ -5,7 +5,8 @@ import { z } from "zod";
 import { MetaClient } from "./client";
 import { MetaClientError, getMetaModelConfig } from "./config";
 import { markSegmentationRequested, readStoredSegmentationResponse, storeSegmentationResponse, type StoredSegmentationResponse } from "./segmentation-response";
-import { preflightSegmentationWire, SegmentationPreflightError } from "./segmentation-preflight";
+import { preflightSegmentationObjectIds, SegmentationPreflightError } from "./segmentation-preflight";
+import { buildSamGeometryPrompt, SAM_MAX_OBJECTS, SamPromptError, type SamObjectPrompt } from "./sam-prompts";
 
 const MAX_SOURCE_BYTES = 8 * 1024 * 1024;
 const MAX_SOURCE_PIXELS = 16_777_216;
@@ -14,16 +15,38 @@ const MAX_WIRE_BYTES = 4 * 1024 * 1024;
 const MAX_OUTPUT_BYTES = 32 * 1024 * 1024;
 const sha256 = (bytes: Uint8Array | string) => createHash("sha256").update(bytes).digest("hex");
 
+/**
+ * Exactly one of `prompt` (concept) or `geometry` (box/point prompts) is required; both are
+ * optional in the type only so existing concept callers and spreads keep compiling. The
+ * adapter rejects requests with neither or both before any model call.
+ */
 export interface MetaSegmentationRequest {
   bytes: Uint8Array;
   mimeType: "image/png" | "image/jpeg" | "image/webp";
   /** A short noun phrase identifying one visible object type. */
-  prompt: string;
+  prompt?: string;
+  /**
+   * SAM 3.1 geometry prompts in decoded (oriented) source pixels, all on frame 0. Labels and
+   * origins stay local: only the box/point text is sent. Cannot be combined with `prompt`.
+   */
+  geometry?: readonly SamObjectPrompt[];
   sourceAssetId: string;
   sourceProvenance: "source_photo" | "owner_photo" | "meta_illustration";
 }
+export type MetaSegmentationRegionOrigin = SamObjectPrompt["origin"] | "concept_prompt";
+export type MetaSegmentationPromptKind = "concept" | "geometry";
+/**
+ * Fields marked "always set by the adapter" are optional in the type only so results recorded
+ * before geometry prompts existed remain assignable; absent values mean a concept result.
+ */
 export interface MetaSegmentedObject {
   id: string;
+  /** The prompted geometry object id SAM echoed; null for concept prompts. Always set by the adapter. */
+  promptObjectId?: number | null;
+  /** Local label of the prompted geometry object (never sent to Meta); null for concept prompts. Always set by the adapter. */
+  label?: string | null;
+  /** Where the selection request came from. Not a verified product identity. Always set by the adapter. */
+  regionOrigin?: MetaSegmentationRegionOrigin;
   /** Half-open bounds in the unchanged source raster. */
   bounds: { left: number; top: number; right: number; bottom: number };
   confidence: number | null;
@@ -39,6 +62,10 @@ export interface MetaSegmentationResult {
   status: "segmented" | "no_match";
   model: "sam-3.1";
   endpoint: "/responses";
+  /** Always set by the adapter. */
+  promptKind?: MetaSegmentationPromptKind;
+  /** Prompted geometry ids without a usable (non-empty) mask, ascending; [] for concept prompts. Always set by the adapter. */
+  unmatchedPromptIds?: number[];
   responseId: string;
   width: number;
   height: number;
@@ -54,7 +81,10 @@ export interface MetaSegmentationResult {
     preservationScope: "decoded_source_rgb_and_original_alpha_multiplied_by_binary_mask";
     semanticIdentityVerified: false;
     requiresReview: true;
+    /** SHA-256 of the exact input_text sent (noun phrase or geometry prompt text). */
     promptSha256: string;
+    /** Always set by the adapter. */
+    promptKind?: MetaSegmentationPromptKind;
   };
 }
 export interface MetaSegmentationDependencies {
@@ -111,8 +141,12 @@ async function inspectSource(request: MetaSegmentationRequest) {
     : bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255 ? "jpeg"
       : bytes.subarray(0, 4).toString() === "RIFF" && bytes.subarray(8, 12).toString() === "WEBP" ? "webp" : null;
   if (!signature || request.mimeType !== `image/${signature}`) throw invalid("Segmentation accepts genuine PNG, JPEG or WebP bytes with matching MIME types.");
-  const prompt = request.prompt.trim();
-  if (!prompt || prompt.length > 120 || /[<>\r\n\u0000-\u001f]/.test(prompt)) throw invalid("Segmentation needs one short noun phrase without control tokens.");
+  const hasPrompt = request.prompt !== undefined, hasGeometry = request.geometry !== undefined;
+  if (hasPrompt === hasGeometry) throw invalid("Segmentation needs exactly one concept noun phrase or one set of geometry prompts.");
+  const prompt = typeof request.prompt === "string" ? request.prompt.trim() : "";
+  if (hasPrompt && (!prompt || prompt.length > 120 || /[<>\r\n\u0000-\u001f]/.test(prompt))) throw invalid("Segmentation needs one short noun phrase without control tokens.");
+  const parsedGeometry = hasGeometry ? geometryRequestSchema.safeParse(request.geometry) : null;
+  if (parsedGeometry && !parsedGeometry.success) throw invalid("Segmentation geometry needs 1 to 16 labelled box or point prompts with explicit origins.");
   if (!request.sourceAssetId.trim() || request.sourceAssetId.length > 200) throw invalid("Segmentation requires a bounded source asset ID.");
   if (!["source_photo", "owner_photo", "meta_illustration"].includes(request.sourceProvenance)) throw invalid("Segmentation requires explicit original image provenance.");
   try {
@@ -123,12 +157,33 @@ async function inspectSource(request: MetaSegmentationRequest) {
     }
     const decoded = await image.ensureAlpha().raw().toBuffer({ resolveWithObject: true });
     if (decoded.info.channels !== 4 || decoded.info.width !== metadata.width || decoded.info.height !== metadata.height) throw invalid("The segmentation source raster could not be normalized safely.");
-    return { bytes, prompt, width: metadata.width, height: metadata.height, rgba: decoded.data };
+    const geometry = parsedGeometry?.success ? parsedGeometry.data : null;
+    const base = { bytes, width: metadata.width, height: metadata.height, rgba: decoded.data };
+    if (!geometry) return { ...base, promptKind: "concept" as const, text: prompt, objects: [] as GeometryObject[] };
+    // Orientation 1 is enforced above, so stored and displayed sizes are identical.
+    let text: string;
+    try { text = buildSamGeometryPrompt(geometry, { width: metadata.width, height: metadata.height }, { media: "image" }); }
+    catch (error) { throw invalid(error instanceof SamPromptError ? error.message : "Segmentation geometry could not be prepared safely."); }
+    return { ...base, promptKind: "geometry" as const, text, objects: geometry.map(({ objectId, label, origin }) => ({ objectId, label, origin })) };
   } catch (error) {
     if (error instanceof MetaClientError) throw error;
     throw invalid("The segmentation source could not be decoded within its pixel limit.");
   }
 }
+interface GeometryObject { objectId: number; label: string; origin: SamObjectPrompt["origin"] }
+const pixel = z.number().int().nonnegative();
+// Field-level validation; buildSamGeometryPrompt then enforces media bounds, id uniqueness and grammar.
+const geometryRequestSchema = z.array(z.object({
+  objectId: z.number().int().min(0).max(SAM_MAX_OBJECTS - 1),
+  label: z.string().trim().min(1).max(120).regex(/^[^\u0000-\u001f\u007f]+$/),
+  origin: z.enum(["owner_tap", "spark_grounding", "local_layout"]),
+  prompts: z.array(z.object({
+    frame: z.number().int().nonnegative(),
+    box: z.object({ x1: pixel, y1: pixel, x2: pixel, y2: pixel }).optional(),
+    points: z.array(z.object({ x: pixel, y: pixel, polarity: z.enum(["positive", "negative"]) })).max(64).optional(),
+  })).min(1).max(32),
+})).min(1).max(SAM_MAX_OBJECTS);
+
 const responseSchema = z.object({
   id: z.string().min(1).max(200), status: z.literal("completed"), model: z.literal("sam-3.1").optional(),
   output: z.array(z.object({ type: z.string(), content: z.array(z.object({ type: z.string(), text: z.string().max(MAX_WIRE_BYTES).optional() }).passthrough()).max(8).optional() }).passthrough()).max(32),
@@ -146,10 +201,14 @@ async function decodeResult(response: unknown, request: MetaSegmentationRequest,
   const text = lanes[0]?.text?.trim() ?? "";
   if (Buffer.byteLength(text) > MAX_WIRE_BYTES) throw invalid("Segmentation output exceeded its byte limit.", true);
   const objects: MetaSegmentedObject[] = [];
+  const prompted = new Map(source.objects.map((object) => [String(object.objectId), object]));
   if (text) {
     // The official parser decodes payloads during finish(), so dimensions and
     // aggregate allocation must be bounded before handing it any mask tokens.
-    const objectCount = preflightSegmentationWire(text, source.width, source.height);
+    const declaredIds = preflightSegmentationObjectIds(text, source.width, source.height);
+    const objectCount = declaredIds.length;
+    // Geometry ids are echoed verbatim; anything else (including "03" for 3) is not ours.
+    if (source.promptKind === "geometry" && declaredIds.some((id) => !prompted.has(id))) throw invalid("Segmentation returned an object that was not prompted.", true);
     const parser = formats.segmentation.image().createParser();
     let result: ReturnType<typeof parser.finish>["result"];
     try { parser.push(text, { emit: false }); result = parser.finish({ status: "completed" }).result; }
@@ -185,15 +244,18 @@ async function decodeResult(response: unknown, request: MetaSegmentationRequest,
       ]);
       totalBytes += maskPng.length + cutoutPng.length;
       if (totalBytes > MAX_OUTPUT_BYTES) throw invalid("Segmentation artifacts exceeded the total output byte limit.", true);
-      objects.push({ id: record.objectId, bounds: { left, top, right, bottom }, confidence: record.confidence ?? null, foregroundPixels, coverageFraction: foregroundPixels / (source.width * source.height), maskPng, cutoutPng, sha256: sha256(cutoutPng) });
+      const origin = prompted.get(record.objectId);
+      objects.push({ id: record.objectId, promptObjectId: origin ? origin.objectId : null, label: origin ? origin.label : null, regionOrigin: origin ? origin.origin : "concept_prompt", bounds: { left, top, right, bottom }, confidence: record.confidence ?? null, foregroundPixels, coverageFraction: foregroundPixels / (source.width * source.height), maskPng, cutoutPng, sha256: sha256(cutoutPng) });
     }
   }
+  const returned = new Set(objects.map((object) => object.id));
   return {
-    status: objects.length ? "segmented" : "no_match", model: "sam-3.1", endpoint: "/responses", responseId: parsed.data.id,
+    status: objects.length ? "segmented" : "no_match", model: "sam-3.1", endpoint: "/responses", promptKind: source.promptKind,
+    unmatchedPromptIds: source.objects.map((object) => object.objectId).filter((id) => !returned.has(String(id))).sort((a, b) => a - b), responseId: parsed.data.id,
     width: source.width, height: source.height, sourceSha256: sha256(source.bytes), elapsedMs, objects,
     usage: { inputTokens: parsed.data.usage?.input_tokens ?? null, outputTokens: parsed.data.usage?.output_tokens ?? null, totalTokens: parsed.data.usage?.total_tokens ?? null, imagesProcessed: parsed.data.usage?.images_processed ?? null },
     provenance: { kind: "meta_segmentation", sourceAssetId: request.sourceAssetId, sourceProvenance: request.sourceProvenance, originalSubjectPixelsPreserved: true,
-      preservationScope: "decoded_source_rgb_and_original_alpha_multiplied_by_binary_mask", semanticIdentityVerified: false, requiresReview: true, promptSha256: sha256(source.prompt) },
+      preservationScope: "decoded_source_rgb_and_original_alpha_multiplied_by_binary_mask", semanticIdentityVerified: false, requiresReview: true, promptSha256: sha256(source.text), promptKind: source.promptKind },
   };
 }
 
@@ -202,8 +264,18 @@ export async function decodeMetaSegmentationResponse(response: unknown, request:
   return decodeResult(response, request, await inspectSource(request), elapsedMs);
 }
 
+/**
+ * Concept bindings are byte-identical to the original version-1 JSON so previously saved
+ * responses keep recovering. Geometry bindings use version 2 and cover the exact prompt
+ * text plus the local labels/origins that the decoded result reports.
+ */
 function requestBinding(request: MetaSegmentationRequest, source: SourceRaster): string {
-  return sha256(JSON.stringify({ version: 1, model: "sam-3.1", sourceSha256: sha256(source.bytes), mimeType: request.mimeType, prompt: source.prompt,
+  if (source.promptKind === "concept") {
+    return sha256(JSON.stringify({ version: 1, model: "sam-3.1", sourceSha256: sha256(source.bytes), mimeType: request.mimeType, prompt: source.text,
+      sourceAssetId: request.sourceAssetId, sourceProvenance: request.sourceProvenance, maskEncoding: "one_bit", includeConfidence: true }));
+  }
+  return sha256(JSON.stringify({ version: 2, model: "sam-3.1", promptKind: "geometry", sourceSha256: sha256(source.bytes), mimeType: request.mimeType, geometry: source.text,
+    objects: source.objects.map(({ objectId, label, origin }) => ({ objectId, label, origin })),
     sourceAssetId: request.sourceAssetId, sourceProvenance: request.sourceProvenance, maskEncoding: "one_bit", includeConfidence: true }));
 }
 async function recoverSource(request: MetaSegmentationRequest, source: SourceRaster, directory: string): Promise<MetaSegmentationResult | null> {
@@ -244,7 +316,7 @@ export async function segmentMetaImage(request: MetaSegmentationRequest, depende
   let response: unknown;
   try {
     response = await client.requestJson("/responses", { method: "POST", modelRole: "segmentation", body: {
-      model, input: [{ type: "message", role: "user", content: [{ type: "input_text", text: source.prompt }, { type: "input_image", image_url: `data:${request.mimeType};base64,${source.bytes.toString("base64")}` }] }],
+      model, input: [{ type: "message", role: "user", content: [{ type: "input_text", text: source.text }, { type: "input_image", image_url: `data:${request.mimeType};base64,${source.bytes.toString("base64")}` }] }],
       stream: false, store: false, metadata: { mask_encoding: "one_bit", include_confidence: "true" },
     } });
   } catch (error) { throw wrappedFailure(error, "request", false, undefined, Date.now() - started); }
