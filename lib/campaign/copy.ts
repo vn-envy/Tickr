@@ -279,13 +279,17 @@ const ASK_JOINER = String.raw`\b(?:and|but|or|nor|yet|then|so|because|while|whil
 const ASK_STOP_CHARS = String.raw`.!?,;:‐-―−…()\[\]{}\/|\\\n\r  •·‣◦▪\p{Extended_Pictographic}`;
 /**
  * "Ask the team about the Brownies and Cheesecake Range and what is available for pickup": only after "ask" or "check
- * [with] [addressee] about", a plain list of at most six words naming items (letters only; no list stop such as "is",
- * "which", "available", "today" or "with", and no sale, stock, offer, delivery or price word; inner "and" / "&" join
- * items), then "and" and the question word. A comma, a relative clause, a state or any other word ends the list, so the
- * allowance does not apply and the text stays checked. The whole clause, items included, keeps every asked-clause stop
- * rule, the claim-vocabulary test and the affirmed-answer test.
+ * [with] [addressee] about", a plain list of at most six words naming items, then "and" and the question word. Each item
+ * word starts with a letter and holds only letters, apostrophes, hyphens and "&" ("Grandma's", "pain-au-chocolat",
+ * "M&S"); it is not a list stop such as "is", "which", "available", "today" or "with", nor such a stop joined by an
+ * apostrophe or hyphen ("it's", "we're", "sold-out", "in-store"), nor a "restock" word, and no hyphen-joined part of
+ * it is a sale, stock, offer, delivery or price word ("on-sale", "half-price"); inner "and" / "&" join items. A digit, a comma, a relative
+ * clause, a state or any other word ends the list, so the allowance does not apply and the text stays checked. The
+ * whole clause, items included, keeps every asked-clause stop rule, the claim-vocabulary test and the affirmed-answer
+ * test, and the sensitive-claim checks still read the raw text.
  */
-const ASK_ABOUT_ITEMS = String.raw`(?:ask|check)${ASK_ADDRESSEE}\s+about\s+${PREFILL_LIST_WORD}(?:\s+(?:${PREFILL_LIST_WORD}|and|&)){0,5}(?<!\s(?:and|&))\s+and\s+`;
+const ASK_ITEM_WORD = String.raw`(?!${PREFILL_LIST_STOP}['’-])(?![\p{L}'’&-]*?restock)${PREFILL_LIST_WORD}`;
+const ASK_ABOUT_ITEMS = String.raw`(?:ask|check)${ASK_ADDRESSEE}\s+about\s+${ASK_ITEM_WORD}(?:\s+(?:${ASK_ITEM_WORD}|and|&)){0,5}(?<!\s(?:and|&))\s+and\s+`;
 const ASKED_CLAUSE = new RegExp(String.raw`\b(?:${ASK_VERB}${ASK_ADDRESSEE}\s*:?\s+(?:about\s+)?|${ASK_ABOUT_ITEMS})(?:whether|if|what|which)\b(?:(?!${ASK_JOINER}|(?<![\p{L}\p{N}])-|-(?![\p{L}\p{N}]))[^${ASK_STOP_CHARS}])*`, "giu");
 /**
  * An asked clause that itself names a sale, stock, discount, offer, deal, free item, delivery, booking, slot, immediate
@@ -498,23 +502,33 @@ function fallbackText(kind: FallbackKind, focus: string): string {
   }
 }
 
-/** Planning and production words that may end a channel title; "part", "slide" and "scene" only with a number. */
-const TITLE_PLANNING_WORDS = new Set(["introduction", "intro", "concept", "concepts", "narrative", "storyboard", "campaign", "carousel", "reel", "reels", "scene", "scenes", "slide", "slides"]);
-const TITLE_NUMBERED_WORDS = new Set(["part", "slide", "scene"]);
+/**
+ * Unambiguous planning labels, cut from the end of a channel title on their own. Media and structure words that can
+ * also name a real offering or theme ("Water Slides", "Fishing Reel", "Vintage Carousel", "Sweet Scenes", "Election
+ * Campaign") are cut only as a numbered label ("Part 2", "Slide 3", "Reel 1"), or when they open a separated label
+ * segment that ends in a cut label ("Weekend loaf: Carousel Story Introduction", "Weekend loaf – Reel Concept"); "Water
+ * Slides Concept" keeps "Water Slides". "story" goes only directly before a cut label ("Taste of Home Story Introduction").
+ */
+const TITLE_PLANNING_WORDS = new Set(["introduction", "intro", "concept", "concepts", "narrative", "storyboard"]);
+const TITLE_MEDIA_WORDS = new Set(["campaign", "carousel", "reel", "reels", "scene", "scenes", "slide", "slides"]);
+const TITLE_NUMBERED_WORDS = new Set(["part", "slide", "scene", "reel", "carousel"]);
 const TITLE_NUMBER = /^(?:[1-9]|1[0-2]|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)$/u;
 const TITLE_FUNCTION_WORDS = new Set(["a", "an", "the", "our", "your", "my", "his", "her", "its", "their", "of", "and", "or", "&", "to", "for", "with", "in", "on", "at", "from", "by", "this", "that"]);
+/** A kept title must not end on a possessive or contraction ("Grandma's", "Kids'") whose noun was cut. */
+const TITLE_DANGLING_APOSTROPHE = /['’](?:s)?$/iu;
 
 /**
  * A channel title is printed on that channel's image as a short uppercase kicker, so a trailing planning label ("Taste
  * of Home Story Introduction", "Weekend loaf – Concept", "Taste of Home Part 2") is cut back to the consumer words before
- * it. Words are only ever removed from the end, never added or reworded. A "story" directly before the removed label goes
- * too, unless that would leave a dangling word ("Our Story Reel" keeps "Our Story"). The longest cut that leaves at least
- * one word, does not end on a function word, keeps brackets balanced and keeps every protected name (the focus offering)
- * whole is used; when there is none, the title is left as written.
+ * it. Words are only ever removed from the end, never added or reworded. The longest cut that leaves at least one word,
+ * does not end on a function word or a possessive, keeps brackets balanced and keeps every protected name (the
+ * discovered offerings) whole is used; when there is none, the title is left as written.
  */
 export function cleanChannelTitle(title: string, protectedNames: readonly string[] = []): string {
   const words = title.trim().split(/\s+/u).filter(Boolean);
   const bare = (word: string | undefined) => (word ?? "").replace(/^[\p{P}]+|[\p{P}]+$/gu, "").toLowerCase();
+  // A word opens a label segment at the start, inside an opening bracket, or after a dash, colon, bar or middle dot.
+  const opensSegment = (index: number) => index === 0 || /^[([]/u.test(words[index]) || /[\p{Pd}:|·]$/u.test(words[index - 1]);
   // Every point the title could be cut back to, from the least to the most removed.
   const cuts: number[] = [];
   let end = words.length;
@@ -524,6 +538,7 @@ export function cleanChannelTitle(title: string, protectedNames: readonly string
     else if (TITLE_PLANNING_WORDS.has(word)) end--;
     else if (TITLE_NUMBER.test(word) && end > 1 && TITLE_NUMBERED_WORDS.has(bare(words[end - 2]))) end -= 2;
     else if (word === "story" && cuts.length) end--;
+    else if (TITLE_MEDIA_WORDS.has(word) && cuts.length && opensSegment(end - 1)) end--;
     else break;
     if (!/^[\p{P}]+$/u.test(words[end] ?? "")) cuts.push(end);
   }
@@ -532,24 +547,35 @@ export function cleanChannelTitle(title: string, protectedNames: readonly string
   const names = protectedNames.map(normalize).filter((name) => name && normalize(title).includes(name));
   for (const cut of [...cuts].reverse()) {
     const kept = words.slice(0, cut).join(" ").replace(/[\s\p{Pd}:|·,;(]+$/u, "").trim();
-    const last = bare(kept.split(/\s+/u).at(-1));
+    const lastWord = kept.split(/\s+/u).at(-1) ?? "";
     const brackets = (kept.match(/\(/g) ?? []).length === (kept.match(/\)/g) ?? []).length;
-    if (/[\p{L}\p{N}]/u.test(kept) && !TITLE_FUNCTION_WORDS.has(last) && brackets && names.every((name) => normalize(kept).includes(name))) return kept;
+    if (/[\p{L}\p{N}]/u.test(kept) && !TITLE_FUNCTION_WORDS.has(bare(lastWord)) && !TITLE_DANGLING_APOSTROPHE.test(lastWord) && brackets && names.every((name) => normalize(kept).includes(name))) return kept;
   }
   return title;
 }
 
+/** Names a title cut must keep whole: the focus name and every discovered offering. */
+const titleProtectedNames = (copy: CampaignCopy, enrichment?: BusinessEnrichment) =>
+  [copy.creativeBrief?.focus.name ?? "", ...(enrichment?.offerings ?? []).map((offering) => offering.name)].filter((name) => name.trim());
+
 /** Moves isolated production labels out of consumer fields and returns the review note that records them, if any. */
-function moveProductionNotes(copy: CampaignCopy): string | null {
+function moveProductionNotes(copy: CampaignCopy, enrichment?: BusinessEnrichment): string | null {
   const removed: string[] = [];
-  // The title is the kicker printed on the channel image; a planning label at its end is cut back, never reworded.
-  for (const channel of copy.channels) channel.title = cleanChannelTitle(channel.title, copy.creativeBrief?.focus.name ? [copy.creativeBrief.focus.name] : []);
+  // The title is the kicker printed on the channel image; a planning label at its end is cut back, never reworded, and
+  // the cut words are recorded with the other moved production labels.
+  const names = titleProtectedNames(copy, enrichment);
+  for (const channel of copy.channels) {
+    const written = channel.title.trim().split(/\s+/u).filter(Boolean).join(" ");
+    const kept = cleanChannelTitle(channel.title, names);
+    if (kept !== channel.title) removed.push(`Channel title label “${written.slice(kept.length).replace(/^[\s\p{P}]+|[\s\p{P}]+$/gu, "")}”.`);
+    channel.title = kept;
+  }
   copy.name = cleanConsumerCopy(copy.name);
   copy.coreMessage = cleanConsumerCopy(copy.coreMessage);
   copy.primaryCta = cleanConsumerCopy(copy.primaryCta);
   for (const channel of copy.channels) for (const field of ["headline", "body", "caption", "cta"] as const) channel[field] = cleanConsumerCopy(channel[field], removed);
   for (const scene of copy.creativeBrief?.scenes ?? []) { scene.headline = cleanConsumerCopy(scene.headline, removed); scene.body = cleanConsumerCopy(scene.body, removed); }
-  return removed.length ? `${PRODUCTION_NOTE_PREFIX} ${unique(removed).join(" ")}` : null;
+  return removed.length ? excerpt(`${PRODUCTION_NOTE_PREFIX} ${unique(removed).join(" ")}`, 500) : null;
 }
 
 /**
@@ -745,7 +771,7 @@ export function validateCompletedCampaignCopy(input: unknown, report: ResearchRe
   // cannot impersonate them, so it can neither forge one nor crowd a real one out under the note cap.
   parsed.reviewNotes = parsed.reviewNotes.map(authoredNote);
   // The repair judges the same consumer text strict validation judges: production labels are moved out first.
-  const moved = moveProductionNotes(parsed);
+  const moved = moveProductionNotes(parsed, enrichment);
   if (moved) parsed.reviewNotes = unique([...parsed.reviewNotes, moved]);
   try { return validateCampaignCopy(structuredClone(parsed), report, opportunity, sources, enrichment); }
   catch { /* Repaired below; a failure the repair cannot fix is thrown again by strict validation. */ }
@@ -758,7 +784,7 @@ export function validateCompletedCampaignCopy(input: unknown, report: ResearchRe
 export function validateCampaignCopy(input: unknown, report: ResearchReport, opportunity: ResearchOpportunity, sources: readonly CollectedSource[] = [], enrichment?: BusinessEnrichment): CampaignCopy {
   const copy = CampaignCopySchema.parse(input);
   if (report.mode === "live") copy.reviewNotes = copy.reviewNotes.map((note) => note.replace(/\bvisibly label(?:ed|led) synthetic\b/gi, "visibly labeled as a review-only concept"));
-  const moved = moveProductionNotes(copy);
+  const moved = moveProductionNotes(copy, enrichment);
   if (moved) copy.reviewNotes = [...new Set([...copy.reviewNotes, moved])];
   const { ownFacts, isSummary, normalize, validateCurrentClaims, validateSensitiveCopy } = campaignClaimRules(report, opportunity, sources, enrichment, focusOfferingName(copy, enrichment));
   if (!ownFacts.size) throw new Error("Provide attributable business evidence before creating a campaign concept.");

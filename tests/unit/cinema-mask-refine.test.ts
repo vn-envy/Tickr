@@ -283,4 +283,51 @@ describe("real-photo SAM mask refinement", () => {
     expect(refined.alpha[120 * width + 550]).toBe(255);
     expect(refined.report.maxGrowthPx).toBe(refined.report.morphRadius + 1);
   });
+
+  test("a part outside the subject box joined by a thin neck survives the open and the box re-clean", () => {
+    // SAM joins a top part lying entirely outside the Spark box to the boxed subject by a 3-px
+    // bridge. Step 1 keeps it (connected); the radius-2 open cuts the bridge, and the re-clean
+    // must not then drop the detached part by the box rule (≈ 8% of the subject).
+    const width = 900, height = 900, raster = new Uint8Array(width * height);
+    for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+      if (Math.hypot(x + 0.5 - 450, y + 0.5 - 560) < 300 || Math.hypot(x + 0.5 - 450, y + 0.5 - 140) < 90) raster[y * width + x] = 255;
+    }
+    for (let y = 225; y < 265; y++) for (let x = 449; x < 452; x++) raster[y * width + x] = 255;
+    const keepBox = { left: 150, top: 260, right: 750, bottom: 860 };
+    const loose = refineMaskAlpha(raster, width, height, { sigma: 1, threshold: 128 });
+    const boxed = refineMaskAlpha(raster, width, height, { sigma: 1, threshold: 128, keepBox });
+    expect(boxed.report).toMatchObject({ morphRadius: 2, removedComponents: 0, removedPixels: 0 });
+    for (const result of [loose, boxed]) {
+      expect(result.alpha[140 * width + 450]).toBe(255);
+      expect(result.alpha[60 * width + 450]).toBe(255);
+      expect(result.alpha[560 * width + 450]).toBe(255);
+      // Only edge noise and the bridge itself may go; never the top part (≈ 25 000 px).
+      expect(result.report.edgeRemovedPixels).toBeLessThan(result.report.inputPixels * 0.01);
+    }
+    expect(Buffer.from(boxed.alpha).equals(Buffer.from(loose.alpha))).toBe(true);
+  });
+
+  test("the open-loss guard counts small parts the open cuts off at their necks", () => {
+    // Twelve small lobes (each below MIN_COMPONENT_SHARE, together ≈ 5% of the subject) joined to
+    // the body by 3-px necks: the open would detach them all and the re-clean would drop them as
+    // specks, so the open is skipped and every lobe is kept.
+    const width = 900, height = 900, cx = 450, cy = 450, raster = new Uint8Array(width * height);
+    const lobes = Array.from({ length: 12 }, (_, k) => { const t = (k / 12) * 2 * Math.PI; return { t, x: cx + Math.cos(t) * 330, y: cy + Math.sin(t) * 330 }; });
+    for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+      const px = x + 0.5 - cx, py = y + 0.5 - cy;
+      let on = Math.hypot(px, py) < 300;
+      for (const lobe of lobes) {
+        if (Math.hypot(x + 0.5 - lobe.x, y + 0.5 - lobe.y) < 20) on = true;
+        const along = px * Math.cos(lobe.t) + py * Math.sin(lobe.t), across = -px * Math.sin(lobe.t) + py * Math.cos(lobe.t);
+        if (along > 295 && along < 315 && Math.abs(across) < 1.5) on = true;
+      }
+      if (on) raster[y * width + x] = 255;
+    }
+    const refined = refineMaskAlpha(raster, width, height, { sigma: 1, threshold: 128 });
+    expect(refined.report.morphRadius).toBe(2);
+    expect(refined.report.openSkipped).toBe(true);
+    for (const lobe of lobes) expect(refined.alpha[Math.floor(lobe.y) * width + Math.floor(lobe.x)]).toBe(255);
+    expect(refined.report.edgeRemovedPixels).toBeLessThan(refined.report.inputPixels * 0.01);
+    expect(topology(refined.alpha, width, height).components).toBe(1);
+  });
 });

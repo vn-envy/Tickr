@@ -17,7 +17,8 @@
  * 4. a morphological close then open with a disk whose radius scales with the subject size
  *    (MORPH_RADIUS_SHARE of √area, at least half a native cell, at most MAX_MORPH_RADIUS) fills
  *    edge bites and removes spurs; the open is skipped when it would remove more than
- *    MAX_OPEN_LOSS of the subject (thin parts). New fragments/pin-holes are cleaned once more;
+ *    MAX_OPEN_LOSS of the subject (thin parts), counting parts the open cuts off at a thin neck.
+ *    New fragments/pin-holes are cleaned once more, without the box (step 1 applied it);
  * 5. the result may never extend more than a small margin (`maxGrowthPx`) past the cleaned SAM
  *    selection of steps 1–2, so no halo of background pixels is ever selected;
  * 6. the binary is smoothed by a small exact Gaussian (at least NATIVE_SIGMA_SHARE of a native cell)
@@ -40,7 +41,7 @@ export const MAX_HOLE_SHARE = 0.005;
  */
 export const MORPH_RADIUS_SHARE = 0.003;
 export const MAX_MORPH_RADIUS = 4;
-/** The open is skipped when it would remove more than this share of the subject (thin parts). */
+/** The open is skipped when it would remove more than this share of the subject (thin parts, and parts it cuts off at a neck). */
 export const MAX_OPEN_LOSS = 0.04;
 /** Largest native grid step (source pixels per SAM mask cell) that is undone. */
 export const MAX_NATIVE_FACTOR = 16;
@@ -139,60 +140,109 @@ function kernel(sigma: number): Float32Array {
   return out;
 }
 
-/** Separable zero-padded convolution with a symmetric kernel, in place. */
+/**
+ * Separable zero-padded convolution with a symmetric kernel, in place. Windows that are entirely 0,
+ * or entirely 1 and inside the raster, take a precomputed value summed in the same order as the
+ * full loop, so the result is bit-identical to convolving every cell; only the edge band of a
+ * binary mask pays for the full kernel.
+ */
 function blur(data: Float32Array, width: number, height: number, k: Float32Array): void {
-  const radius = (k.length - 1) / 2, tmp = new Float32Array(data.length);
+  const radius = (k.length - 1) / 2, span = k.length, tmp = new Float32Array(data.length);
+  // Value of a window of constant v fully inside the raster, summed exactly like the loops below.
+  const constant = (v: number) => { let sum = 0; for (let t = 0; t < span; t++) sum += v * k[t]; return Math.fround(sum); };
+  const fullH = constant(1), fullV = constant(fullH);
   for (let y = 0; y < height; y++) {
     const row = y * width;
+    // Zeros and ones among the in-raster cells of the window [x − r, x + r].
+    let zeros = 0, ones = 0;
+    for (let xx = 0; xx < Math.min(width, radius); xx++) { const v = data[row + xx]; if (v === 0) zeros++; else if (v === 1) ones++; }
     for (let x = 0; x < width; x++) {
+      const enter = x + radius, leave = x - radius - 1;
+      if (enter < width) { const v = data[row + enter]; if (v === 0) zeros++; else if (v === 1) ones++; }
+      if (leave >= 0) { const v = data[row + leave]; if (v === 0) zeros--; else if (v === 1) ones--; }
+      const inside = Math.min(width - 1, enter) - Math.max(0, x - radius) + 1;
+      if (zeros === inside) { tmp[row + x] = 0; continue; }
+      if (ones === span) { tmp[row + x] = fullH; continue; }
       let sum = 0;
       for (let t = -radius; t <= radius; t++) { const xx = x + t; if (xx >= 0 && xx < width) sum += data[row + xx] * k[t + radius]; }
       tmp[row + x] = sum;
     }
   }
+  // Vertical pass row by row, with per-column counts of zero and fullH cells in the window.
+  const zeros = new Int32Array(width), fulls = new Int32Array(width);
+  const tally = (y: number, sign: number) => {
+    const row = y * width;
+    for (let x = 0; x < width; x++) { const v = tmp[row + x]; if (v === 0) zeros[x] += sign; else if (v === fullH) fulls[x] += sign; }
+  };
+  for (let y = 0; y < Math.min(height, radius); y++) tally(y, 1);
   for (let y = 0; y < height; y++) {
+    const enter = y + radius, leave = y - radius - 1;
+    if (enter < height) tally(enter, 1);
+    if (leave >= 0) tally(leave, -1);
+    const inside = Math.min(height - 1, enter) - Math.max(0, y - radius) + 1, row = y * width;
     for (let x = 0; x < width; x++) {
+      if (zeros[x] === inside) { data[row + x] = 0; continue; }
+      if (fulls[x] === span) { data[row + x] = fullV; continue; }
       let sum = 0;
       for (let t = -radius; t <= radius; t++) { const yy = y + t; if (yy >= 0 && yy < height) sum += tmp[yy * width + x] * k[t + radius]; }
-      data[y * width + x] = sum;
+      data[row + x] = sum;
     }
   }
 }
 
 const count = (cells: Uint8Array) => { let n = 0; for (let i = 0; i < cells.length; i++) n += cells[i]; return n; };
 
+interface Box { left: number; top: number; right: number; bottom: number }
+
 /**
- * Connected components of cells equal to `value` (8- or 4-connected). Returns per-cell labels
- * (0 = other value) and per-label sizes, border contact and box overlap (index 0 unused).
+ * Connected components of cells equal to `value` (8- or 4-connected), labelled over horizontal
+ * runs with union-find (linear in the raster, no per-cell label or stack buffers). Labels follow
+ * the scan order of each component's first cell. Returns the runs (row, half-open [start, end) and
+ * label) and per-label sizes, border contact and box overlap (index 0 unused).
  */
 function components(cells: Uint8Array, width: number, height: number, value: 0 | 1, eight: boolean, box: Box | null = null) {
-  const labels = new Int32Array(cells.length), sizes: number[] = [0], border: boolean[] = [false], inBox: boolean[] = [false];
-  const stack = new Int32Array(cells.length);
-  let next = 0;
-  for (let start = 0; start < cells.length; start++) {
-    if (cells[start] !== value || labels[start]) continue;
-    const label = ++next;
-    let top = 0, size = 0, touches = false, overlaps = false;
-    stack[top++] = start; labels[start] = label;
-    while (top) {
-      const i = stack[--top], x = i % width, y = (i - x) / width;
-      size++;
-      if (x === 0 || y === 0 || x === width - 1 || y === height - 1) touches = true;
-      if (box && x >= box.left && x < box.right && y >= box.top && y < box.bottom) overlaps = true;
-      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
-        if ((!dx && !dy) || (!eight && dx && dy)) continue;
-        const nx = x + dx, ny = y + dy;
-        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-        const j = ny * width + nx;
-        if (cells[j] === value && !labels[j]) { labels[j] = label; stack[top++] = j; }
+  const rows: number[] = [], starts: number[] = [], ends: number[] = [], parent: number[] = [];
+  const find = (i: number): number => { let r = i; while (parent[r] !== r) r = parent[r]; while (parent[i] !== r) { const next = parent[i]; parent[i] = r; i = next; } return r; };
+  const reach = eight ? 1 : 0;
+  let prevFirst = 0, prevLast = 0;
+  for (let y = 0; y < height; y++) {
+    const rowStart = y * width, first = starts.length;
+    let x = 0, p = prevFirst;
+    while (x < width) {
+      while (x < width && cells[rowStart + x] !== value) x++;
+      if (x >= width) break;
+      const s = x;
+      while (x < width && cells[rowStart + x] === value) x++;
+      const run = starts.length;
+      rows.push(y); starts.push(s); ends.push(x); parent.push(run);
+      // Previous-row runs touching [s − reach, x + reach).
+      while (p < prevLast && ends[p] + reach <= s) p++;
+      for (let q = p; q < prevLast && starts[q] < x + reach; q++) {
+        const a = find(q), b = find(run);
+        if (a !== b) { if (a < b) parent[b] = a; else parent[a] = b; }
       }
     }
-    sizes.push(size); border.push(touches); inBox.push(overlaps);
+    prevFirst = first; prevLast = starts.length;
   }
-  return { labels, sizes, border, inBox };
+  const n = starts.length, labels = new Int32Array(n), sizes: number[] = [0], border: boolean[] = [false], inBox: boolean[] = [false];
+  const boxLeft = box ? Math.ceil(box.left) : 0, boxTop = box ? Math.ceil(box.top) : 0;
+  for (let run = 0; run < n; run++) {
+    const root = find(run);
+    let label = labels[root];
+    if (run === root) { label = sizes.length; labels[run] = label; sizes.push(0); border.push(false); inBox.push(false); }
+    else labels[run] = label;
+    const y = rows[run], s = starts[run], e = ends[run];
+    sizes[label] += e - s;
+    if (y === 0 || y === height - 1 || s === 0 || e === width) border[label] = true;
+    if (box && y >= boxTop && y < box.bottom) { const xMin = Math.max(s, boxLeft); if (xMin < e && xMin < box.right) inBox[label] = true; }
+  }
+  return { rows, starts, ends, labels, sizes, border, inBox };
 }
 
-interface Box { left: number; top: number; right: number; bottom: number }
+/** Sets every cell of the runs whose label is flagged to `value`, in place. */
+function paintRuns(cells: Uint8Array, width: number, runs: ReturnType<typeof components>, flagged: Uint8Array, value: 0 | 1): void {
+  for (let run = 0; run < runs.labels.length; run++) if (flagged[runs.labels[run]]) cells.fill(value, runs.rows[run] * width + runs.starts[run], runs.rows[run] * width + runs.ends[run]);
+}
 
 /**
  * Drops foreground specks (and, with a box, components outside it) in place. The anchor — the
@@ -209,7 +259,7 @@ function dropSpecks(cells: Uint8Array, width: number, height: number, minCompone
   for (let label = 1; label < fg.sizes.length; label++) {
     if (label !== anchor && (fg.sizes[label] < minComponent || (boxed && !fg.inBox[label]))) { drop[label] = 1; removed++; pixels += fg.sizes[label]; }
   }
-  if (removed) for (let i = 0; i < cells.length; i++) if (drop[fg.labels[i]]) cells[i] = 0;
+  if (removed) paintRuns(cells, width, fg, drop, 0);
   return { components: removed, pixels };
 }
 
@@ -221,7 +271,7 @@ function fillHoles(cells: Uint8Array, width: number, height: number, maxHole: nu
   for (let label = 1; label < bg.sizes.length; label++) {
     if (!bg.border[label] && bg.sizes[label] < maxHole) { fill[label] = 1; holes++; pixels += bg.sizes[label]; }
   }
-  if (holes) for (let i = 0; i < cells.length; i++) if (fill[bg.labels[i]]) cells[i] = 1;
+  if (holes) paintRuns(cells, width, bg, fill, 1);
   return { holes, pixels };
 }
 
@@ -418,17 +468,23 @@ export function refineMaskField(raster: Uint8Array, width: number, height: numbe
   // 4. Close then open with a disk scaled to the subject size.
   // At least half a native cell, so one-cell bites and bumps of a coarse grid are closed/opened too.
   const radius = options.morphRadius ?? Math.min(MAX_MORPH_RADIUS, Math.max(Math.round(Math.sqrt(cleanedArea) * MORPH_RADIUS_SHARE), nativeStepMax > 1 ? Math.round(nativeStepMax / 2) : 0));
+  // Resampling and the open can leave new fragments or pin-holes: clean once more (unreported).
+  // Without the box: step 1 already applied it, and a part the open cuts off at a thin neck was
+  // connected to the subject in the SAM mask — it may lie outside the box and is still the subject.
+  const reclean = (mask: Uint8Array): Uint8Array => {
+    dropSpecks(mask, lw, lh, cleanedArea * minShare, null);
+    fillHoles(mask, lw, lh, cleanedArea * holeShare);
+    return mask;
+  };
   if (radius > 0) {
     const closed = morph(morph(cells, lw, lh, radius, true), lw, lh, radius, false);
-    const opened = morph(morph(closed, lw, lh, radius, false), lw, lh, radius, true);
-    const closedArea = count(closed);
-    if (count(opened) >= closedArea * (1 - MAX_OPEN_LOSS)) cells = opened;
-    else { cells = closed; report.openSkipped = true; }
-  }
-  // Resampling and the open can leave new fragments or pin-holes: clean once more (unreported).
-  if (radius > 0 || nativeStepMax > 1) {
-    dropSpecks(cells, lw, lh, cleanedArea * minShare, box);
-    fillHoles(cells, lw, lh, cleanedArea * holeShare);
+    // The open-loss guard counts what the open erodes and what the re-clean then drops (parts cut
+    // off at a neck), so a detached real part can never slip past it.
+    const opened = reclean(morph(morph(closed, lw, lh, radius, false), lw, lh, radius, true));
+    if (count(opened) >= count(closed) * (1 - MAX_OPEN_LOSS)) cells = opened;
+    else { cells = reclean(closed); report.openSkipped = true; }
+  } else if (nativeStepMax > 1) {
+    cells = reclean(cells);
   }
   report.morphRadius = radius;
 

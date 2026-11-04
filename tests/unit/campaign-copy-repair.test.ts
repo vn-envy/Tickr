@@ -998,6 +998,9 @@ describe("hosted live run (4 Nov 2026): 'ask the team about <items> and what …
     "Ask us about the Weekend loaf and whether it is available for pickup.",
     "Ask about the Weekend loaf & Brownies and what is available this weekend.",
     "Ask our bakers about the Weekend loaf and what's available at the counter today.",
+    // Item words may hold a possessive apostrophe or an inner hyphen; they still name items only.
+    "Ask about Grandma's Weekend loaf and what is available this weekend.",
+    "Ask the team about the pain-au-chocolat and the Weekend loaf and what is available for pickup.",
   ])("a narrow item list before 'and what/which/whether' is an asked clause: %j", (body) => {
     expect(() => validateCampaignCopy(withField(["facebook_ads", "body", body]), ...scopedArgs)).not.toThrow();
   });
@@ -1025,6 +1028,12 @@ describe("hosted live run (4 Nov 2026): 'ask the team about <items> and what …
     "Ask about it and what is available today.",
     "Ask about the Weekend loaf with delivery and what is available today.",
     "See about the Weekend loaf and what is available today.",
+    // A list stop joined by an apostrophe or hyphen, or a restock word, is a state, not an item name.
+    "Ask about the loaf it's here and what is available today.",
+    "Ask about the sold-out loaf and what is available today.",
+    "Ask us about the restocked loaf and what is available today.",
+    "Ask about the in-store loaf and what is available today.",
+    "Ask about the loaf we're baking and what is available today.",
   ])("anything outside the narrow item list stays a checked availability claim and is reset: %j", (body) => {
     expect(() => validateCampaignCopy(withField(["facebook_ads", "body", body]), ...scopedArgs)).toThrow("dated, original evidence");
     const repaired = validateCompletedCampaignCopy(withField(["facebook_ads", "body", body]), ...scopedArgs);

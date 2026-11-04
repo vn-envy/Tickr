@@ -410,7 +410,10 @@ describe("channel titles are short consumer kickers printed on the channel image
     for (const [title, expected] of [
       ["Taste of Home Story Introduction", "Taste of Home"], ["Taste of Home Introduction", "Taste of Home"], ["Weekend loaf Concept", "Weekend loaf"],
       ["Weekend loaf – Concept", "Weekend loaf"], ["Weekend loaf: Carousel Story Introduction", "Weekend loaf"], ["Taste of Home Part 2", "Taste of Home"],
-      ["Taste of Home (Reel)", "Taste of Home"], ["Our Story Reel", "Our Story"], ["Story Introduction", "Story"], ["Family Recipes Narrative", "Family Recipes"], ["Weekend Bakes Campaign", "Weekend Bakes"],
+      ["Story Introduction", "Story"], ["Family Recipes Narrative", "Family Recipes"], ["Taste of Home Reel 1", "Taste of Home"], ["Taste of Home Slide 3", "Taste of Home"],
+      ["Weekend loaf – Reel Concept", "Weekend loaf"], ["Weekend loaf | Campaign Concept", "Weekend loaf"], ["Weekend loaf (Carousel Concept)", "Weekend loaf"],
+      // A cut never ends on a possessive: the noun it qualifies stays.
+      ["Grandma's Story Introduction", "Grandma's Story"], ["Kids’ Story Concept", "Kids’ Story"],
     ] as const) {
       expect(cleanChannelTitle(title), title).toBe(expected);
       expect(title.startsWith(expected), title).toBe(true);
@@ -419,6 +422,11 @@ describe("channel titles are short consumer kickers printed on the channel image
     // Nothing changes without a trailing planning label, when nothing would be left, when the cut would end on a
     // function word or unbalance a bracket, or when it would cut into the protected focus name.
     for (const title of ["Taste of Home", "Our Family Story", "instagram_reels", "Carousel", "The Reel", "Fresh (from the Reel", "Part of the Family", "Slides and Swings"]) expect(cleanChannelTitle(title), title).toBe(title);
+    // Media and structure words can name a real offering or theme in any business category: alone, without a number
+    // and outside a separated label segment they stay, and so does a possessive that a cut would leave dangling.
+    for (const title of ["Water Slides", "Playground Slides", "Sweet Scenes", "Fishing Reel", "Highland Reels", "Vintage Carousel", "Election Campaign", "Weekend Bakes Campaign", "Our Story Reel", "Taste of Home (Reel)", "Kids' Slides", "Kids' Concept", "Grandma’s Narrative"]) expect(cleanChannelTitle(title), title).toBe(title);
+    expect(cleanChannelTitle("Water Slides Concept")).toBe("Water Slides");
+    expect(cleanChannelTitle("Highland Reels Story Introduction")).toBe("Highland Reels");
     expect(cleanChannelTitle("Fly Fishing Reel", ["Fly Fishing Reel"])).toBe("Fly Fishing Reel");
     expect(cleanChannelTitle("Fly Fishing Reel Introduction", ["Fly Fishing Reel"])).toBe("Fly Fishing Reel");
     expect(cleanChannelTitle("Weekend Story Introduction", ["Weekend Story"])).toBe("Weekend Story");
@@ -435,6 +443,29 @@ describe("channel titles are short consumer kickers printed on the channel image
     const completed = productDraft(); completed.channels[0].title = "Taste of Home Story Introduction";
     completed.creativeBrief!.context = { insightIds: [], whyNow: "Explain the source-attributed offering.", seasonalTheme: { name: null, status: "none", sourceIds: [] } };
     expect(validateCompletedCampaignCopy(completed, report, opportunity, [productSource], enrichment).channels[0].title).toBe("Taste of Home");
+  });
+
+  test("every cut is recorded in the production note, and every discovered offering name, not only the focus, stays whole", () => {
+    const enriched: BusinessEnrichment = { ...enrichment, offerings: [...enrichment.offerings, { id: "offering-2", name: "The Brownie Concept", description: "A brownie box offered by the bakery.", sourceIds: ["s1"] }] };
+    const copy = productDraft();
+    copy.channels[0].title = "Taste of Home Story Introduction";
+    copy.channels[1].title = "Weekend loaf – Concept";
+    copy.channels[2].title = "The Brownie Concept";
+    copy.channels[3].title = "The Brownie Concept Introduction";
+    const validated = validateCampaignCopy(copy, report, opportunity, [productSource], enriched);
+    expect(validated.channels.slice(0, 4).map((channel) => channel.title)).toEqual(["Taste of Home", "Weekend loaf", "The Brownie Concept", "The Brownie Concept"]);
+    const notes = validated.reviewNotes.filter((note) => note.startsWith("Production notes moved from consumer copy:"));
+    expect(notes).toEqual(["Production notes moved from consumer copy: Channel title label “Story Introduction”. Channel title label “Concept”. Channel title label “Introduction”."]);
+    // Without the offering record the same title would lose a word, so protection comes from the enrichment, not luck.
+    expect(cleanChannelTitle("The Brownie Concept")).toBe("The Brownie");
+    // A saved checkpoint re-validates idempotently: nothing more is cut and the note is not repeated.
+    expect(validateCampaignCopy(structuredClone(validated), report, opportunity, [productSource], enriched)).toEqual(validated);
+    // An untouched title adds no note.
+    expect(validateCampaignCopy(productDraft(), report, opportunity, [productSource], enriched).reviewNotes.some((note) => note.includes("Channel title label"))).toBe(false);
+    // The completed path records the cut the same way.
+    const completed = productDraft(); completed.channels[0].title = "Taste of Home Story Introduction";
+    completed.creativeBrief!.context = { insightIds: [], whyNow: "Explain the source-attributed offering.", seasonalTheme: { name: null, status: "none", sourceIds: [] } };
+    expect(validateCompletedCampaignCopy(completed, report, opportunity, [productSource], enriched).reviewNotes).toContain("Production notes moved from consumer copy: Channel title label “Story Introduction”.");
   });
 });
 

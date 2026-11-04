@@ -190,7 +190,7 @@ async function produce(input: AutopilotProductionInput, dependencies: AutopilotD
   const repairs = copy.claimRepairs ?? [];
   // Records from an earlier release may have trimmed a field rather than replacing it; say so rather than over-claim.
   const alongside = repairs.filter(isAlongsideRepair).length;
-  if (repairs.length) notes.push(`Copy check: ${plural(repairs.length, "field")} ${repairs.length === 1 ? "was" : "were"} ${repairs.every((repair) => repair.fallback) ? "replaced with a neutral line" : "repaired"} because the sources could not support ${repairs.length === 1 ? "it" : "them"}${alongside ? ` (${alongside} only because ${alongside === 1 ? "it is" : "they are"} read with such text)` : ""}; ${CLAIM_REPAIR_DOCUMENT} lists the original text for owner confirmation.`);
+  if (repairs.length) notes.push(`Copy check: ${plural(repairs.length, "field")} ${repairs.length === 1 ? "was" : "were"} ${repairs.every((repair) => repair.fallback) ? "replaced with a neutral line" : "repaired"} because the sources could not support ${repairs.length === 1 ? "it" : "them"}${alongside ? ` (${alongside} not rejected, only read with such text)` : ""}; ${CLAIM_REPAIR_DOCUMENT} lists the original text for owner confirmation.`);
 
   // 3. Analyze ------------------------------------------------------------------------------
   await input.progress("analyze", harvest.assets.length ? `Muse Spark is studying ${plural(harvest.assets.length, "photo and video")} against your goal.` : "Nothing to analyze; moving on to the plan.");
