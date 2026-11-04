@@ -773,8 +773,8 @@ describe("fifth review: realistic compliant copy is no longer reset (each allowa
     ]) expect(() => validateCampaignCopy(withField(["click_to_whatsapp", "body", body]), ...scopedArgs), body).toThrow("dated, original evidence");
   });
 
-  test("R2: find out / see / let you know / tell you / share and a named team addressee are asked clauses", () => {
-    for (const caption of ["Ask the café team what's fresh.", "Ask the team: what's available this weekend?", "Ask our bakers what's available today.", "Ask the kitchen what's available this weekend.", "Find out what's available this weekend.", "See what's available this weekend.", "Message us to find out what's available this weekend.", "We'll let you know what's available this weekend."]) {
+  test("R2: find out / see after a contact frame, let you know / tell you / share and a named team addressee are asked clauses", () => {
+    for (const caption of ["Ask the café team what's fresh.", "Ask the team: what's available this weekend?", "Ask our bakers what's available today.", "Ask the kitchen what's available this weekend.", "Message us to find out what's available this weekend.", "Message us to see what's available this weekend.", "Ask us to find out what's available this weekend.", "We'll let you know what's available this weekend."]) {
       expect(() => validateCampaignCopy(withField(["facebook_ads", "caption", caption]), ...scopedArgs), caption).not.toThrow();
     }
     for (const answer of ["The team will let you know what's available this weekend.", "The team can tell you what's available at the counter today.", "The team will share what's available this weekend."]) {
@@ -785,6 +785,37 @@ describe("fifth review: realistic compliant copy is no longer reset (each allowa
     for (const caption of ["Ask the team — what's available this weekend?", "Could you share what is available this weekend?", "Wondering what's available this weekend? Ask the team.", "DM us for what's available this weekend."]) {
       expect(() => validateCampaignCopy(withField(["facebook_ads", "caption", caption]), ...scopedArgs), caption).toThrow("dated, original evidence");
     }
+  });
+
+  // Bare or invitational "see / find out" advertises availability like "Check out what's available today!".
+  test.each([
+    "Check out what's available today.", "See what's available today.", "See what's available this weekend.", "Find out what's available this weekend.",
+    "Come and see what's available today at the counter!", "Pop in to see which loaves are available here.", "See which loaf is available for pickup today",
+    "You'll see which loaf is available today: the Weekend loaf.", "See what's available today: the Weekend loaf, warm from the oven.", "Find out what's available today.",
+  ])("R2 (round 5): bare or invitational see / find out stays a checked availability claim: %j", (caption) => {
+    expect(() => validateCampaignCopy(withField(["facebook_ads", "caption", caption]), ...scopedArgs)).toThrow("dated, original evidence");
+    const repaired = validateCompletedCampaignCopy(withField(["facebook_ads", "caption", caption]), ...scopedArgs);
+    expect(channel(repaired, "facebook_ads").caption).toBe(fallbackFor("facebook_ads", "caption"));
+    expect(repaired.claimRepairs!.find((repair) => repair.field === "facebook_ads caption")).toMatchObject({ removed: [caption], fallback: true });
+  });
+
+  test("Round 5: colon answers, emphatic answers, bullets, line separators and B1G1 keep an asked clause checked", () => {
+    for (const caption of [
+      "Ask what's available today: the Weekend loaf!", "Check what's available today: the Weekend loaf, warm from the oven.", "Ask whether the Weekend loaf is available today. It sure is!",
+      "Ask whether the Weekend loaf is available today. Spoiler: it is.", "Ask what you like • Weekend loaf in stock now", "Ask what you like Weekend loaf in stock now",
+      "Ask which two you'd like with our B1G1 today", "Ask which loaves you want to buy 2 get 1 today",
+    ]) expect(() => validateCampaignCopy(withField(["facebook_ads", "caption", caption]), ...scopedArgs), caption).toThrow("dated, original evidence");
+  });
+
+  test("Round 5: prefill occasions exclude promo nouns and symbol emoji; skin-tone greeting emoji are allowed; 'in our … branch' is a destination", () => {
+    for (const body of ["Hi! What's available this Freebie?", "Hi! What's available this Giveaway?", "Hi! What's available this BOGOF?", "Hi! What's available this Halfprice?", "Hi! What's available this Saleathon?", "Hi! What's available this Black Friday?", "Hello! 🆓 What's available today?", "Hello! 🈹 What's available today?", "Hi! What's available today? 🆓"]) {
+      expect(() => validateCampaignCopy(withField(["click_to_whatsapp", "body", body]), ...scopedArgs), body).toThrow("dated, original evidence");
+    }
+    for (const body of ["Hi! 👋🏽 Could you share what is available this weekend?", "Hey team! 👋🏽 What's available this morning?", "Hi! What's available this Diwali?", "Hi! What's available this Thanksgiving?"]) {
+      expect(channel(validateCampaignCopy(withField(["click_to_whatsapp", "body", body]), ...scopedArgs), "click_to_whatsapp").body, body).toBe(body);
+    }
+    expect(() => validateCampaignCopy(withField(["click_to_whatsapp", "body", "Hi! What's available today in our Pune branch?"]), ...scopedArgs)).toThrow("unresolved branch");
+    expect(() => validateCampaignCopy(withField(["facebook_ads", "caption", "Fresh bakes every morning in our Pune branch."]), ...scopedArgs)).toThrow("unresolved branch");
   });
 
   /** A copy whose focus is a discovered offering with a number in its exact name. */
@@ -825,6 +856,49 @@ describe("fifth review: realistic compliant copy is no longer reset (each allowa
     // A story-only focus (no offering ID) is not masked.
     const story = namedFocus("7-grain loaf", null);
     expect(() => validateCampaignCopy(structuredClone(story.draft), ...story.summary)).toThrow("quantitative promises");
+  });
+
+  // The words around a masked occurrence can turn the name's own number into an offer; a currency name is a price claim.
+  test.each([
+    ["Dark Chocolate 85%", "Dark Chocolate 85% off today only."],
+    ["Dark Chocolate 85%", "Dark Chocolate 85% off this weekend."],
+    ["Dark Chocolate 85%", "Our Dark Chocolate 85%: half the usual price this weekend."],
+    ["70% Dark Chocolate Cake", "Save 70% Dark Chocolate Cake"],
+    ["70% Dark Chocolate Cake", "Up to 70% Dark Chocolate Cake"],
+    ["70% Dark Chocolate Cake", "Get 70% Dark Chocolate Cake today"],
+    ["Weekend loaf 20", "Weekend loaf 20% off"],
+    ["Weekend loaf 20", "Weekend loaf 20 % off"],
+    ["Weekend loaf 20", "Weekend loaf 20.5% this weekend"],
+  ])("R3 (round 5): focus %j is not masked in %j", (name, caption) => {
+    const { draft, scoped, summary } = namedFocus(name);
+    for (const args of [scoped, summary]) {
+      const copy = structuredClone(draft); channel(copy, "facebook_ads").caption = caption;
+      expect(() => validateCampaignCopy(structuredClone(copy), ...args)).toThrow();
+      const repaired = validateCompletedCampaignCopy(structuredClone(copy), ...args);
+      expect(channel(repaired, "facebook_ads").caption).not.toBe(caption);
+      expect(repaired.claimRepairs?.some((repair) => repair.removed.includes(caption))).toBe(true);
+    }
+  });
+
+  // A name carrying a currency amount is a current price claim: never masked, so without dated original evidence the
+  // copy is withheld (the neutral fallback would repeat the price) rather than published.
+  test.each([["Brownie £4", "Brownie £4 this weekend."], ["Brownie £4", "Brownie £4 at the counter."], ["£5 Lunch Box", "£5 Lunch Box, every weekday."], ["$6 Bagel Box", "$6 Bagel Box for lunch."]])("R3 (round 5): currency focus %j is never masked: %j", (name, caption) => {
+    const { draft, scoped, summary } = namedFocus(name);
+    for (const args of [scoped, summary]) {
+      const copy = structuredClone(draft); channel(copy, "facebook_ads").caption = caption;
+      expect(() => validateCampaignCopy(structuredClone(copy), ...args)).toThrow();
+      expect(() => validateCompletedCampaignCopy(structuredClone(copy), ...args)).toThrow();
+    }
+  });
+
+  test("R3 (round 5): a descriptor name stays masked in neutral wording", () => {
+    for (const [name, caption] of [["Dark Chocolate 85%", "Dark Chocolate 85% – the best bar in town."], ["70% Dark Chocolate Cake", "Ask the team about the 70% Dark Chocolate Cake."]]) {
+      const { draft, scoped, summary } = namedFocus(name);
+      for (const args of [scoped, summary]) {
+        const copy = structuredClone(draft); channel(copy, "facebook_ads").caption = caption;
+        expect(() => validateCampaignCopy(copy, ...args), `${name}: ${caption}`).not.toThrow();
+      }
+    }
   });
 
   test("R4: a small party size or order count in a customer question of the WhatsApp script is not a business quantity", () => {

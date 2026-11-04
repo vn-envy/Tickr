@@ -195,7 +195,9 @@ export function withoutInquiries(text: string, voice: CopyVoice = "business"): s
 }
 
 /** A prefilled inquiry may open only with a bare greeting, a short addressee ("Hi team,") and an emoji ("Hello! 👋"), never with free text. */
-const PREFILL_GREETING = String.raw`(?:(?:hi|hello|hey|hiya|namaste|greetings|good (?:morning|afternoon|evening))\b(?:\s+(?:there|all|everyone|folks|(?:[\p{L}'’&-]+\s+){0,3}team))?\s*[,:;!–—-]?\s*(?:[\p{Extended_Pictographic}️‍]+\s*)?)?`;
+/** A pictograph emoji with optional skin tone; enclosed letter and ideograph symbols ("🆓", "🈹", "🆕") read as words and are not allowed. */
+const PREFILL_EMOJI = String.raw`(?:(?![\u{1F100}-\u{1F2FF}])[\p{Extended_Pictographic}\p{Emoji_Modifier}️‍])`;
+const PREFILL_GREETING = String.raw`(?:(?:hi|hello|hey|hiya|namaste|greetings|good (?:morning|afternoon|evening))\b(?:\s+(?:there|all|everyone|folks|(?:[\p{L}'’&-]+\s+){0,3}team))?\s*[,:;!–—-]?\s*(?:${PREFILL_EMOJI}+\s*)?)?`;
 /** A word that would turn a category list into a clause, a comparison, a tag question or a state ("besides", "is", "right", "I hear", "sold out"). */
 const PREFILL_LIST_STOP = String.raw`(?:is|are|was|were|be|been|being|isn['’]t|aren['’]t|wasn['’]t|weren['’]t|am|do|does|did|don['’]t|doesn['’]t|have|has|had|can|will|would|could|should|get|got|i|me|my|you|your|it|its|they|we|he|she|this|that|these|those|which|who|right|besides|beside|other|than|apart|along|with|without|including|included|include|includes|excluding|except|plus|also|too|just|only|still|already|hear|heard|said|saw|like|such|as|not|no|yes|and|or|but|so|in|on|at|for|to|from|of|by|today|tonight|tomorrow|yesterday|now|sold|out|left|remaining|ready|open|closed|back|again|off|free|sale|stock|stocked|offer|offers|deal|deals|special|discounted|reserved|booked|available)`;
 /**
@@ -222,7 +224,7 @@ const PREFILL_OPTION = String.raw`(?:pickup|pick-up|collection|delivery|takeaway
 const PREFILL_AVAILABLE_TAIL = String.raw`(?:\s+(?:${PREFILL_TIME}|${PREFILL_PLACE}|${PREFILL_LIST})){0,3}`
   + String.raw`(?:\s*,?\s+(?:(?:and|&)\s+)?(?:the\s+)?${PREFILL_OPTION}(?:\s+(?:or|and|&)\s+${PREFILL_OPTION})?\s+(?:options|times|timings|details))?`
   + String.raw`(?:\s*,\s*please)?`
-  + String.raw`\s*\?[\s"'”’)\]\p{Extended_Pictographic}️‍]*$`;
+  + String.raw`\s*\?(?:[\s"'”’)\]]|${PREFILL_EMOJI})*$`;
 /**
  * The only neutral prefill shape: an open "what is available" that is the direct object of the request at the very start
  * of a body consisting of that single question, followed only by the allow-listed tail ("Hi! Could you share what is
@@ -231,6 +233,8 @@ const PREFILL_AVAILABLE_TAIL = String.raw`(?:\s+(?:${PREFILL_TIME}|${PREFILL_PLA
  * sentence or anything after a noun phrase never matches.
  */
 const PREFILL_OPEN_AVAILABILITY = new RegExp(String.raw`^(${PREFILL_GREETING}(?:(?:could|can|would) you (?:share|tell (?:me|us)|let (?:me|us) know) what(?:['’]s|\s+is|\s+are)?\s+(?:(?:is|are)\s+)?|(?:please\s+)?(?:share|tell (?:me|us)|let (?:me|us) know) what(?:['’]s|\s+is)?\s+|what(?:['’]s|\s+is)?\s+))available\b(?=${PREFILL_AVAILABLE_TAIL})`, "iu");
+/** A capitalised promo noun ("this Freebie", "this BOGOF", "this Black Friday") is a sale, not an occasion. */
+const PREFILL_PROMO_OCCASION = /free|giveaway|bogo|b1g1|half|sale|deal|offer|promo|price|discount|clearance|cashback|black|cyber|bonanza|bargain/iu;
 const PREFILL_PLAIN_THIS = /^(?:weekend|week|month|morning|afternoon|evening|(?:mon|tues|wednes|thurs|fri|satur|sun)days?)$/iu;
 
 /**
@@ -245,7 +249,7 @@ function prefillClaimText(text: string): string {
   if (!match) return raw;
   const tail = raw.slice(match[0].length);
   // "this <word>" names a capitalised occasion ("this Diwali"), never an ordinary word ("this loaf").
-  for (const [, word] of tail.matchAll(/\bthis\s+(\p{L}[\p{L}'’-]*)/giu)) if (!PREFILL_PLAIN_THIS.test(word) && !/^\p{Lu}/u.test(word)) return raw;
+  for (const [, word] of tail.matchAll(/\bthis\s+(\p{L}[\p{L}'’-]*)/giu)) if (!PREFILL_PLAIN_THIS.test(word) && (!/^\p{Lu}/u.test(word) || PREFILL_PROMO_OCCASION.test(word))) return raw;
   return `${match[1]}${tail}`;
 }
 
@@ -258,20 +262,26 @@ function prefillClaimText(text: string): string {
  */
 // "let you know / tell you / share" only as the business's promise to answer ("the team will let you know", "we can
 // tell you", "we'll share"): "Could you share what is available this weekend…" in business voice still presupposes it.
-const ASK_VERB = String.raw`(?:ask|check(?!\s+out\b)|confirm|inquire|enquire|find\s+out|see|(?<=\b(?:will|can|['’]ll|happy\s+to|glad\s+to)\s+)(?:let\s+you\s+know|tell\s+you|share(?:\s+with\s+you)?))`;
+// "see / find out" only after an explicit contact frame ("Message us to find out what's…"): a bare or invitational
+// "See what's available today", "Come and see which…" or "You'll see which loaf is available" advertises like
+// "Check out what's available", so it stays checked.
+const ASK_VERB = String.raw`(?:ask|check(?!\s+out\b)|confirm|inquire|enquire|(?<=\b(?:message|ask|call|dm|contact|text|email|whatsapp|ring|phone)\s+(?:us|the\s+team|our\s+team|me)\s+to\s+)(?:see|find\s+out)|(?<=\b(?:will|can|['’]ll|happy\s+to|glad\s+to)\s+)(?:let\s+you\s+know|tell\s+you|share(?:\s+with\s+you)?))`;
 const ASK_ADDRESSEE = String.raw`(?:\s+(?:with\s+)?(?:(?:the|our)\s+(?:[\p{L}'’&-]+\s+)?(?:team|staff|crew|bakers?|kitchen|chefs?|baristas?)|team|staff|us|me|them))?`;
 const ASK_JOINER = String.raw`\b(?:and|but|or|nor|yet|then|so|because|while|whilst|plus|as|since|until|till|before|after|when|whenever|once|though|although|which|that|who|whose)\b`;
 /** A plain hyphen ends the clause when it is used as a dash (" - "), not inside a word ("pick-up"). */
-const ASK_STOP_CHARS = String.raw`.!?,;:‐-―−…()\[\]{}\/|\\\n\r\p{Extended_Pictographic}`;
+const ASK_STOP_CHARS = String.raw`.!?,;:‐-―−…()\[\]{}\/|\\\n\r  •·‣◦▪\p{Extended_Pictographic}`;
 const ASKED_CLAUSE = new RegExp(String.raw`\b${ASK_VERB}${ASK_ADDRESSEE}\s*:?\s+(?:about\s+)?(?:whether|if|what|which)\b(?:(?!${ASK_JOINER}|(?<![\p{L}\p{N}])-|-(?![\p{L}\p{N}]))[^${ASK_STOP_CHARS}])*`, "giu");
 /**
  * An asked clause that itself names a sale, stock, discount, offer, deal, free item, delivery, booking, slot, immediate
  * availability, price or local destination is not erased: "Ask what's on sale today" presupposes a sale, and "Ask if
  * it's on sale. It is!" answers itself. Such a clause stays in the checked text and the claim rules decide.
  */
-const ASKED_CLAIM_VOCABULARY = /\b(?:on[- ]?sales?|sales?|stock(?:s|ed)?|in[- ]stock|discount(?:s|ed)?|offers?|deals?|deliver(?:y|ies|s|ed)?|bookings?|slots?|appointments?|reservations?|bogo|buy[- ]one[- ]get[- ]one|half[- ]price|promo(?:tion)?s?|specials?|clearance|available\s+(?:right\s+)?now|now\s+available|open\s+(?:now|today)|today\s+only|visit|located|based|branch|outlet|store|shop|clinic|studio|location)\b|(?<![\p{L}\p{N}-])free\b|[$€£₹]\s?\d|\d\s?%/iu;
-/** A following "Yes!", "It is!" or "They are." answers the asked question as an assertion. */
-const AFFIRMED_ANSWER = /^[\s.!?…,;:‐-―−()"'”’-]*(?:(?:yes|yep|yeah|yup|sure|of course|absolutely|definitely|indeed)\b|(?:it|they|we|you)\s+(?:is|are|do|does|can|will|have)\s*[!.…])/iu;
+const ASKED_CLAIM_VOCABULARY = /\b(?:on[- ]?sales?|sales?|stock(?:s|ed)?|in[- ]stock|discount(?:s|ed)?|offers?|deals?|deliver(?:y|ies|s|ed)?|bookings?|slots?|appointments?|reservations?|bogo|b1g1|buy[- ]one[- ]get[- ]one|buy\s*\d+\s*get\s*\d+|half[- ]price|promo(?:tion)?s?|specials?|clearance|available\s+(?:right\s+)?now|now\s+available|open\s+(?:now|today)|today\s+only|visit|located|based|branch|outlet|store|shop|clinic|studio|location)\b|(?<![\p{L}\p{N}-])free\b|[$€£₹]\s?\d|\d\s?%/iu;
+/**
+ * A following "Yes!", "It is!", "It sure is!", "Spoiler: it is." or "They are." answers the asked question as an
+ * assertion, and so does a colon straight after the clause ("Ask what's available today: the Weekend loaf!").
+ */
+const AFFIRMED_ANSWER = /^\s*:|^[\s.!?…,;:‐-―−()"'”’-]*(?:(?:yes|yep|yeah|yup|sure|of course|absolutely|definitely|indeed|spoiler)\b|(?:it|they|we|you)\s+(?:sure\s+|really\s+|certainly\s+)?(?:is|are|do|does|can|will|have)\s*[!.…])/iu;
 
 /** Erases genuine asked clauses only; a clause with claim vocabulary, or one answered by the words after it, stays checked. */
 export function withoutAskedClauses(text: string): string {
@@ -312,7 +322,9 @@ function focusOfferingName(copy: Pick<CampaignCopy, "creativeBrief">, enrichment
   const offering = enrichment?.offerings.find((item) => item.id === focus.offeringId);
   const normalize = (value: string) => value.toLowerCase().replace(/\s+/g, " ").trim();
   // A name that is itself worded as an offer ("20% Off Box", "Buy 2 Get 1 Deal") is never masked.
-  if (!offering || normalize(offering.name) !== normalize(focus.name) || /(?:\d\s?%|[$€£₹]\s?\d[\d,.]*)\s*off\b|\b(?:off|sale|discount(?:s|ed)?|deals?|offers?|free|bogo|buy\s*\d+\s*get\s*\d+|half[- ]price|save)\b/i.test(focus.name)) return null;
+  // A name carrying a currency amount ("Brownie £4", "£5 Lunch Box") is a price claim and is never masked either; masking
+  // is kept to descriptor percentages and counts ("70% cocoa", "7-grain").
+  if (!offering || normalize(offering.name) !== normalize(focus.name) || /(?:\d\s?%|[$€£₹]\s?\d[\d,.]*)\s*off\b|\b(?:off|sale|discount(?:s|ed)?|deals?|offers?|free|bogo|b1g1|buy\s*\d+\s*get\s*\d+|half[- ]price|save)\b/i.test(focus.name) || /[$€£₹¥¢]|\b(?:rs|inr|usd|eur|gbp|aed|dollars?|euros?|rupees?|pounds?|pence|cents?)\b|\d\s*(?:p|k)\b|\d\s*\/-/i.test(focus.name)) return null;
   return focus.name;
 }
 
@@ -331,8 +343,22 @@ function campaignClaimRules(report: ResearchReport, opportunity: ResearchOpportu
   const normalize = (value: string) => value.toLowerCase().replace(/\s+/g, " ").trim();
   // The exact discovered offering name ("70% Dark Chocolate Cake", "7-grain loaf") is the product's name, not an offer or
   // a quantity: it is masked for those two checks only, never for availability, sensitive-claim, destination or branch checks.
-  const focusPattern = focusOffering?.trim() ? new RegExp(String.raw`(?<![\p{L}\p{N}])${escapeRegExp(focusOffering.trim()).replace(/\s+/g, String.raw`\s+`)}(?![\p{L}\p{N}])`, "giu") : null;
-  const withoutFocusName = (text: string) => (focusPattern ? text.replace(focusPattern, " focus-offering ") : text);
+  // An occurrence is masked only when the words around it do not turn the name's own number into an offer. It stays
+  // checked when followed by "%", a decimal, "off", "discount", "saving"… ("Dark Chocolate 85% off", "Weekend loaf 20%
+  // off") or preceded by "save", "up to", "only", "from", "was", "get"… ("Save 70% Dark Chocolate Cake"), and every
+  // occurrence in a sentence that otherwise speaks of a price, saving, sale or offer ("Our Dark Chocolate 85%: half the
+  // usual price this weekend") stays checked.
+  const focusPattern = focusOffering?.trim() ? new RegExp(String.raw`(?<![\p{L}\p{N}$€£₹¥]|\d[.,])${escapeRegExp(focusOffering.trim()).replace(/\s+/g, String.raw`\s+`)}(?![\p{L}\p{N}%]|\s?%|[.,]\d)`, "giu") : null;
+  const FOCUS_OFFER_BEFORE = /\b(?:save|saving|savings|up\s+to|extra|only|just|now|from|was|were|get|off|less|reduced|discounted|pay|priced?|costs?|worth|plus|over|under|at)\s*[:\-–—]?\s*$/iu;
+  const FOCUS_OFFER_AFTER = /^\s*(?:[-–—:]\s*)?(?:%|percent\b|pc\b|off\b|discount|saving|sale\b|deals?\b|offers?\b|free\b|reduced\b|cheaper\b|less\b)/iu;
+  const FOCUS_OFFER_SENTENCE = /\b(?:off|half|price[ds]?|pricing|discount\w*|sav(?:e|es|ed|ing|ings)|deals?|offers?|sales?|reduced|cheaper|bargain\w*|promo\w*|clearance|bogo|b1g1|percent|only|was|slashed)\b|(?<![\p{L}\p{N}-])free\b|%|[$€£₹¥]/iu;
+  const withoutFocusName = (text: string) => {
+    if (!focusPattern) return text;
+    return text.split(/(?<=[.!?…])(?=\s)|(?<=\n)/).map((sentence) => {
+      const masked = sentence.replace(focusPattern, (match: string, offset: number, whole: string) => (FOCUS_OFFER_BEFORE.test(whole.slice(0, offset)) || FOCUS_OFFER_AFTER.test(whole.slice(offset + match.length)) ? match : " focus-offering "));
+      return FOCUS_OFFER_SENTENCE.test(masked) ? sentence : masked;
+    }).join("");
+  };
   const quantities = (text: string, prepared = false) => { const quantityText = prepared ? text : businessQuantityText(text); return [
     ...(quantityText.match(/\b\d(?:[\d,.]*\d)?\b/g) ?? []),
     ...(quantityText.match(/\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|twenty|thirty|forty|fifty|hundred|thousand|several|multiple)\s*(?:[-–]\s*)?(?:years?|months?|weeks?|days?|hours?|minutes?|generations?|orders?|appointments?|slots?|customers?|percent|kilos?|pounds?)\b/gi) ?? []),
@@ -354,7 +380,7 @@ function campaignClaimRules(report: ResearchReport, opportunity: ResearchOpportu
     const commercialPromise = offers(withoutFocusName(claimText)).length > 0 || /\b(?:discount(?:s|ed)?|on[- ]sale|limited[- ]time offer|special offer|free (?:trial|consultation|delivery|shipping|sample|session)|buy[- ]one[- ]get[- ]one|bogo|b1g1|half[- ]price|buy\s*\d+\s*get\s*\d+)\b/i.test(claimText);
     const availabilityPromise = /\b(?:available (?:now|today|here|at|for|this)|now available|in[- ]stock|on[- ]sale|open (?:now|today)|(?:bookings?|appointments?|slots?) (?:are )?(?:open|available)|(?:same|next)[- ]day delivery)\b/i.test(claimText);
     if ((commercialPromise || availabilityPromise) && !currentOffer) throw new Error("Current offers and availability need dated, original evidence for this exact location.");
-    if (enrichment?.branch && enrichment.branch.status !== "matched" && /\b(?:visit us|visit (?:our|the|this) (?!website\b|page\b|profile\b|menu\b)|we(?:'re| are) (?:located|based)|at (?:our|this|the) [^.!?]{0,50}\b(?:branch|store|shop|clinic|studio|location)|our (?:local|nearby) (?:branch|store|shop|clinic|studio))\b/i.test(claimText)) throw new Error("An unresolved branch cannot be presented as a confirmed local destination.");
+    if (enrichment?.branch && enrichment.branch.status !== "matched" && /\b(?:visit us|visit (?:our|the|this) (?!website\b|page\b|profile\b|menu\b)|we(?:'re| are) (?:located|based)|at (?:our|this|the) [^.!?]{0,50}\b(?:branch|store|shop|clinic|studio|location)|in (?:our|this) [^.!?]{0,50}\b(?:branch|outlet|location)|our (?:local|nearby) (?:branch|store|shop|clinic|studio))\b/i.test(claimText)) throw new Error("An unresolved branch cannot be presented as a confirmed local destination.");
   };
   /**
    * quantityTexts, when given, are alternative readings of publicCopy with editorial numbering already removed (for
