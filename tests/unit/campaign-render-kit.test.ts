@@ -235,7 +235,9 @@ describe("composable campaign kit export", () => {
       const video = await readFile(shortReelPath);
       await writeFile(join(outputDir, "cinema-tracked-preview.mp4"), video);
       const ledger = JSON.stringify({ synthetic: true, frames: 2 });
-      const result = await renderCampaignKit(input, opportunity, draft(), usage, {
+      // A locally repaired draft exports its full repair list beside the summarising review note.
+      const claimRepairs = [{ field: "facebook_ads caption", removed: ["Synthetic removed sentence.", "Synthetic reset sentence."], unsupported: ["Synthetic removed sentence."], reason: "unsupported claim", fallback: true }];
+      const result = await renderCampaignKit(input, opportunity, { ...draft(), claimRepairs }, usage, {
         visual: typography,
         render: { channelImages: { instagram_feed: await photo("#0000ff") }, reel: { kind: "prebuilt", videoPath: reelPath, coverPath } },
         extraAssets: [
@@ -254,9 +256,12 @@ describe("composable campaign kit export", () => {
       expect(byName.get("cinema-tracked-preview.mp4")).toMatchObject({ id: "tracked-preview", channel: "instagram_reels", mediaType: "video", width: 1080, height: 1920, sha256: hashBytes(video) });
       expect(byName.get("composition-ledger.json")).toMatchObject({ mediaType: "document", width: null, height: null, sha256: hashBytes(Buffer.from(ledger)) });
       expect(byName.get("instagram_reel.mp4")?.sha256).toBe(hashBytes(await readFile(reelPath)));
+      const repairDocument = await readFile(join(outputDir, "copy-claim-repairs.json"));
+      expect(byName.get("copy-claim-repairs.json")).toMatchObject({ mediaType: "document", sha256: hashBytes(repairDocument) });
+      expect(JSON.parse(repairDocument.toString("utf8")).repairs).toEqual(claimRepairs);
 
       const manifest = JSON.parse(await readFile(join(outputDir, "manifest.json"), "utf8")) as { inventory: Array<{ filename: string; sha256: string }> };
-      for (const filename of ["cinema-still-1.png", "cinema-tracked-preview.mp4", "composition-ledger.json", "instagram_reel.mp4"]) {
+      for (const filename of ["cinema-still-1.png", "cinema-tracked-preview.mp4", "composition-ledger.json", "instagram_reel.mp4", "copy-claim-repairs.json"]) {
         expect(manifest.inventory.find((item) => item.filename === filename)?.sha256).toBe(byName.get(filename)!.sha256);
       }
       const review = JSON.parse(await readFile(join(outputDir, "review-report.json"), "utf8")) as { checks: Array<{ id: string; reason: string }>; assets: Array<{ filename: string }> };
@@ -286,6 +291,7 @@ describe("composable campaign kit export", () => {
         { visual: typography, extraDocuments: [{ filename: "manifest.json", content: "{}" }] },
         { visual: typography, extraAssets: [{ filename: "instagram_feed.png", mediaType: "image", channel: null }] },
         { visual: typography, extraAssets: [{ filename: "copy-checkpoint.json", mediaType: "document", channel: null }] },
+        { visual: typography, extraDocuments: [{ filename: "copy-claim-repairs.json", content: "{}" }] },
         { visual: typography, extraAssets: [{ filename: "extra.png", mediaType: "image", channel: null }], extraDocuments: [{ filename: "extra.png", content: "duplicate" }] },
         { visual: typography, extraDocuments: [{ filename: "README.txt", content: "case" }] },
         { visual: typography, extraDocuments: [{ filename: "../escape.json", content: "{}" }] },

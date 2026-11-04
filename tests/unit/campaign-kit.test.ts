@@ -405,10 +405,11 @@ describe("local export inventory", () => {
     } finally { vi.unstubAllEnvs(); await rm(directory, { recursive: true, force: true }); }
   });
 
-  test("stored invalid claims remain invalid on repeated local replay, without another paid request", async () => {
+  test("stored structurally invalid copy remains invalid on repeated local replay, without another paid request", async () => {
     const directory = await mkdtemp(join(tmpdir(), "tickr-invalid-response-"));
     const input: CreateCampaignInput = { business: { id: "b1", name: "Fixture bakery", locality: "Fixture", vertical: "bakery", goal: "Test invalid stored response", website: null }, report, opportunityId: opportunity.id, sources: [productSource], enrichment, mode: "synthetic", outputDir: directory, requireCompletedCopy: true };
-    const copy = productDraft(); copy.creativeBrief!.context = { insightIds: [], whyNow: "Explain the offering.", seasonalTheme: { name: null, status: "none", sourceIds: [] } }; copy.channels[0].caption = "Weekend loaf: 50% off.";
+    // An unsupported claim is repaired locally now; evidence outside the selected sources is structural and never is.
+    const copy = productDraft(); copy.creativeBrief!.context = { insightIds: [], whyNow: "Explain the offering.", seasonalTheme: { name: null, status: "none", sourceIds: [] } }; copy.channels[0].caption = "Weekend loaf: 50% off."; copy.channels[0].evidenceIds = ["competitor-1"];
     const response: CompletedCopyResponse = { version: 1, status: "completed", responseId: "response-invalid", model: "muse-spark-1.3", requestHash: hashBytes(Buffer.from("fixture request")), receivedAt: new Date().toISOString(), usage: { model: "muse-spark-1.3", inputTokens: 17, outputTokens: 29, elapsedMs: 43 }, outputText: JSON.stringify(copy) };
     vi.stubEnv("META_API_KEY", "");
     try {

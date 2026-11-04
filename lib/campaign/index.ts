@@ -3,7 +3,7 @@ import { lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import sharp from "sharp";
 import { z } from "zod";
 import { CampaignKitSchema, ModelUsageSchema, type BusinessContext, type BusinessEnrichment, type CampaignKit, type CampaignVisual, type CollectedSource, type ModelUsage, type ResearchMode, type ResearchOpportunity, type ResearchReport } from "../research/contracts";
-import { eligibleBusinessEvidence, generateCampaignCopy, validateCampaignCopy, validateCompletedCampaignCopy, type CampaignCopy } from "./copy";
+import { CLAIM_REPAIR_DOCUMENT, eligibleBusinessEvidence, generateCampaignCopy, validateCampaignCopy, validateCompletedCampaignCopy, type CampaignCopy } from "./copy";
 import { hashBytes, safeOutputPath, writeVerifiedArchive } from "./archive";
 import { normalizeCampaignImage, probeLocalMp4Size, renderCampaignAssets, validateRenderRouting, type RenderInput } from "./render";
 import type { Channel } from "../schemas/common";
@@ -137,7 +137,7 @@ const RESERVED_FILENAMES = new Set([
   "instagram_reel.mp4", "instagram_reel.pending.mp4", "instagram_reel_cover.png", "campaign-hero-source.png", "campaign-source-image.png",
   "campaign-subject.png", "campaign-subject-mask.png", "campaign-backdrop.png",
   "campaign-strategy.json", "brand-product-dossier.json", "evidence-report.json", "captions.md", "whatsapp-conversation.json", "review-report.json", "readme.txt", "manifest.json", "campaign-concept.zip",
-  "copy-checkpoint.json", "copy-checkpoint.pending.json", "copy-response.json", "copy-response.pending.json", "visual-checkpoint.json", "visual-checkpoint.pending.json", "media-acquisition.json",
+  CLAIM_REPAIR_DOCUMENT, "copy-checkpoint.json", "copy-checkpoint.pending.json", "copy-response.json", "copy-response.pending.json", "visual-checkpoint.json", "visual-checkpoint.pending.json", "media-acquisition.json",
   "art-direction-checkpoint.json", "backdrop-checkpoint.json", "sam-layer-checkpoint.json", "sam-layer-diagnostic.json",
   "analysis-response.json", "analysis-response.pending.json", "autopilot-budget.json", "autopilot-public", "state.json", "masklets.json",
 ]);
@@ -298,6 +298,8 @@ async function renderConcept(input: CreateCampaignInput, opportunity: ResearchOp
   await addDocument("evidence-report.json", json({ mode: input.mode, evidence: selectedEvidence, sources: input.sources.filter((source) => selectedSourceIds.has(source.id)).map(({ id, kind, title, url, retrievedAt, acquisition, citation, context }) => ({ id, kind, title, url, retrievedAt, acquisition, citation, context })), unknowns: input.report.unknowns, limitations: reviewNotes }));
   await addDocument("captions.md", `# ${copy.name}\n\nCONCEPT — REVIEW REQUIRED\n\n${copy.channels.map((channel) => `## ${channel.title}\n\n${channel.caption}\n\nCTA: ${channel.cta}\n\nSupporting evidence: ${channel.evidenceIds.join(", ")}`).join("\n\n")}\n`);
   await addDocument("whatsapp-conversation.json", json({ status: "suggested_scripts_not_deployed", eligibility: "unchecked", ...copy.conversation }));
+  // Every sentence the deterministic claim repair removed, in full: the review note only summarises them.
+  if (copy.claimRepairs?.length) await addDocument(CLAIM_REPAIR_DOCUMENT, json({ status: "removed_from_public_copy_pending_owner_confirmation", note: "These sentences were removed from the completed draft, or went with a field reset to neutral text, because the selected sources could not support them. Restore none without owner confirmation and matching evidence.", repairs: copy.claimRepairs }));
   await addDocument("review-report.json", json({
     ruleVersion: "concept-v1", verdict: "needs_owner", campaignId: campaign.id, mode: input.mode,
     checks: [
