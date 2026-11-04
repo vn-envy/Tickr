@@ -194,25 +194,35 @@ export function withoutInquiries(text: string, voice: CopyVoice = "business"): s
   }).join(" ");
 }
 
-/** A prefilled inquiry may open only with a bare greeting and a short addressee ("Hi team,"), never with free text. */
-const PREFILL_GREETING = String.raw`(?:(?:hi|hello|hey|hiya|namaste|greetings|good (?:morning|afternoon|evening))\b(?:\s+(?:there|all|everyone|folks|(?:[\p{L}'’&-]+\s+){0,3}team))?\s*[,:;!\u2013\u2014-]?\s*)?`;
+/** A prefilled inquiry may open only with a bare greeting, a short addressee ("Hi team,") and an emoji ("Hello! 👋"), never with free text. */
+const PREFILL_GREETING = String.raw`(?:(?:hi|hello|hey|hiya|namaste|greetings|good (?:morning|afternoon|evening))\b(?:\s+(?:there|all|everyone|folks|(?:[\p{L}'’&-]+\s+){0,3}team))?\s*[,:;!–—-]?\s*(?:[\p{Extended_Pictographic}️‍]+\s*)?)?`;
 /** A word that would turn a category list into a clause, a comparison, a tag question or a state ("besides", "is", "right", "I hear", "sold out"). */
 const PREFILL_LIST_STOP = String.raw`(?:is|are|was|were|be|been|being|isn['’]t|aren['’]t|wasn['’]t|weren['’]t|am|do|does|did|don['’]t|doesn['’]t|have|has|had|can|will|would|could|should|get|got|i|me|my|you|your|it|its|they|we|he|she|this|that|these|those|which|who|right|besides|beside|other|than|apart|along|with|without|including|included|include|includes|excluding|except|plus|also|too|just|only|still|already|hear|heard|said|saw|like|such|as|not|no|yes|and|or|but|so|in|on|at|for|to|from|of|by|today|tonight|tomorrow|yesterday|now|sold|out|left|remaining|ready|open|closed|back|again|off|free|sale|stock|stocked|offer|offers|deal|deals|special|discounted|reserved|booked|available)`;
-const PREFILL_LIST_WORD = String.raw`(?!${PREFILL_LIST_STOP}(?![\p{L}'’-]))\p{L}[\p{L}'’&-]*`;
+/**
+ * Delivery or takeaway service and offer words. Any hyphen-joined part of a list word counts ("on-sale", "in-stock",
+ * "buy-one-get-one", "half-price", and also "gluten-free"), so such a word ends the neutral list and "available" stays checked.
+ */
+const PREFILL_CLAIM_PART = String.raw`(?:sale|sales|stock|stocked|offer|offers|deal|deals|free|delivery|deliveries|deliver|takeaway|take|discount|discounts|discounted|bogo|half|price|prices|priced|buy|get|special|specials|promo|promos|promotion|promotions|clearance)`;
+const PREFILL_WORD = String.raw`(?![\p{L}'’&-]*?(?<![\p{L}'’])${PREFILL_CLAIM_PART}(?![\p{L}'’]))(?!${PREFILL_LIST_STOP}(?![\p{L}'’-]))\p{L}`;
+const PREFILL_LIST_WORD = String.raw`${PREFILL_WORD}[\p{L}'’&-]*`;
 const PREFILL_LIST_ITEM = String.raw`(?:(?:the|our|your)\s+)?${PREFILL_LIST_WORD}(?:\s+${PREFILL_LIST_WORD}){0,4}`;
 /**
- * The only tail allowed after the neutralised "available": up to three of a time ("this weekend"), a place ("at the
- * counter") or an "in/for <category list>", an optional "and pickup/delivery options", then the closing "?" and nothing
- * else. A copula, a tag question or the focus name after "besides / other than / along with / including / just / I hear"
- * never matches, so "available" stays in the checked text and the business claim rules reject it.
+ * The only tail allowed after the neutralised "available": up to three of a time ("this weekend", "on Saturday", "this
+ * Diwali"), a place ("at the counter") or an "in/for <category list>", an optional "[and] [the] pickup/delivery
+ * options/times/details", an optional ", please", then the closing "?" and nothing else. A copula, a tag question or the
+ * focus name after "besides / other than / along with / including / just / I hear" never matches, so "available" stays
+ * in the checked text and the business claim rules reject it.
  */
-const PREFILL_TIME = String.raw`(?:today|tonight|tomorrow|now|right now|this (?:weekend|week|month|morning|afternoon|evening))`;
+const PREFILL_WEEKDAY = String.raw`(?:mon|tues|wednes|thurs|fri|satur|sun)days?`;
+/** "this <occasion>": one word that is not a list stop or claim word; prefillClaimText also requires it to be capitalised ("this Diwali"). */
+const PREFILL_TIME = String.raw`(?:today|tonight|tomorrow|now|right now|(?:this|next) (?:weekend|week|month|morning|afternoon|evening)|(?:(?:this|on|next)\s+)?${PREFILL_WEEKDAY}|this\s+${PREFILL_WORD}[\p{L}'’-]*)`;
 const PREFILL_PLACE = String.raw`(?:here|in[- ]store|at the (?:counter|shop|store|bakery|cafe|café))`;
 const PREFILL_LIST = String.raw`(?:in|for)\s+${PREFILL_LIST_ITEM}(?:(?:\s*,\s*|\s*,?\s+(?:and|or|&)\s+)${PREFILL_LIST_ITEM}){0,7}`;
 const PREFILL_OPTION = String.raw`(?:pickup|pick-up|collection|delivery|takeaway)`;
 const PREFILL_AVAILABLE_TAIL = String.raw`(?:\s+(?:${PREFILL_TIME}|${PREFILL_PLACE}|${PREFILL_LIST})){0,3}`
-  + String.raw`(?:\s*,?\s+(?:and|&)\s+${PREFILL_OPTION}(?:\s+(?:or|and|&)\s+${PREFILL_OPTION})?\s+options)?`
-  + String.raw`\s*\?[\s"'”’)\]\p{Extended_Pictographic}\uFE0F\u200D]*$`;
+  + String.raw`(?:\s*,?\s+(?:(?:and|&)\s+)?(?:the\s+)?${PREFILL_OPTION}(?:\s+(?:or|and|&)\s+${PREFILL_OPTION})?\s+(?:options|times|timings|details))?`
+  + String.raw`(?:\s*,\s*please)?`
+  + String.raw`\s*\?[\s"'”’)\]\p{Extended_Pictographic}️‍]*$`;
 /**
  * The only neutral prefill shape: an open "what is available" that is the direct object of the request at the very start
  * of a body consisting of that single question, followed only by the allow-listed tail ("Hi! Could you share what is
@@ -221,14 +231,68 @@ const PREFILL_AVAILABLE_TAIL = String.raw`(?:\s+(?:${PREFILL_TIME}|${PREFILL_PLA
  * sentence or anything after a noun phrase never matches.
  */
 const PREFILL_OPEN_AVAILABILITY = new RegExp(String.raw`^(${PREFILL_GREETING}(?:(?:could|can|would) you (?:share|tell (?:me|us)|let (?:me|us) know) what(?:['’]s|\s+is|\s+are)?\s+(?:(?:is|are)\s+)?|(?:please\s+)?(?:share|tell (?:me|us)|let (?:me|us) know) what(?:['’]s|\s+is)?\s+|what(?:['’]s|\s+is)?\s+))available\b(?=${PREFILL_AVAILABLE_TAIL})`, "iu");
+const PREFILL_PLAIN_THIS = /^(?:weekend|week|month|morning|afternoon|evening|(?:mon|tues|wednes|thurs|fri|satur|sun)days?)$/iu;
 
 /**
  * Prefill voice: the whole body stays under the business claim checks. Only the leading open "what is available" of a
- * body that is one polite question is neutralised; stock, sale, booking, delivery, offer, price and branch wording
- * anywhere in it, including any later "available", is still checked.
+ * body that is, as written, exactly one allow-listed polite question is neutralised; stock, sale, booking, delivery,
+ * offer, price and branch wording anywhere in it, including any later "available", is still checked. The shape is
+ * decided on the raw body, before any asked clause is erased, so erasing a later sentence can never create it.
  */
 function prefillClaimText(text: string): string {
-  return text.trim().replace(PREFILL_OPEN_AVAILABILITY, "$1");
+  const raw = text.trim();
+  const match = PREFILL_OPEN_AVAILABILITY.exec(raw);
+  if (!match) return raw;
+  const tail = raw.slice(match[0].length);
+  // "this <word>" names a capitalised occasion ("this Diwali"), never an ordinary word ("this loaf").
+  for (const [, word] of tail.matchAll(/\bthis\s+(\p{L}[\p{L}'’-]*)/giu)) if (!PREFILL_PLAIN_THIS.test(word) && !/^\p{Lu}/u.test(word)) return raw;
+  return `${match[1]}${tail}`;
+}
+
+/**
+ * An asked clause points the reader to a question ("Ask the team what's available this weekend", "We'll let you know
+ * what's available"). The question word directly follows the verb and an optional addressee ("the team", "our bakers",
+ * "the café team", "the team:"). The clause ends at sentence or clause punctuation, a line break, any dash or ellipsis,
+ * a bracket, a slash or bar, an emoji, a relative pronoun, or a joiner that starts a new clause ("and grab…",
+ * "because…", "then…"): "Ask what you fancy and grab the loaf, now in stock" still asserts stock.
+ */
+// "let you know / tell you / share" only as the business's promise to answer ("the team will let you know", "we can
+// tell you", "we'll share"): "Could you share what is available this weekend…" in business voice still presupposes it.
+const ASK_VERB = String.raw`(?:ask|check(?!\s+out\b)|confirm|inquire|enquire|find\s+out|see|(?<=\b(?:will|can|['’]ll|happy\s+to|glad\s+to)\s+)(?:let\s+you\s+know|tell\s+you|share(?:\s+with\s+you)?))`;
+const ASK_ADDRESSEE = String.raw`(?:\s+(?:with\s+)?(?:(?:the|our)\s+(?:[\p{L}'’&-]+\s+)?(?:team|staff|crew|bakers?|kitchen|chefs?|baristas?)|team|staff|us|me|them))?`;
+const ASK_JOINER = String.raw`\b(?:and|but|or|nor|yet|then|so|because|while|whilst|plus|as|since|until|till|before|after|when|whenever|once|though|although|which|that|who|whose)\b`;
+/** A plain hyphen ends the clause when it is used as a dash (" - "), not inside a word ("pick-up"). */
+const ASK_STOP_CHARS = String.raw`.!?,;:‐-―−…()\[\]{}\/|\\\n\r\p{Extended_Pictographic}`;
+const ASKED_CLAUSE = new RegExp(String.raw`\b${ASK_VERB}${ASK_ADDRESSEE}\s*:?\s+(?:about\s+)?(?:whether|if|what|which)\b(?:(?!${ASK_JOINER}|(?<![\p{L}\p{N}])-|-(?![\p{L}\p{N}]))[^${ASK_STOP_CHARS}])*`, "giu");
+/**
+ * An asked clause that itself names a sale, stock, discount, offer, deal, free item, delivery, booking, slot, immediate
+ * availability, price or local destination is not erased: "Ask what's on sale today" presupposes a sale, and "Ask if
+ * it's on sale. It is!" answers itself. Such a clause stays in the checked text and the claim rules decide.
+ */
+const ASKED_CLAIM_VOCABULARY = /\b(?:on[- ]?sales?|sales?|stock(?:s|ed)?|in[- ]stock|discount(?:s|ed)?|offers?|deals?|deliver(?:y|ies|s|ed)?|bookings?|slots?|appointments?|reservations?|bogo|buy[- ]one[- ]get[- ]one|half[- ]price|promo(?:tion)?s?|specials?|clearance|available\s+(?:right\s+)?now|now\s+available|open\s+(?:now|today)|today\s+only|visit|located|based|branch|outlet|store|shop|clinic|studio|location)\b|(?<![\p{L}\p{N}-])free\b|[$€£₹]\s?\d|\d\s?%/iu;
+/** A following "Yes!", "It is!" or "They are." answers the asked question as an assertion. */
+const AFFIRMED_ANSWER = /^[\s.!?…,;:‐-―−()"'”’-]*(?:(?:yes|yep|yeah|yup|sure|of course|absolutely|definitely|indeed)\b|(?:it|they|we|you)\s+(?:is|are|do|does|can|will|have)\s*[!.…])/iu;
+
+/** Erases genuine asked clauses only; a clause with claim vocabulary, or one answered by the words after it, stays checked. */
+export function withoutAskedClauses(text: string): string {
+  return text.replace(ASKED_CLAUSE, (clause: string, offset: number, whole: string) => (ASKED_CLAIM_VOCABULARY.test(clause) || AFFIRMED_ANSWER.test(whole.slice(offset + clause.length)) ? clause : ""));
+}
+
+/**
+ * A small party size, order count or size inside a genuine customer question of the WhatsApp script ("Can we reserve a
+ * table for 6?", "Is it enough for 4?", "Can I order 2 loaves for Saturday?", "Do you have a 1 kg size?") is what the
+ * customer asks for, not a business quantity. Business-voice text, years, durations, times, dates, prices and stated
+ * business counts ("Do you still have 40 loaves?", "Is it true it has been baked for 20 years?") keep the quantity rule.
+ */
+const CUSTOMER_QUESTION_START = new RegExp(String.raw`^${GREETING}(?:can|could|would|may|do|does|is|are|will|shall)\s+(?:we|i|you|it|they|this|that|there|one)\b(?!\s+(?:${RHETORICAL})\b)`, "iu");
+const CUSTOMER_COUNT_GUARD = String.raw`(?![\d.,:/%]|\s*%|\s*(?:for|x|×|by)\s*\d|\s*(?:off|free|years?|yrs?|months?|weeks?|days?|hours?|hrs?|minutes?|mins?|am|pm|a\.m|p\.m|o['’]?clock|th|st|nd|rd|generations?|percent|left|remaining|in stock|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|january|february|march|april|june|july|august|september|october|november|december)\b)`;
+const CUSTOMER_COUNT = new RegExp(String.raw`(?<![\d½]\s*)\b(for|order|get|buy|reserve|book|need|want|take|collect|pick up)(\s+(?:a\s+)?(?:(?:party|group|table)\s+(?:of|for)\s+)?)(?:[1-9]|1\d|20)\b${CUSTOMER_COUNT_GUARD}|\b(a\s+)(?:[1-9]|1\d|20)(?:\.\d)?(\s?(?:kg|kgs|kilo|kilos|g|gm|lb|lbs|pound|litre|liter|l|inch|tier|layer)\b)`, "giu");
+export function customerQuestionQuantityText(text: string): string {
+  return text.split(/(?<=[.!?])\s+|\n+/).map((sentence) => {
+    const trimmed = sentence.trim();
+    const genuine = QUESTION_END.test(trimmed) && !/\b(?:true|really|heard|hear|right|correct|still)\b/i.test(trimmed) && (POLITE_REQUEST.test(trimmed) || CUSTOMER_INQUIRY.test(trimmed) || CUSTOMER_QUESTION_START.test(trimmed));
+    return genuine ? sentence.replace(CUSTOMER_COUNT, (_match, verb: string | undefined, gap: string | undefined, article: string | undefined, unit: string | undefined) => (verb !== undefined ? `${verb}${gap}customer-count` : `${article}customer-size${unit}`)) : sentence;
+  }).join(" ");
 }
 
 /** The click-to-WhatsApp body is the customer's prefilled inquiry, printed on the ad image; every other channel field is the business speaking. */
@@ -236,11 +300,27 @@ export function channelFieldVoice(channel: string, field: "title" | "headline" |
   return channel === "click_to_whatsapp" && field === "body" ? "prefill" : "business";
 }
 
+const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * The exact focus offering name, when the creative brief names a discovered offering (the same match strict validation
+ * requires); a story-only focus (offeringId null) has none, and neither has a name worded as an offer.
+ */
+function focusOfferingName(copy: Pick<CampaignCopy, "creativeBrief">, enrichment?: BusinessEnrichment): string | null {
+  const focus = copy.creativeBrief?.focus;
+  if (!focus?.offeringId || !focus.name.trim()) return null;
+  const offering = enrichment?.offerings.find((item) => item.id === focus.offeringId);
+  const normalize = (value: string) => value.toLowerCase().replace(/\s+/g, " ").trim();
+  // A name that is itself worded as an offer ("20% Off Box", "Buy 2 Get 1 Deal") is never masked.
+  if (!offering || normalize(offering.name) !== normalize(focus.name) || /(?:\d\s?%|[$€£₹]\s?\d[\d,.]*)\s*off\b|\b(?:off|sale|discount(?:s|ed)?|deals?|offers?|free|bogo|buy\s*\d+\s*get\s*\d+|half[- ]price|save)\b/i.test(focus.name)) return null;
+  return focus.name;
+}
+
 /**
  * The claim rules shared by strict validation and the completed-response repair pre-pass. Each check throws the same
  * message the strict validator always has; nothing here accepts more than the strict validator does.
  */
-function campaignClaimRules(report: ResearchReport, opportunity: ResearchOpportunity, sources: readonly CollectedSource[], enrichment?: BusinessEnrichment) {
+function campaignClaimRules(report: ResearchReport, opportunity: ResearchOpportunity, sources: readonly CollectedSource[], enrichment?: BusinessEnrichment, focusOffering: string | null = null) {
   const ownFacts = new Map(eligibleBusinessEvidence(report, opportunity, sources).map((item) => [item.id, item]));
   // Publishing destinations and numerical offers are high-impact and cannot be invented.
   const destinations = (text: string) => (text.match(/https?:\/\/[^\s<>"\\]+|\b[\w.+-]+@[\w.-]+\.[a-z]{2,}\b/gi) ?? []).map((value) => value.replace(/[.,;!?)]+$/, ""));
@@ -249,6 +329,10 @@ function campaignClaimRules(report: ResearchReport, opportunity: ResearchOpportu
   const summarySourceIds = new Set(sources.filter((source) => source.acquisition === "meta_cited_summary").map((source) => source.id));
   const isSummary = (id: string) => ownFacts.get(id)!.basis === "meta_cited_summary" || summarySourceIds.has(ownFacts.get(id)!.sourceId);
   const normalize = (value: string) => value.toLowerCase().replace(/\s+/g, " ").trim();
+  // The exact discovered offering name ("70% Dark Chocolate Cake", "7-grain loaf") is the product's name, not an offer or
+  // a quantity: it is masked for those two checks only, never for availability, sensitive-claim, destination or branch checks.
+  const focusPattern = focusOffering?.trim() ? new RegExp(String.raw`(?<![\p{L}\p{N}])${escapeRegExp(focusOffering.trim()).replace(/\s+/g, String.raw`\s+`)}(?![\p{L}\p{N}])`, "giu") : null;
+  const withoutFocusName = (text: string) => (focusPattern ? text.replace(focusPattern, " focus-offering ") : text);
   const quantities = (text: string, prepared = false) => { const quantityText = prepared ? text : businessQuantityText(text); return [
     ...(quantityText.match(/\b\d(?:[\d,.]*\d)?\b/g) ?? []),
     ...(quantityText.match(/\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|twenty|thirty|forty|fifty|hundred|thousand|several|multiple)\s*(?:[-–]\s*)?(?:years?|months?|weeks?|days?|hours?|minutes?|generations?|orders?|appointments?|slots?|customers?|percent|kilos?|pounds?)\b/gi) ?? []),
@@ -258,17 +342,17 @@ function campaignClaimRules(report: ResearchReport, opportunity: ResearchOpportu
   const hasScopedSources = sources.some((source) => source.context) || Boolean(enrichment?.branch);
   const validateCurrentClaims = (publicCopy: string, evidenceIds: string[], voice: CopyVoice = "business") => {
     if (!hasScopedSources) return; // Preserve legacy descriptive concepts and their recorded review status.
-    // "Ask/check whether…" points the reader to confirm; "Check out what's available today" still advertises.
-    const askedText = withoutInquiries(publicCopy, voice)
-      // The question word must directly follow the verb (optionally "the team/us/me"), and the asked clause ends at
-      // clause punctuation or a relative pronoun: "Confirm the loaf, which is available today" and "Check if you like
-      // the loaf that is in stock now" still assert availability.
-      .replace(/\b(?:ask|check(?!\s+out\b)|confirm|inquire|enquire)(?:\s+(?:with\s+)?(?:(?:the|our)\s+(?:team|staff|crew)|team|staff|us|me|them))?\s+(?:about\s+)?(?:whether|if|what|which)\b(?:(?!\b(?:which|that|who|whose)\b)[^.!?,;:–—])*/giu, "");
-    const claimText = voice === "customer" ? askedText.replace(CUSTOMER_YES_NO_QUESTION, "") : voice === "prefill" ? prefillClaimText(askedText) : askedText;
+    // "Ask/check whether…" points the reader to confirm; "Check out what's available today" still advertises. The
+    // prefill shape is decided on the raw body first; asked clauses are erased before sentences are joined, so a line
+    // break still ends one ("Confirm the loaf, which is available today" and "Ask what you like\nLoaf in stock" assert).
+    const prepared = voice === "prefill" ? prefillClaimText(publicCopy) : publicCopy;
+    const askedText = withoutInquiries(withoutAskedClauses(prepared), voice);
+    const claimText = voice === "customer" ? askedText.replace(CUSTOMER_YES_NO_QUESTION, "") : askedText;
     const references = evidenceIds.map((id) => sources.find((source) => source.id === ownFacts.get(id)?.sourceId)).filter((source): source is CollectedSource => Boolean(source));
     const currentOffer = references.some((source) => isCurrentOfferSource(source));
-    const commercialPromise = offers(claimText).length > 0 || /\b(?:discount(?:s|ed)?|on sale|limited[- ]time offer|special offer|free (?:trial|consultation|delivery|shipping|sample|session))\b/i.test(claimText);
-    const availabilityPromise = /\b(?:available (?:now|today|here|at|for|this)|now available|in stock|on sale|open (?:now|today)|(?:bookings?|appointments?|slots?) (?:are )?(?:open|available)|(?:same|next)[- ]day delivery)\b/i.test(claimText);
+    // The price/percentage part masks the exact focus offering name; the wording checks below never do.
+    const commercialPromise = offers(withoutFocusName(claimText)).length > 0 || /\b(?:discount(?:s|ed)?|on[- ]sale|limited[- ]time offer|special offer|free (?:trial|consultation|delivery|shipping|sample|session)|buy[- ]one[- ]get[- ]one|bogo|b1g1|half[- ]price|buy\s*\d+\s*get\s*\d+)\b/i.test(claimText);
+    const availabilityPromise = /\b(?:available (?:now|today|here|at|for|this)|now available|in[- ]stock|on[- ]sale|open (?:now|today)|(?:bookings?|appointments?|slots?) (?:are )?(?:open|available)|(?:same|next)[- ]day delivery)\b/i.test(claimText);
     if ((commercialPromise || availabilityPromise) && !currentOffer) throw new Error("Current offers and availability need dated, original evidence for this exact location.");
     if (enrichment?.branch && enrichment.branch.status !== "matched" && /\b(?:visit us|visit (?:our|the|this) (?!website\b|page\b|profile\b|menu\b)|we(?:'re| are) (?:located|based)|at (?:our|this|the) [^.!?]{0,50}\b(?:branch|store|shop|clinic|studio|location)|our (?:local|nearby) (?:branch|store|shop|clinic|studio))\b/i.test(claimText)) throw new Error("An unresolved branch cannot be presented as a confirmed local destination.");
   };
@@ -281,11 +365,11 @@ function campaignClaimRules(report: ResearchReport, opportunity: ResearchOpportu
     // A retrieved model summary is not original wording or owner confirmation.
     const referenceText = evidenceIds.filter((id) => !isSummary(id)).map((id) => ownFacts.get(id)!.quote).join(" ");
     if (destinations(publicCopy).some((value) => !destinations(referenceText).includes(value))) throw new Error("The draft introduced an unsupported destination.");
-    if (offers(publicCopy).some((value) => !offers(referenceText).includes(value))) throw new Error("The draft introduced an unsupported price or percentage.");
+    if (offers(withoutFocusName(publicCopy)).some((value) => !offers(referenceText).includes(value))) throw new Error("The draft introduced an unsupported price or percentage.");
     if (phones(publicCopy).some((value) => !phones(referenceText).includes(value))) throw new Error("The draft introduced an unsupported contact number.");
     if (evidenceIds.some(isSummary)) {
       const supported = quantities(referenceText);
-      const readings = quantityTexts?.length ? quantityTexts.map((text) => quantities(text, true)) : [quantities(publicCopy)];
+      const readings = quantityTexts?.length ? quantityTexts.map((text) => quantities(withoutFocusName(text), true)) : [quantities(withoutFocusName(publicCopy))];
       if (readings.every((reading) => reading.some((value) => !supported.includes(value)))) throw new Error("Dates and quantitative promises from Meta summaries need original source or owner confirmation before advertising.");
       if (sensitiveClaims(publicCopy).some((value) => !sensitiveClaims(referenceText).includes(value))) throw new Error("Promotional, certification and medical claims from Meta summaries need original source or owner confirmation before advertising.");
     }
@@ -308,6 +392,17 @@ const CLAIM_REPAIR_ALONGSIDE = "read with the replaced";
 /** Channels whose public post, when a creative brief exists, renders the four brief scenes (carousel slides, reel). */
 const SCENE_CHANNELS = new Set<string>(["instagram_carousel", "instagram_reels"]);
 const PRODUCTION_NOTE_PREFIX = "Production notes moved from consumer copy:";
+const SUMMARY_NOTE = "Story and product themes drawn from Meta-linked summaries are reported descriptions, not original page quotations or owner-approved facts. Confirm the wording and current business details before use.";
+const BRANCH_NOTE = "The supplied location is not confirmed against original branch evidence. Brand descriptions do not establish availability at this location.";
+const themeNote = (name: string) => `The ${name} theme is a proposed creative occasion, not a verified existing business promotion.`;
+const THEME_NOTE = /^The .+ theme is a proposed creative occasion, not a verified existing business promotion\.$/su;
+/** The deterministic safety notes; under the 14-note cap they always outrank notes the draft itself wrote. */
+const isSystemNote = (note: string) => note.startsWith(CLAIM_REPAIR_NOTE_PREFIX) || note.startsWith(PRODUCTION_NOTE_PREFIX) || note === SUMMARY_NOTE || note === BRANCH_NOTE || THEME_NOTE.test(note);
+/** A model-written note can never carry a system note's prefix or text: it is kept, renamed as a draft note. */
+function authoredNote(note: string): string {
+  for (const prefix of [CLAIM_REPAIR_NOTE_PREFIX, PRODUCTION_NOTE_PREFIX]) if (note.startsWith(prefix)) return `Draft note: ${note.slice(prefix.length).trim()}`.slice(0, 500);
+  return isSystemNote(note) ? `Draft note: ${note}`.slice(0, 500) : note;
+}
 
 type FallbackKind = "label" | "message" | "cta" | "objective" | "audience" | "customer" | "answer" | "qualification" | "next" | "story";
 interface ClaimTarget {
@@ -327,6 +422,21 @@ const REASONS: Array<[RegExp, string]> = [
   [/unresolved branch/, "unconfirmed local destination"],
 ];
 const claimReason = (message: string) => REASONS.find(([pattern]) => pattern.test(message))?.[1] ?? "unsupported claim";
+
+/** Record list bounds from CampaignClaimRepairSchema. */
+const RECORD_LIST_MAX = 400;
+const RECORD_ITEM_MAX = 1600;
+/**
+ * Deduplicates a repair record list and keeps it within the schema: an over-long entry ends with "…" and a list over
+ * the cap keeps its first entries and ends with an explicit "+N more" entry, so nothing is dropped silently.
+ */
+export function boundedRecordList(values: readonly string[], kind: "removed" | "unsupported"): string[] {
+  const items = unique(values.map((value) => value.trim()).filter(Boolean).map((value) => (value.length > RECORD_ITEM_MAX ? `${value.slice(0, RECORD_ITEM_MAX - 1).trimEnd()}…` : value)));
+  if (!items.length) return ["(empty)"];
+  if (items.length <= RECORD_LIST_MAX) return items;
+  const hidden = items.length - (RECORD_LIST_MAX - 1);
+  return [...items.slice(0, RECORD_LIST_MAX - 1), `+${hidden} more ${kind === "unsupported" ? "rejected parts not listed; the field's full original text is under removed" : "entries not listed"}`];
+}
 
 const excerpt = (text: string, max: number) => { const flat = text.replace(/\s+/g, " ").trim(); return flat.length > max ? `${flat.slice(0, max - 1).trimEnd()}…` : flat; };
 const unique = (values: readonly string[]) => [...new Set(values)];
@@ -371,7 +481,7 @@ function moveProductionNotes(copy: CampaignCopy): string | null {
  */
 export function repairCampaignCopyClaims<T extends CampaignCopy>(copy: T, report: ResearchReport, opportunity: ResearchOpportunity, sources: readonly CollectedSource[], enrichment?: BusinessEnrichment): { copy: T; repairs: CampaignClaimRepair[] } {
   const repairs: CampaignClaimRepair[] = [];
-  const rules = campaignClaimRules(report, opportunity, sources, enrichment);
+  const rules = campaignClaimRules(report, opportunity, sources, enrichment, focusOfferingName(copy, enrichment));
   const brief = copy.creativeBrief;
   const briefIds = brief ? [...new Set([...brief.focus.evidenceIds, ...brief.brandStory.evidenceIds])] : [];
   const topIds = [...new Set([...copy.evidenceIds, ...briefIds])];
@@ -443,7 +553,9 @@ export function repairCampaignCopyClaims<T extends CampaignCopy>(copy: T, report
 
   const violation = (target: ClaimTarget, text: string): string | null => {
     try {
-      rules.validateSensitiveCopy(text, target.ids, [businessQuantityText(text, { channel: target.channel, field: target.key, contextText: target.context(text) })]);
+      // A genuine customer question in the WhatsApp script may carry a small party size or order count.
+      const quantityText = target.voice === "customer" ? customerQuestionQuantityText(text) : text;
+      rules.validateSensitiveCopy(text, target.ids, [businessQuantityText(quantityText, { channel: target.channel, field: target.key, contextText: target.context(text) })]);
       if (target.current) rules.validateCurrentClaims(text, target.ids, target.voice);
       return null;
     } catch (error) { return error instanceof Error ? error.message : "unsupported claim"; }
@@ -467,9 +579,10 @@ export function repairCampaignCopyClaims<T extends CampaignCopy>(copy: T, report
     for (const { member, original, fallback, problem: own } of plan) {
       reset.add(member);
       if (original === fallback || !original.trim()) continue;
-      // Every occurrence is listed, duplicates included; when only the combination fails, the whole field is quoted.
+      // Each failing part is listed once; when only the combination fails, the whole field is quoted. Both lists are
+      // bounded by the record schema, and a capped list says so in its last entry.
       const failing = own === null ? [] : roughSentences(original).filter((sentence) => violation(member, sentence) !== null);
-      repairs.push({ field: member.field, removed: [original.trim()], unsupported: failing.length ? failing : [original.trim()], reason: own === null ? `${CLAIM_REPAIR_ALONGSIDE} ${trigger.field}` : claimReason(own), fallback: true });
+      repairs.push({ field: member.field, removed: boundedRecordList([original.trim()], "removed"), unsupported: boundedRecordList(failing.length ? failing : [original.trim()], "unsupported"), reason: own === null ? `${CLAIM_REPAIR_ALONGSIDE} ${trigger.field}` : claimReason(own), fallback: true });
     }
     for (const { member, fallback } of plan) member.set(fallback!);
     return true;
@@ -499,6 +612,15 @@ export function repairCampaignCopyClaims<T extends CampaignCopy>(copy: T, report
     }
   }
   return { copy, repairs };
+}
+
+/** The exported copy-claim-repairs.json document: every replaced field with its original text in full. */
+export function claimRepairDocument(repairs: readonly CampaignClaimRepair[]) {
+  return {
+    status: "removed_from_public_copy_pending_owner_confirmation",
+    note: "Each listed field was replaced in full with a neutral line built only from the exact focus name (a brand story was cleared instead), because the selected sources could not support its text or because it is read together with a field whose text they could not support. removed holds the original field text in full; unsupported quotes the part the claim rules rejected. Restore none without owner confirmation and matching evidence.",
+    repairs,
+  };
 }
 
 /** A field replaced only because it is read together with a rejected field (same ad, scene sequence or script). */
@@ -532,8 +654,9 @@ export function claimRepairNote(repairs: readonly CampaignClaimRepair[]): string
  */
 export function validateCompletedCampaignCopy(input: unknown, report: ResearchReport, opportunity: ResearchOpportunity, sources: readonly CollectedSource[], enrichment?: BusinessEnrichment): CampaignCopy {
   const parsed: CampaignCopy = GeneratedCampaignCopySchema.parse(input);
-  // The repair prefix is reserved for the deterministic note below; model text cannot impersonate it.
-  parsed.reviewNotes = parsed.reviewNotes.map((note) => (note.startsWith(CLAIM_REPAIR_NOTE_PREFIX) ? `Draft note: ${note.slice(CLAIM_REPAIR_NOTE_PREFIX.length).trim()}`.slice(0, 500) : note));
+  // The repair and production prefixes and the safety notes' text are reserved for the deterministic notes; model text
+  // cannot impersonate them, so it can neither forge one nor crowd a real one out under the note cap.
+  parsed.reviewNotes = parsed.reviewNotes.map(authoredNote);
   // The repair judges the same consumer text strict validation judges: production labels are moved out first.
   const moved = moveProductionNotes(parsed);
   if (moved) parsed.reviewNotes = unique([...parsed.reviewNotes, moved]);
@@ -548,11 +671,9 @@ export function validateCompletedCampaignCopy(input: unknown, report: ResearchRe
 export function validateCampaignCopy(input: unknown, report: ResearchReport, opportunity: ResearchOpportunity, sources: readonly CollectedSource[] = [], enrichment?: BusinessEnrichment): CampaignCopy {
   const copy = CampaignCopySchema.parse(input);
   if (report.mode === "live") copy.reviewNotes = copy.reviewNotes.map((note) => note.replace(/\bvisibly label(?:ed|led) synthetic\b/gi, "visibly labeled as a review-only concept"));
-  // Notes the draft itself carried; a repaired draft's deterministic notes outrank them under the note cap.
-  const authoredNotes = new Set(copy.reviewNotes.filter((note) => !note.startsWith(CLAIM_REPAIR_NOTE_PREFIX) && !note.startsWith(PRODUCTION_NOTE_PREFIX)));
   const moved = moveProductionNotes(copy);
   if (moved) copy.reviewNotes = [...new Set([...copy.reviewNotes, moved])];
-  const { ownFacts, isSummary, normalize, validateCurrentClaims, validateSensitiveCopy } = campaignClaimRules(report, opportunity, sources, enrichment);
+  const { ownFacts, isSummary, normalize, validateCurrentClaims, validateSensitiveCopy } = campaignClaimRules(report, opportunity, sources, enrichment, focusOfferingName(copy, enrichment));
   if (!ownFacts.size) throw new Error("Provide attributable business evidence before creating a campaign concept.");
   if (new Set(copy.channels.map((channel) => channel.id)).size !== CHANNELS.length) throw new Error("The concept must contain each supported channel exactly once.");
   for (const id of [...copy.evidenceIds, ...copy.channels.flatMap((channel) => channel.evidenceIds)]) {
@@ -593,7 +714,7 @@ export function validateCampaignCopy(input: unknown, report: ResearchReport, opp
       if (theme.status !== "none" && !theme.name?.trim()) throw new Error("A seasonal theme needs a name.");
       if (theme.status === "verified_offer" && (!theme.sourceIds.length || theme.sourceIds.some((id) => !businessSourceIds.has(id) || !isCurrentOfferSource(sourceMap.get(id)!)))) throw new Error("A verified seasonal offer needs current original evidence for this exact branch.");
       if (theme.status === "verified_offer" && !theme.sourceIds.some((id) => normalize(sourceMap.get(id)!.text).includes(normalize(theme.name!)))) throw new Error("The verified seasonal offer name must be present in its original source.");
-      if (theme.status === "proposed_theme") copy.reviewNotes.push(`The ${theme.name} theme is a proposed creative occasion, not a verified existing business promotion.`);
+      if (theme.status === "proposed_theme") copy.reviewNotes.push(themeNote(theme.name!));
     }
     const sceneRoles = brief.scenes.map((scene) => scene.role);
     if (sceneRoles.join(",") !== "hook,proof,occasion,action") throw new Error("The creative brief needs hook, proof, occasion and action scenes in order.");
@@ -606,7 +727,8 @@ export function validateCampaignCopy(input: unknown, report: ResearchReport, opp
     if (/\b(?:owner review|review[- ]only|concept visual|rendered locally|typography[- ]led|not produced|not yet produced|not published|illustration prompt|source[- ]backed|evidence[- ]backed)\b/i.test(publicCopy)) throw new Error("Keep production and review notes out of consumer-facing copy.");
     copy.evidenceIds.push(...brief.focus.evidenceIds, ...brief.brandStory.evidenceIds);
   }
-  const topFields = [copy.name, copy.objective, copy.audienceHypothesis, copy.coreMessage, copy.primaryCta, copy.conversation.opener, ...copy.conversation.commonReplies.flatMap((reply) => [reply.question, reply.answer]), copy.conversation.qualificationQuestion, copy.conversation.nextAction];
+  // In the field-by-field reading, a genuine customer question of the script may carry a small party size or order count.
+  const topFields = [copy.name, copy.objective, copy.audienceHypothesis, copy.coreMessage, copy.primaryCta, customerQuestionQuantityText(copy.conversation.opener), ...copy.conversation.commonReplies.flatMap((reply) => [customerQuestionQuantityText(reply.question), reply.answer]), copy.conversation.qualificationQuestion, copy.conversation.nextAction];
   const topCopy = `${copy.name} ${copy.objective} ${copy.audienceHypothesis} ${copy.coreMessage} ${copy.primaryCta} ${JSON.stringify(copy.conversation)}`;
   validateSensitiveCopy(topCopy, copy.evidenceIds, [businessQuantityText(topCopy), fieldQuantityText(topFields, { contextText: topFields.join(" ") })]);
   // Questions are consumer strings, not JSON syntax or text joined across field boundaries.
@@ -623,17 +745,13 @@ export function validateCampaignCopy(input: unknown, report: ResearchReport, opp
   }
   copy.evidenceIds = [...new Set([...copy.evidenceIds, ...copy.channels.flatMap((channel) => channel.evidenceIds)])];
   if (copy.evidenceIds.some(isSummary)) {
-    copy.reviewNotes = [...new Set([
-      "Story and product themes drawn from Meta-linked summaries are reported descriptions, not original page quotations or owner-approved facts. Confirm the wording and current business details before use.",
-      ...copy.reviewNotes,
-    ])].slice(0, 14);
+    copy.reviewNotes = [...new Set([SUMMARY_NOTE, ...copy.reviewNotes])];
   }
-  if (enrichment?.branch && enrichment.branch.status !== "matched") copy.reviewNotes.push("The supplied location is not confirmed against original branch evidence. Brand descriptions do not establish availability at this location.");
+  if (enrichment?.branch && enrichment.branch.status !== "matched") copy.reviewNotes.push(BRANCH_NOTE);
   const notes = [...new Set(copy.reviewNotes)];
-  // Only a repaired draft can exceed the cap: drop the draft's own trailing notes, never the repair or safety notes.
-  if (notes.length > 14 && notes.some((note) => note.startsWith(CLAIM_REPAIR_NOTE_PREFIX))) {
-    for (let index = notes.length - 1; index >= 0 && notes.length > 14; index--) if (authoredNotes.has(notes[index])) notes.splice(index, 1);
-  }
+  // Over the cap, the draft's own notes give way first (trailing ones first); the repair, production, summary, theme
+  // and branch notes are never dropped for them.
+  for (let index = notes.length - 1; index >= 0 && notes.length > 14; index--) if (!isSystemNote(notes[index])) notes.splice(index, 1);
   copy.reviewNotes = notes.slice(0, 14);
   return CampaignCopySchema.parse(copy);
 }
