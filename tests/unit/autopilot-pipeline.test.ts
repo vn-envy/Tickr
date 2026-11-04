@@ -28,6 +28,7 @@ import { defaultAutopilotDependencies, produceAutopilotCampaign, type AutopilotD
 import { heroTrack } from "../../lib/autopilot/produce";
 import { AutopilotPaidStepError, AutopilotResumableError, AutopilotQualitySchema, type AutopilotProductionInput } from "../../lib/autopilot/production-types";
 import { readPublicFile, readPublicState, type AutopilotPublicState } from "../../lib/autopilot/public-state";
+import { ILLUSTRATION_ASSET_ID, ILLUSTRATION_REEL_LABEL } from "../../lib/autopilot/produce";
 import type { BusinessEnrichment, CollectedSource, ResearchOpportunity, ResearchReport } from "../../lib/research/contracts";
 import { ChannelSchema } from "../../lib/schemas/common";
 import { samImageWire, samResponse, samVideoWire } from "../helpers/sam-wire";
@@ -130,10 +131,15 @@ const fakeTracked = (async (input: Parameters<typeof renderTrackedReel>[0]) => {
   return { ledger, layout: { conceptLabel: "CONCEPT", provenanceLabel: input.provenanceLabel, calloutLabel: "synthetic cup", calloutSide: "above", truncatedText: [] }, qa: { violations: [], framesSubjectHiddenByTransition: 0, footageFramesWithoutMask: 0, headlineOcclusion: { mean: 0, max: 0 } } };
 }) as unknown as typeof renderTrackedReel;
 
+type CriticRequest = Parameters<typeof critiqueCampaign>[0];
 interface Harness {
   input: AutopilotProductionInput;
   deps: AutopilotDependencies;
   calls: Calls;
+  /** Every critique request the pipeline sent (first critique, then the verification critique). */
+  criticRequests: CriticRequest[];
+  /** Every SAM image request the pipeline sent. */
+  segmentRequests: MetaSegmentationRequest[];
   stages: string[];
   phases: Array<AutopilotPublicState["phase"] | null>;
   runCalls: { count: number };
@@ -149,6 +155,8 @@ async function syntheticPhoto(path: string, background: string, cup: string, var
 
 async function harness(name: string, options: {
   photos?: number; clip?: boolean; website?: boolean; caps?: Partial<Record<AutopilotRole, number>>; findings?: Finding[];
+  /** Findings of the verification critique (every critique after the first); none by default. */
+  recheckFindings?: Finding[];
   realStillDepth?: boolean; realTracked?: boolean; renderKit?: AutopilotDependencies["renderKit"];
   /** Risks reported for every analyzed photo (e.g. a possible minor excludes them all). */
   imageRisks?: Array<{ kind: string; box: null; note: string }>;
@@ -176,6 +184,8 @@ async function harness(name: string, options: {
   }
   const calls = zeroCalls();
   const findings = options.findings ?? [];
+  const criticRequests: CriticRequest[] = [];
+  const segmentRequests: MetaSegmentationRequest[] = [];
   const runCalls = { count: 0 };
   const budget = createAutopilotBudget(outputDir, async () => { runCalls.count++; }, { ...AUTOPILOT_ROLE_CAPS, ...options.caps });
   const stages: string[] = [];
@@ -202,9 +212,13 @@ async function harness(name: string, options: {
     harvestOwnerMeta: async () => ({ connected: false, imported: 0, notes: [] }),
     analyzeMedia: (request, dependencies) => analyzeMediaAssets(request, { ...dependencies, client: fakeClient((body) => { calls.media++; return mediaResponse(body, options.imageRisks, options.frameRisks); }) }),
     analyzeShots: (request, dependencies) => analyzeClipShots(request, { ...dependencies, client: fakeClient(() => { calls.shotlog++; return shotResponse(); }) }),
-    segment: (request, dependencies) => segmentMetaImage(request, { ...dependencies, client: fakeClient(() => { calls.samImage++; return samImageResponse(request); }) }),
+    segment: (request, dependencies) => segmentMetaImage(request, { ...dependencies, client: fakeClient(() => { calls.samImage++; segmentRequests.push(request); return samImageResponse(request); }) }),
     trackVideo: (request: SamVideoRequest, dependencies) => trackMetaVideo(request, { ...dependencies, client: fakeClient(() => { calls.samVideo++; return samVideoResponse(request.clip); }) }),
-    critique: (request, dependencies) => critiqueCampaign(request, { ...dependencies, client: fakeClient(() => { calls.critic++; return sparkEnvelope({ findings, summary: "Synthetic critique summary." }); }) }),
+    critique: (request, dependencies) => critiqueCampaign(request, { ...dependencies, client: fakeClient(() => {
+      calls.critic++;
+      criticRequests.push(request);
+      return sparkEnvelope({ findings: calls.critic === 1 ? findings : options.recheckFindings ?? [], summary: "Synthetic critique summary." });
+    }) }),
     ensureCopy: async (input: CreateCampaignInput, copyOptions?: { reserveCopyCall?: () => Promise<void> }): Promise<CampaignCopyResult> => {
       const marker = join(input.outputDir, "synthetic-copy-done.txt");
       if (!(await lstat(marker).then(() => true, () => false))) {
@@ -225,7 +239,7 @@ async function harness(name: string, options: {
     progress: async (stage) => { stages.push(stage); phases.push((await readPublicState(outputDir))?.phase ?? null); },
     leaseLost: () => false,
   };
-  return { input, deps, calls, stages, phases, runCalls, budget };
+  return { input, deps, calls, criticRequests, segmentRequests, stages, phases, runCalls, budget };
 }
 
 beforeAll(async () => {
@@ -334,7 +348,8 @@ describe("Autopilot production pipeline", () => {
     expect(result.quality.reelMode).toBe("still_depth");
     expect(result.quality.criticVerdict).toBe("no_blocking_findings");
     expect(result.quality.withheldFiles).toEqual([]);
-    expect(h.calls).toEqual({ copy: 1, media: 1, shotlog: 0, samImage: 1, samVideo: 0, critic: 1 });
+    // The second critique is the verification critique of the stills the copy fix re-rendered.
+    expect(h.calls).toEqual({ copy: 1, media: 1, shotlog: 0, samImage: 1, samVideo: 0, critic: 2 });
     const state = (await readPublicState(h.input.outputDir))!;
     expect(state.sources).toEqual({ officialWebsite: 1, ownerUploads: 0, ownerInstagram: 0, ownerFacebook: 0, connected: false });
     expect(state.media[0]).toMatchObject({ provenance: "official_website", rights: "unknown_review_required", status: "selected" });
@@ -365,7 +380,7 @@ describe("Autopilot production pipeline", () => {
     expect(result.campaign.assets.some((asset) => asset.filename === "instagram_reel.mp4")).toBe(true);
   }, 400_000);
 
-  test("a crash after every paid step resumes from checkpoints and stored responses with zero additional paid requests", async () => {
+  test("a crash after every paid step resumes from checkpoints and stored responses without repeating a paid request", async () => {
     let renders = 0;
     const crashing: AutopilotDependencies["renderKit"] = async (...args) => {
       renders++;
@@ -384,15 +399,19 @@ describe("Autopilot production pipeline", () => {
     await rm(join(h.input.outputDir, "autopilot", "critique.json"));
     h.deps.renderKit = defaultAutopilotDependencies.renderKit;
     const result = await produceAutopilotCampaign(h.input, h.deps);
-    expect(h.calls).toEqual(paidBefore);
-    expect(await h.budget.counts()).toEqual(countsBefore);
-    expect(h.runCalls.count).toBe(runBefore);
+    // The only new paid request is the verification critique, which follows the (crashed) final export.
+    expect(h.calls).toEqual({ ...paidBefore, critic: 2 });
+    expect(await h.budget.counts()).toEqual({ ...countsBefore, spark_critic: 2 });
+    expect(h.runCalls.count).toBe(runBefore + 1);
     expect(result.quality.reelMode).toBe("tracked_video");
     expect(result.additionalUsage.length).toBeGreaterThanOrEqual(5);
     expect((await readPublicState(h.input.outputDir))?.phase).toBe("done");
+    // A further pass reuses the verification critique too.
+    await produceAutopilotCampaign(h.input, h.deps);
+    expect(h.calls).toEqual({ ...paidBefore, critic: 2 });
   }, 400_000);
 
-  test("removable review wording in the Reel copy re-renders the Reel into its own files, and a crash during export resumes with zero paid requests", async () => {
+  test("removable review wording in the Reel copy re-renders the Reel into its own files, and a crash during export resumes without repeating a paid request", async () => {
     let renders = 0;
     const crashing: AutopilotDependencies["renderKit"] = async (...args) => {
       renders++;
@@ -408,9 +427,13 @@ describe("Autopilot production pipeline", () => {
 
     h.deps.renderKit = defaultAutopilotDependencies.renderKit;
     const result = await produceAutopilotCampaign(h.input, h.deps);
-    expect(h.calls).toEqual(paidBefore);
-    expect(await h.budget.counts()).toEqual(countsBefore);
-    expect(h.runCalls.count).toBe(runBefore);
+    // Only the verification critique of the re-rendered files is new (it follows the final export).
+    expect(h.calls).toEqual({ ...paidBefore, critic: 2 });
+    expect(await h.budget.counts()).toEqual({ ...countsBefore, spark_critic: 2 });
+    expect(h.runCalls.count).toBe(runBefore + 1);
+    // The re-rendered Reel was re-critiqued in its final bytes.
+    const reelAsset = result.campaign.assets.find((asset) => asset.filename === "instagram_reel.mp4")!;
+    expect(h.criticRequests[1].reel?.sha256).toBe(reelAsset.sha256);
     // The critiqued Reel's record and files are untouched; the revision has its own.
     expect(await readFile(join(autopilot, "reel.json"), "utf8")).toBe(critiquedReel);
     for (const name of ["reel-revised.json", "reel/tracked-revised.mp4", "reel/tracked-revised-cover.png", "reel/tracked.mp4"]) expect((await lstat(join(autopilot, name))).isFile()).toBe(true);
@@ -423,7 +446,7 @@ describe("Autopilot production pipeline", () => {
 
     // A third, uninterrupted pass over the same checkpoints also completes without paying again.
     await produceAutopilotCampaign(h.input, h.deps);
-    expect(h.calls).toEqual(paidBefore);
+    expect(h.calls).toEqual({ ...paidBefore, critic: 2 });
   }, 400_000);
 
   test("excluded website images never come back as a hero through the visual stage", async () => {
@@ -448,7 +471,9 @@ describe("Autopilot production pipeline", () => {
     expect(result.quality.mediaExcluded).toBe(1);
     expect(result.quality.reelMode).toBe("illustration");
     expect(result.campaign.visual?.kind).toBe("meta_illustration");
-    expect(h.calls.samImage).toBe(0);
+    // SAM only ever sees the labelled illustration, never the excluded website photo.
+    expect(h.calls.samImage).toBe(1);
+    expect(h.segmentRequests.map((request) => [request.sourceAssetId, request.sourceProvenance])).toEqual([[ILLUSTRATION_ASSET_ID, "meta_illustration"]]);
     const state = (await readPublicState(h.input.outputDir))!;
     expect(state.media[0]).toMatchObject({ provenance: "official_website", status: "excluded" });
   }, 400_000);
@@ -483,8 +508,9 @@ describe("Autopilot production pipeline", () => {
 
   test("without usable media the campaign uses one labelled Muse illustration, and typography once that budget is gone", async () => {
     let images = 0;
-    const withIllustration = async (caps?: Partial<Record<AutopilotRole, number>>, name = "illustration") => {
+    const withIllustration = async (caps?: Partial<Record<AutopilotRole, number>>, name = "illustration", configure?: (h: Harness) => void) => {
       const h = await harness(name, { caps });
+      configure?.(h);
       h.deps.prepareVisual = (input) => prepareCampaignVisual(input, { generateImage: async () => {
         images++;
         const bytes = await sharp({ create: { width: 1024, height: 1536, channels: 3, background: "#c8a26b" } }).png().toBuffer();
@@ -500,12 +526,85 @@ describe("Autopilot production pipeline", () => {
     expect(result.additionalUsage.map((usage) => usage.model)).toContain("muse-image-1.0");
     expect((await h.budget.counts()).muse_image).toBe(1);
     expect((await readPublicState(h.input.outputDir))?.plan).toMatchObject({ heroAssetId: null, reelMode: "illustration" });
+    // SAM 3.1 concept-segments the labelled illustration (the brief's offering as the phrase), and the
+    // Reel is its depth Reel, still labelled an illustrative image, not the flat legacy slideshow.
+    expect(h.calls.samImage).toBe(1);
+    expect((await h.budget.counts()).sam_image).toBe(1);
+    expect(h.segmentRequests).toHaveLength(1);
+    expect(h.segmentRequests[0]).toMatchObject({ prompt: "Flat white", sourceAssetId: ILLUSTRATION_ASSET_ID, sourceProvenance: "meta_illustration" });
+    expect(h.segmentRequests[0].geometry).toBeUndefined();
+    const illustrated = JSON.parse(await kitFile(h.input.outputDir, "director-report.json")) as { reel: { mode: string; provenanceLabel: string; ledger: unknown } };
+    expect(illustrated.reel).toMatchObject({ mode: "illustration", provenanceLabel: ILLUSTRATION_REEL_LABEL });
+    expect(illustrated.reel.ledger).not.toBeNull();
+    const illustratedState = (await readPublicState(h.input.outputDir))!;
+    expect(illustratedState.sam).toEqual([expect.objectContaining({ assetId: ILLUSTRATION_ASSET_ID, media: "image", promptKind: "concept", origin: "concept_prompt", status: "segmented", preview: `mask-${ILLUSTRATION_ASSET_ID}.png` })]);
+    expect(await readPublicFile(h.input.outputDir, `mask-${ILLUSTRATION_ASSET_ID}.png`)).not.toBeNull();
+    expect(result.campaign.assets.map((asset) => asset.filename)).toEqual(expect.arrayContaining(["instagram_reel.mp4", "instagram_reel_cover.png", `sam-mask-${ILLUSTRATION_ASSET_ID}.png`]));
+    expect(result.campaign.reviewNotes.join(" ")).toMatch(/labelled AI illustration with a SAM 3\.1 cutout/);
+    // A second pass reuses the stored SAM selection and the saved depth Reel.
+    await produceAutopilotCampaign(h.input, h.deps);
+    expect(h.calls.samImage).toBe(1);
+    expect(images).toBe(1);
+
+    // SAM finds nothing usable in the illustration: the legacy in-kit Reel remains, still labelled.
+    const noMatch = await withIllustration(undefined, "illustration-no-match", (target) => {
+      target.deps.segment = (request, dependencies) => segmentMetaImage(request, { ...dependencies, client: fakeClient(() => { target.calls.samImage++; target.segmentRequests.push(request); return samResponse(""); }) });
+    });
+    expect(images).toBe(2);
+    expect(noMatch.h.calls.samImage).toBe(1);
+    expect(noMatch.result.quality.reelMode).toBe("illustration");
+    const fallback = JSON.parse(await kitFile(noMatch.h.input.outputDir, "director-report.json")) as { reel: { provenanceLabel: string | null } };
+    expect(fallback.reel.provenanceLabel).toBeNull();
+    expect(noMatch.result.campaign.assets.some((asset) => asset.filename === "instagram_reel.mp4")).toBe(true);
+    expect(noMatch.result.quality.notes.join(" ")).toMatch(/the Reel uses composed crops of the illustration/);
+    expect((await readPublicState(noMatch.h.input.outputDir))!.sam).toEqual([expect.objectContaining({ assetId: ILLUSTRATION_ASSET_ID, status: "no_match", preview: null })]);
 
     const typography = await withIllustration({ muse_image: 0 }, "typography");
-    expect(images).toBe(1);
+    expect(images).toBe(2);
     expect(typography.result.quality.reelMode).toBe("legacy");
     expect(typography.result.campaign.visual?.kind).toBe("typography");
+    expect(typography.h.calls.samImage).toBe(0);
     expect(typography.result.quality.notes.join(" ")).toMatch(/illustration budget/);
+  }, 400_000);
+
+  test("files changed by the critic's fixes get one verification critique bound to their final bytes, whose critical finding withholds them", async () => {
+    const h = await harness("recheck", { photos: 1, recheckFindings: [{ assetId: "instagram_feed", severity: "critical", rule: "unreadable_text", description: "Synthetic unreadable headline.", box: null, timeSeconds: null }] });
+    const result = await produceAutopilotCampaign(h.input, h.deps);
+    // One first critique, then exactly one verification critique (never a loop).
+    expect(h.calls.critic).toBe(2);
+    expect((await h.budget.counts()).spark_critic).toBe(2);
+    const critic = JSON.parse(await kitFile(h.input.outputDir, "critic-report.json")) as { verdict: string; changedAfterCritique: string[]; critiquedFiles: Array<{ filename: string; sha256: string }> };
+    expect(critic.verdict).toBe("no_blocking_findings");
+    expect(critic.changedAfterCritique).toContain("instagram_feed.png");
+    // The verification critique saw exactly the changed files, bound to their final (new) bytes.
+    const [first, second] = h.criticRequests;
+    expect(second.assets.map((asset) => asset.filename).sort()).toEqual([...critic.changedAfterCritique].filter((file) => file.endsWith(".png")).sort());
+    for (const asset of second.assets) {
+      expect(asset.sha256).toBe(result.campaign.assets.find((item) => item.filename === asset.filename)!.sha256);
+      expect(asset.sha256).not.toBe(first.assets.find((item) => item.filename === asset.filename)!.sha256);
+    }
+    // Its critical finding withholds the file (and the archive bundling it); the verdict is the worse of both.
+    expect(result.quality.criticVerdict).toBe("blocking_findings");
+    expect(result.quality.findings).toBe(1);
+    expect(result.quality.withheldFiles).toEqual(expect.arrayContaining(["instagram_feed.png", "campaign-concept.zip"]));
+    expect(approvableFiles(result.campaign, result.quality.withheldFiles).map((file) => file.filename)).not.toContain("instagram_feed.png");
+    expect(result.quality.fixesApplied.some((fix) => fix.startsWith("Verification critique: Withheld instagram_feed"))).toBe(true);
+    expect(result.quality.notes[0]).toMatch(/^A verification critique re-checked \d+ changed files? in (its|their) final version: it reported blocking problems; .*instagram_feed\.png/);
+    const state = (await readPublicState(h.input.outputDir))!;
+    expect(state.critic?.verdict).toBe("blocking_findings");
+    expect(state.critic?.findings.map((finding) => finding.id)).toEqual(["r2-f1"]);
+    expect(state.critic?.withheld).toEqual(result.quality.withheldFiles);
+    // A retry reuses the stored verification critique.
+    await produceAutopilotCampaign(h.input, h.deps);
+    expect(h.calls.critic).toBe(2);
+
+    // No critic budget left after the first critique: the changed files keep the "not re-critiqued" note.
+    const exhausted = await harness("recheck-exhausted", { photos: 1, caps: { spark_critic: 1 } });
+    const unchecked = await produceAutopilotCampaign(exhausted.input, exhausted.deps);
+    expect(exhausted.calls.critic).toBe(1);
+    expect(unchecked.quality.criticVerdict).toBe("no_blocking_findings");
+    expect(unchecked.quality.notes.join(" ")).toMatch(/files changed after the critique were not re-critiqued/);
+    expect(unchecked.quality.withheldFiles).toEqual([]);
   }, 400_000);
 
   test("a critical finding the critic could not attribute to one file withholds the whole kit from approval", async () => {

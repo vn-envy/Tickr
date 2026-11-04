@@ -28,8 +28,9 @@ import { AutopilotCheckpointError, bounded, readCheckpoint, sha256Hex, writeChec
  * Autopilot production from real pixels: working stills, SAM 3.1 image cutouts (box prompt from
  * Spark's located subject, concept phrase as fallback, composed crops when neither works), mask
  * previews, and the Reel — SAM-tracked owner footage, a still-depth Reel from the hero layers,
- * or the labelled illustration/legacy path. SAM masks only SELECT real pixels; nothing here
- * verifies what a selected object is.
+ * a depth Reel from a SAM cutout of the labelled illustration, or the legacy path. SAM masks only
+ * SELECT existing pixels (real photo pixels, or the illustration's own); nothing here verifies
+ * what a selected object is.
  */
 export const MAX_SEGMENTED_STILLS = 5;
 export const WORKING_LONG_SIDE = 2048;
@@ -72,6 +73,35 @@ export async function workingStill(library: MediaLibrary, asset: HarvestedAsset,
     throw new AutopilotCheckpointError("A saved Autopilot working image is not readable. No new Meta request was made; start a fresh run.");
   }
   return { assetId: asset.assetId, provenance: asset.provenance, bytes, mimeType: "image/jpeg", width: metadata.width, height: metadata.height, sha256: sha256Hex(bytes) };
+}
+
+/** Asset id of the labelled Muse illustration when it stands in for missing real media. */
+export const ILLUSTRATION_ASSET_ID = "meta-illustration";
+/** Visible provenance of the illustration's SAM depth Reel: still clearly an illustration. */
+export const ILLUSTRATION_REEL_LABEL = "ILLUSTRATIVE IMAGE · SAM CUTOUT";
+
+/**
+ * The working JPEG of the labelled Muse illustration (same treatment as a library still). The file
+ * is named by the illustration's hash, so a saved copy only ever matches the same illustration.
+ */
+export async function illustrationStill(illustration: Uint8Array, directory: string): Promise<StillSource> {
+  const path = join(directory, "stills", `${ILLUSTRATION_ASSET_ID}-${sha256Hex(illustration).slice(0, 16)}.jpg`);
+  let bytes: Buffer;
+  try { bytes = await readFile(path); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    bytes = await sharp(illustration, { limitInputPixels: 50_000_000, failOn: "error", animated: false })
+      .resize({ width: WORKING_LONG_SIDE, height: WORKING_LONG_SIDE, fit: "inside", withoutEnlargement: true })
+      .flatten({ background: "#ffffff" }).jpeg({ quality: 92, chromaSubsampling: "4:4:4" }).toBuffer();
+    await mkdir(join(directory, "stills"), { recursive: true, mode: 0o700 });
+    await writeAtomic(path, bytes);
+  }
+  const decoded = await sharp(bytes, { failOn: "truncated", limitInputPixels: 50_000_000 }).raw().toBuffer({ resolveWithObject: true }).catch(() => null);
+  const metadata = decoded ? await sharp(bytes).metadata() : null;
+  if (!decoded || metadata?.format !== "jpeg" || !metadata.width || !metadata.height || metadata.width > WORKING_LONG_SIDE || metadata.height > WORKING_LONG_SIDE) {
+    throw new AutopilotCheckpointError("A saved Autopilot working image is not readable. No new Meta request was made; start a fresh run.");
+  }
+  return { assetId: ILLUSTRATION_ASSET_ID, provenance: "meta_illustration", bytes, mimeType: "image/jpeg", width: metadata.width, height: metadata.height, sha256: sha256Hex(bytes) };
 }
 
 /** Visible footer provenance for a routed still. */
@@ -118,7 +148,7 @@ export async function maskPreview(still: Pick<StillSource, "bytes" | "width" | "
  * or any failure falls back to composed crops; a request is never repeated.
  */
 export async function segmentStill(input: {
-  directory: string; still: StillSource; asset: AnalyzedAsset; pick: StillPick; gate: PaidGate; segment: typeof segmentMetaImage;
+  directory: string; still: StillSource; asset: Pick<AnalyzedAsset, "width" | "height">; pick: Pick<StillPick, "segmentation">; gate: PaidGate; segment: typeof segmentMetaImage;
 }): Promise<SegmentOutcome> {
   const { still, pick } = input;
   const plan = pick.segmentation;
@@ -148,7 +178,7 @@ export async function segmentStill(input: {
   try {
     const result = await input.segment({
       bytes: still.bytes, mimeType: still.mimeType, ...(geometry ? { geometry } : { prompt: plan.kind === "concept" ? plan.phrase : label }),
-      sourceAssetId: still.assetId, sourceProvenance: still.provenance === "official_website" ? "source_photo" : "owner_photo",
+      sourceAssetId: still.assetId, sourceProvenance: still.provenance === "official_website" ? "source_photo" : still.provenance === "meta_illustration" ? "meta_illustration" : "owner_photo",
     }, { responseDirectory: directory });
     const usage: ModelUsage = { model: result.model, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, elapsedMs: Math.max(0, Math.round(result.elapsedMs)), imagesProcessed: result.usage.imagesProcessed ?? null };
     // The response is already stored: masks that cannot be composed locally are treated like no
@@ -251,9 +281,9 @@ async function verifiedFile(path: string, sha256: string): Promise<boolean> {
 export type ReelVariant = "reel" | "reel-revised";
 const variantSuffix = (variant: ReelVariant) => (variant === "reel" ? "" : "-revised");
 
-/** The saved Reel, reused only when every file still matches its recorded hash. */
-export async function savedReel(directory: string, variant: ReelVariant, binding: string): Promise<ReelRecord | null> {
-  const saved = await readCheckpoint<ReelRecord>(directory, variant, binding);
+/** The saved Reel (checkpoint `name`), reused only when every file still matches its recorded hash. */
+export async function savedReel(directory: string, name: string, binding: string): Promise<ReelRecord | null> {
+  const saved = await readCheckpoint<ReelRecord>(directory, name, binding);
   if (!saved) return null;
   if (saved.files && (!(await verifiedFile(saved.files.videoPath, saved.files.videoSha256)) || !(await verifiedFile(saved.files.coverPath, saved.files.coverSha256)))) return null;
   if (saved.overlay && !(await verifiedFile(saved.overlay.path, saved.overlay.sha256))) return { ...saved, overlay: null };
@@ -285,6 +315,11 @@ export interface ReelContext {
   dependencies: ReelDependencies;
   /** Called before the paid SAM video request so the director's room shows the tracking phase. */
   onTracking?: () => Promise<void>;
+  /**
+   * The labelled Muse illustration and its SAM layer, present only when no real photo or footage
+   * carries the Reel: the Reel is then a depth Reel of the illustration, still labelled as one.
+   */
+  illustration?: { still: StillSource; layer: StillLayer } | null;
 }
 
 const reelPaths = (context: Pick<ReelContext, "directory" | "variant">, name: string) => {
@@ -302,12 +337,16 @@ async function stillDepthReel(context: ReelContext, still: StillPick | null, not
   const layer = still ? context.layers.get(still.assetId) : undefined;
   const source = still ? context.stills.get(still.assetId) : undefined;
   if (!layer || !source) return null;
+  return depthReel(context, { source, layer, name: "still-depth", label: `${stillProvenanceLabel(source.provenance, false)} · SAM DEPTH`, fallbackNote: "The depth Reel could not be composed locally; the Reel uses composed crops of the hero photo instead." }, notes);
+}
+
+async function depthReel(context: ReelContext, input: { source: StillSource; layer: StillLayer; name: string; label: string; fallbackNote: string }, notes: string[]): Promise<ReelRecord | null> {
+  const { source, layer, label } = input;
   const mask = await readFile(layer.maskPath);
   if (sha256Hex(mask) !== layer.maskSha256) throw new AutopilotCheckpointError();
   const { scenes, cta } = reelScenes(context.copy);
-  const paths = reelPaths(context, "still-depth");
+  const paths = reelPaths(context, input.name);
   await mkdir(join(context.directory, "reel"), { recursive: true, mode: 0o700 });
-  const label = `${stillProvenanceLabel(source.provenance, false)} · SAM DEPTH`;
   let result: Awaited<ReturnType<typeof renderStillDepthReel>>;
   try {
     result = await context.dependencies.renderStillDepth({
@@ -317,7 +356,7 @@ async function stillDepthReel(context: ReelContext, still: StillPick | null, not
     });
   } catch (error) {
     if (!(error instanceof StillDepthError || error instanceof CinemaEncodeError)) throw error;
-    notes.push("The depth Reel could not be composed locally; the Reel uses composed crops of the hero photo instead.");
+    notes.push(input.fallbackNote);
     return null;
   }
   const violations = [...result.qa.violations];
@@ -462,11 +501,21 @@ function emptyRecord(): ReelRecord {
 
 /**
  * Produce the Reel the plan asks for, falling back tracked → still-depth → legacy in-kit Reel.
- * The illustration path is handled by the caller (it needs the campaign visual stage).
+ * The illustration itself comes from the caller (it needs the campaign visual stage); with its
+ * SAM layer in `context.illustration`, the Reel is the illustration's depth Reel.
  */
 export async function produceReel(context: ReelContext): Promise<ReelRecord> {
   const notes: string[] = [];
   const plan = context.plan.reel;
+  if (context.illustration) {
+    // The caller supplies the illustration only after real media produced no Reel: SAM's cutout of
+    // the labelled illustration drives a depth Reel; without one, the legacy in-kit Reel is used.
+    const depth = await depthReel(context, {
+      source: context.illustration.still, layer: context.illustration.layer, name: "illustration-depth", label: ILLUSTRATION_REEL_LABEL,
+      fallbackNote: "The illustration's depth Reel could not be composed locally; the Reel uses composed crops of the illustration instead.",
+    }, notes);
+    return depth ? { ...depth, notes } : { ...emptyRecord(), notes };
+  }
   let fallback: ReelRecord | null = null;
   if (plan.mode === "tracked_video") {
     const tracked = await trackedReel(context, plan, notes);

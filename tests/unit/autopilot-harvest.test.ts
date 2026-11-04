@@ -6,7 +6,8 @@ import { promisify } from "node:util";
 import sharp from "sharp";
 import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 import { analyzeHarvest, chooseAnalysisVideos, MAX_ANALYZED_CLIPS, type AnalyzeDependencies } from "../../lib/autopilot/analyze";
-import { boundMetaSources, HARVEST_MAX_VIDEOS, harvestMedia, type HarvestedAsset, type HarvestDependencies } from "../../lib/autopilot/harvest";
+import { boundMetaSources, emptyGalleryNote, HARVEST_MAX_VIDEOS, harvestMedia, type HarvestedAsset, type HarvestDependencies } from "../../lib/autopilot/harvest";
+import type { OfficialGalleryResult } from "../../lib/media/gallery";
 import type { NormalizedClip, OwnerMediaConsent } from "../../lib/media/cinema-types";
 import { MAX_OWNER_CLIP_INPUT_SECONDS, OwnerClipError } from "../../lib/media/clip";
 import { MediaLibrary } from "../../lib/media/library";
@@ -109,6 +110,43 @@ describe("harvest caps before copying", () => {
     expect((await result.library.listAssets()).map((asset) => asset.id).sort()).toEqual(result.selected.map((asset) => asset.id).sort());
     expect(await readdir(join(result.library.directory, "files"))).toHaveLength(HARVEST_MAX_VIDEOS);
   }, 120_000);
+});
+
+describe("website gallery notes", () => {
+  const gallery = (overrides: Partial<OfficialGalleryResult>): OfficialGalleryResult => ({
+    status: "unavailable", officialWebsite: "https://synthetic-cafe.example/", pagesRead: [], candidatesFound: 0, attempted: 0,
+    assets: [], skipped: [], localFiles: {}, warnings: [], retrievedAt: "2026-11-04T00:00:00.000Z", ...overrides,
+  });
+  const unreadable = "Tickr could not read the official website this time; no website photos were used.";
+  const noPhotos = "The official website offered no usable photos.";
+
+  async function notesFor(result: OfficialGalleryResult, name: string) {
+    const base = join(root, `gallery-${name}`);
+    const dependencies: HarvestDependencies = {
+      openBusinessLibrary: async () => MediaLibrary.open(join(base, "business")),
+      collectGallery: async () => result,
+      harvestOwnerMeta: async () => ({ connected: false, imported: 0, notes: [] }),
+    };
+    const harvested = await harvestMedia({ outputDir: join(base, "run"), workDir: join(base, "work"), businessId: "synthetic-business", businessMediaDir: join(base, "business"), connectionsDir: join(base, "connections"), website: "https://synthetic-cafe.example/" }, dependencies);
+    return harvested.record.notes;
+  }
+
+  test("a site that could not be reached is not reported as having no photos", async () => {
+    const notes = await notesFor(gallery({ warnings: ["CONNECTION_UNAVAILABLE: The official site could not be reached."] }), "unreachable");
+    expect(notes).toContain(unreadable);
+    expect(notes).not.toContain(noPhotos);
+  });
+
+  test("a read page whose photo downloads all failed is also reported as unreadable", () => {
+    expect(emptyGalleryNote(gallery({ pagesRead: ["https://synthetic-cafe.example/"], candidatesFound: 2, attempted: 2, skipped: [{ imageUrl: "https://synthetic-cafe.example/a.jpg", reason: "fetch_failed" }] }))).toBe(unreadable);
+  });
+
+  test("a read page with no candidate photos keeps the no-usable-photos wording", async () => {
+    const notes = await notesFor(gallery({ status: "no_candidates", pagesRead: ["https://synthetic-cafe.example/"] }), "empty");
+    expect(notes).toContain(noPhotos);
+    expect(notes).not.toContain(unreadable);
+    expect(emptyGalleryNote(gallery({ pagesRead: ["https://synthetic-cafe.example/"], candidatesFound: 3, skipped: [{ imageUrl: "https://synthetic-cafe.example/icon.png", reason: "too_small" }] }))).toBe(noPhotos);
+  });
 });
 
 const video = (id: string, addedAt: string, durationSeconds: number | null, provenance: HarvestedAsset["provenance"] = "owner_upload"): HarvestedAsset => ({

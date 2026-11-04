@@ -7,9 +7,9 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { probeVideo } from "../../lib/campaign/cinema/encode";
 import { dilateMask, erodeMask, fillBehindSubject } from "../../lib/campaign/cinema/fill";
 import { assertLedger, CompositionLedgerAccumulator, LedgerCanvas, LedgerInvariantError, measureLedgerFrame } from "../../lib/campaign/cinema/ledger";
-import { measureText, textBlock, wrapText } from "../../lib/campaign/cinema/typography";
+import { measureText, svgDocument, textBlock, wrapText } from "../../lib/campaign/cinema/typography";
 import {
-  GENERATED_BACKDROP_LABEL, MAX_FOREGROUND_OCCLUSION, MAX_HEADLINE_OCCLUSION, prepareStillDepth, renderStillDepthFrame, renderStillDepthReel,
+  GENERATED_BACKDROP_LABEL, MAX_FOREGROUND_OCCLUSION, MAX_HEADLINE_LINE_OCCLUSION, MAX_HEADLINE_OCCLUSION, prepareStillDepth, renderStillDepthFrame, renderStillDepthReel,
   STILL_DEPTH_COVER_FRAME, STILL_DEPTH_FRAMES, STILL_DEPTH_LABEL_BANDS, type StillDepthComposer, type StillDepthInput,
 } from "../../lib/campaign/cinema/still-depth";
 
@@ -273,6 +273,48 @@ describe("still-depth Reel", () => {
     expect(accumulator.framesSubjectHiddenByTransition).toBeGreaterThan(0);
     expect(accumulator.framesSubjectHiddenByTransition).toBeLessThanOrEqual(4);
   }, 120_000);
+
+  // Regression (live round 2): the cup hid "warm cups" in the hook because a line could lose up to half
+  // its letters and the whole headline 35%. Measured independently on rendered frames: the headline's own
+  // glyph raster at its reported place, against the (red/orange) synthetic product pixels in the frame.
+  test("the hook headline stays readable in every rendered hook frame: no line loses its words behind the product", async () => {
+    const LINE_CAP = 0.2, WHOLE_CAP = 0.25;
+    expect(MAX_HEADLINE_OCCLUSION).toBeLessThanOrEqual(WHOLE_CAP);
+    expect(MAX_HEADLINE_LINE_OCCLUSION).toBeLessThanOrEqual(LINE_CAP);
+    const headline = "Slow mornings, warm cups";
+    const scenesWith = input(still, dir).scenes.map((scene, index) => index === 0 ? { ...scene, headline } : scene);
+    for (const fixture of [still, await syntheticStill(720, 1280, 1.25), await syntheticStill(1600, 1200, 1.35)]) {
+      const reel = await prepareStillDepth(input(fixture, dir, { scenes: scenesWith }));
+      const report = reel.layout.hookHeadline;
+      if (report.placement === "in_front") { expect(report.occlusion).toBe(0); continue; }
+      expect(report.occlusion).toBeLessThanOrEqual(WHOLE_CAP);
+      expect(report.lineOcclusion).toBeLessThanOrEqual(LINE_CAP);
+      const column = report.column === "full" ? { x: 60, width: W - 128, anchor: "start" as const, lines: 3 }
+        : report.column === "left" ? { x: 60, width: Math.round(W * 0.58), anchor: "start" as const, lines: 4 } : { x: W - 60, width: Math.round(W * 0.58), anchor: "end" as const, lines: 4 };
+      const laid = textBlock({ text: headline, x: column.x, top: report.top, maxWidth: column.width, maxLines: column.lines, preferredSize: report.fontSize, minSize: report.fontSize, face: "serif", color: "#F5EEDF", lineHeight: 1.02, anchor: column.anchor });
+      const glyphs = await sharp(Buffer.from(svgDocument(W, H, laid.svg))).ensureAlpha().extractChannel(3).raw().toBuffer();
+      // Every entrance frame once the headline is visible (opacity >= 0.25; it still rises up to 44 px
+      // then), then frames to the end of the hook zoom (before the wipe). Mirrors appear(t, 0.22, 0.75, 44).
+      const entrance = (frame: number) => { const e = 1 - (1 - Math.min(1, Math.max(0, (frame / 30 - 0.22) / 0.75))) ** 3; return { opacity: e, dy: Math.round((1 - e) * 44) }; };
+      const frames = [...Array.from({ length: 31 }, (_, frame) => frame).filter((frame) => entrance(frame).opacity >= 0.25), 55, 83];
+      expect(frames.length).toBeGreaterThan(20);
+      for (const frame of frames) {
+        const rgba = reel.renderFrame(frame);
+        const { dy } = entrance(frame);
+        laid.boxes.forEach((box, line) => {
+          let total = 0, hidden = 0;
+          for (let y = Math.max(0, Math.floor(box.y)); y < Math.min(H, Math.ceil(box.y + box.height)); y++) for (let x = 0; x < W; x++) {
+            if (glyphs[y * W + x] < 160 || y + dy >= H) continue;
+            total++;
+            const o = ((y + dy) * W + x) * 4;
+            if (rgba[o] > 120 && rgba[o] - rgba[o + 2] > 90) hidden++;
+          }
+          expect(total, `line ${line}`).toBeGreaterThan(200);
+          expect(hidden / total, `frame ${frame} (rise ${dy}), line ${line} "${box.text}"`).toBeLessThanOrEqual(LINE_CAP);
+        });
+      }
+    }
+  }, 180_000);
 
   test("rejects invalid inputs with fixed messages", async () => {
     const other = await syntheticStill(360, 640);

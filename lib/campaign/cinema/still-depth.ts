@@ -39,10 +39,15 @@ const PLATE_MARGIN = 120;
 const SIDE = 64;
 /** The frame index used for the cover PNG (2.0 s into the hook, after the treatment settles). */
 export const STILL_DEPTH_COVER_FRAME = 60;
-/** Maximum share of the hook headline's glyph area the subject may cover. */
-export const MAX_HEADLINE_OCCLUSION = 0.35;
-/** Maximum share of any single headline line the subject may cover. */
-export const MAX_HEADLINE_LINE_OCCLUSION = 0.5;
+/**
+ * Maximum share of a depth headline's glyph area the subject may cover in ANY single frame where the
+ * headline is visible (its subject moves: the hook zoom here, the tracked footage in tracked.ts).
+ */
+export const MAX_HEADLINE_OCCLUSION = 0.25;
+/** Maximum share of any single headline line the subject may cover in any single visible frame (a hidden word reads as a typo). */
+export const MAX_HEADLINE_LINE_OCCLUSION = 0.2;
+/** A depth headline counts as visible (and its occlusion is checked) from this opacity on. */
+export const HEADLINE_VISIBLE_OPACITY = 0.25;
 /** Maximum share of the subject that foreground graphics (text, chips) may hide. */
 export const MAX_FOREGROUND_OCCLUSION = 0.10;
 /** Appended to the provenance chip whenever a generated backdrop is composited and the caller's label does not say so. */
@@ -53,6 +58,10 @@ const HOOK_SIZES = [178, 150, 124, 104, 88] as const;
 const HOOK_PULLBACK = [1, 0.88, 0.76, 0.64, 0.54] as const;
 const HOOK_SIDE_COLUMN = Math.round(W * 0.58);
 const HOOK_ZOOM = 1.06;
+/** The hook headline's entrance: it rises this many output pixels while fading in. */
+const HOOK_HEADLINE_RISE = 44;
+/** Ledger rows the hook headline still sits below its final place once it is visible (HEADLINE_VISIBLE_OPACITY). */
+const HOOK_HEADLINE_VISIBLE_RISE_CELLS = Math.ceil((1 - HEADLINE_VISIBLE_OPACITY) * HOOK_HEADLINE_RISE / LEDGER_FACTOR);
 /** Rows occupied by the concept (top) and provenance (bottom) chips in every frame. */
 export const STILL_DEPTH_LABEL_BANDS = { top: { top: 44, bottom: 96 }, bottom: { top: H - 96, bottom: H - 44 } } as const;
 /** Transition windows [start, end) in frames. */
@@ -108,8 +117,14 @@ export interface StillDepthInput {
 export interface StillDepthLayoutReport {
   hookHeadline: {
     placement: "behind_subject" | "in_front";
-    /** Share of the headline's glyph area covered by the subject (≤ MAX_HEADLINE_OCCLUSION behind; 0 in front). */
+    /**
+     * Worst share of the headline's glyph area covered by the subject in any visible hook frame
+     * (≤ MAX_HEADLINE_OCCLUSION behind; 0 in front): measured against the subject's extent over its
+     * whole hook zoom and the headline's whole visible rise.
+     */
     occlusion: number;
+    /** Worst share of any single line covered in any visible hook frame (≤ MAX_HEADLINE_LINE_OCCLUSION behind; 0 in front). */
+    lineOcclusion: number;
     /** Share of the subject hidden by the headline itself (0 behind; the in-front fallback is measured here). */
     foregroundOcclusion: number;
     fontSize: number;
@@ -800,11 +815,19 @@ async function prepareLayout(input: StillDepthInput, assets: Prepared) {
   const columnFor = (column: "full" | "left" | "right") => column === "full" ? { column, x: SIDE - 4, width: textWidth, anchor: "start" as const }
     : column === "left" ? { column, x: SIDE - 4, width: HOOK_SIDE_COLUMN, anchor: "start" as const } : { column, x: W - SIDE + 4, width: HOOK_SIDE_COLUMN, anchor: "end" as const };
   const columns = [columnFor("full"), columnFor(away), columnFor(away === "left" ? "right" : "left")];
+  // The subject's extent over the whole hook (its slow zoom), widened upwards by the rows the headline
+  // still has to rise once it is visible: the headline is then checked against every visible frame at once.
   const coverageAt = (k: number) => {
     const start = { k, ...hookAnchor, dx: 0, dy: 0 };
     const [a, b] = [subjectMap(assets, start), subjectMap(assets, { ...start, k: k * HOOK_ZOOM })];
     for (let i = 0; i < a.length; i++) a[i] = Math.max(a[i], b[i]);
-    return { start, coverage: a };
+    const swept = new Float32Array(a.length);
+    for (let y = 0; y < LH; y++) for (let x = 0; x < LW; x++) {
+      let value = 0;
+      for (let s = 0; s <= HOOK_HEADLINE_VISIBLE_RISE_CELLS && y + s < LH; s++) value = Math.max(value, a[(y + s) * LW + x]);
+      swept[y * LW + x] = value;
+    }
+    return { start, coverage: a, swept };
   };
   const headlines = new Map<string, { laid: TextBlock; graphic: Graphic | null } | null>();
   const headlineFor = async (column: ReturnType<typeof columnFor>, size: number) => {
@@ -818,31 +841,31 @@ async function prepareLayout(input: StillDepthInput, assets: Prepared) {
   let hookStart: Placement = { k: 1, ...hookAnchor, dx: 0, dy: 0 };
   let hookCoverage: Float32Array = new Float32Array(LW * LH);
   let hookHeadline: Graphic | null = null, hookKicker: Graphic | null = null;
-  let hookReport: StillDepthLayoutReport["hookHeadline"] = { placement: "behind_subject", occlusion: 0, foregroundOcclusion: 0, fontSize: 0, top: 0, column: "full", subjectScale: 1 };
+  let hookReport: StillDepthLayoutReport["hookHeadline"] = { placement: "behind_subject", occlusion: 0, lineOcclusion: 0, foregroundOcclusion: 0, fontSize: 0, top: 0, column: "full", subjectScale: 1 };
   let hookFront = false;
   const kickerSpec = (color: string): TextSpec => ({ text: hookScene.kicker, face: "sansBold", size: 26, maxLines: 1, color, letterSpacing: 5, uppercase: true });
   // First pass never truncates the headline; only if nothing fits does the smallest size accept an ellipsis.
   search: for (const allowTruncation of [false, true]) for (const k of HOOK_PULLBACK) {
-    const { start, coverage } = coverageAt(k);
+    const { start, coverage, swept } = coverageAt(k);
     for (const column of columns) for (const size of allowTruncation ? HOOK_SIZES.slice(-1) : HOOK_SIZES) {
       const headline = await headlineFor(column, size);
       const base = headline?.graphic;
       // A display headline never splits a word mid-way or drops text unless nothing else fits.
       if (!headline || !base || ((headline.laid.truncated || headline.laid.brokenWords) && !allowTruncation)) continue;
-      const candidates: { dy: number; occlusion: number; score: number }[] = [];
+      const candidates: { dy: number; occlusion: number; line: number; score: number }[] = [];
       for (let dy = 176; dy + base.height + base.y <= H - 260; dy += LEDGER_FACTOR * 6) {
-        const occlusion = glyphOcclusion(base, coverage, dy / LEDGER_FACTOR);
+        const occlusion = glyphOcclusion(base, swept, dy / LEDGER_FACTOR);
         if (occlusion > MAX_HEADLINE_OCCLUSION) continue;
-        // No single line may lose most of its letters behind the subject (a whole hidden word reads as a typo).
-        const lines = headline.laid.boxes.map((box) => glyphOcclusion(base, coverage, dy / LEDGER_FACTOR, [box.y, box.y + box.height]));
-        if (Math.max(...lines) <= MAX_HEADLINE_LINE_OCCLUSION) candidates.push({ dy, occlusion, score: Math.abs(occlusion - 0.16) + 0.25 * dy / H });
+        // No single line may lose its letters behind the subject in any frame (a hidden word reads as a typo).
+        const line = Math.max(0, ...headline.laid.boxes.map((box) => glyphOcclusion(base, swept, dy / LEDGER_FACTOR, [box.y, box.y + box.height])));
+        if (line <= MAX_HEADLINE_LINE_OCCLUSION) candidates.push({ dy, occlusion, line, score: Math.max(occlusion, line) + 0.25 * dy / H });
       }
       candidates.sort((a, b) => a.score - b.score);
       const chosen = candidates[0];
       if (!chosen) continue;
       hookStart = start; hookCoverage = coverage;
       hookHeadline = shiftGraphic(base, chosen.dy);
-      hookReport = { placement: "behind_subject", occlusion: Number(chosen.occlusion.toFixed(4)), foregroundOcclusion: 0, fontSize: headline.laid.size, top: chosen.dy, column: column.column, subjectScale: k };
+      hookReport = { placement: "behind_subject", occlusion: Number(chosen.occlusion.toFixed(4)), lineOcclusion: Number(chosen.line.toFixed(4)), foregroundOcclusion: 0, fontSize: headline.laid.size, top: chosen.dy, column: column.column, subjectScale: k };
       if (headline.laid.truncated) truncated.push("hook.headline");
       const kicker = hookScene.kicker.trim() ? block(kickerSpec(theme.kickerOnDark), column.anchor === "end" ? W - SIDE : SIDE, chosen.dy - 64, column.width, column.anchor) : null;
       hookKicker = kicker ? await renderGraphic(kicker.svg) : null;
@@ -863,7 +886,7 @@ async function prepareLayout(input: StillDepthInput, assets: Prepared) {
       }
       hookHeadline = shiftGraphic(base, best.dy);
       if (headline.truncated) truncated.push("hook.headline");
-      hookReport = { placement: "in_front", occlusion: 0, foregroundOcclusion: Number(foregroundOcclusion(hookCoverage, [hookHeadline]).toFixed(4)), fontSize: headline.size, top: best.dy, column: "full", subjectScale: 1 };
+      hookReport = { placement: "in_front", occlusion: 0, lineOcclusion: 0, foregroundOcclusion: Number(foregroundOcclusion(hookCoverage, [hookHeadline]).toFixed(4)), fontSize: headline.size, top: best.dy, column: "full", subjectScale: 1 };
     }
   }
   const headlineBottom = hookHeadline ? hookHeadline.y + hookHeadline.height : 0;
@@ -1029,14 +1052,14 @@ class Director {
       const camera = shifted(fitPlacement({ ...hook.start, k: 1 + 0.02 * easeInOut(t / 3.2) }, this.assets.plateA), shift);
       if (treat < 1) s.plate(this.assets.plateA, camera, 1, "treated_source", clip);
       if (treat > 0) s.plate(this.assets.plateB, camera, treat, "treated_source", clip);
-      const words = appear(t, 0.22, 0.75, 44);
+      const words = appear(t, 0.22, 0.75, HOOK_HEADLINE_RISE);
       s.graphic(hook.kicker, shift, words.dy, words.opacity, "background_graphics", clip);
       if (!hook.headlineInFront) s.graphic(hook.headline, shift, words.dy, words.opacity, "background_graphics", clip);
       s.shadow(subject, 0.55 * treat, clip);
       return;
     }
     s.subject(subject, 1, clip);
-    if (hook.headlineInFront) { const words = appear(t, 0.22, 0.75, 44); s.graphic(hook.headline, shift, words.dy, words.opacity, "foreground_graphics", clip); }
+    if (hook.headlineInFront) { const words = appear(t, 0.22, 0.75, HOOK_HEADLINE_RISE); s.graphic(hook.headline, shift, words.dy, words.opacity, "foreground_graphics", clip); }
     const body = appear(t, 1.05);
     s.graphic(hook.body, shift, body.dy, body.opacity, "foreground_graphics", clip);
   }

@@ -100,7 +100,7 @@ export function SamPanel({ run, state }: { run: RunView; state: AutopilotPublicS
         </div>
       </li>;
     })}</ul>
-    <p className="ap-fineprint">SAM selects real pixels from your media. A selection is not proof of what the product is; review it like any other claim.</p>
+    <p className="ap-fineprint">SAM selects pixels from each source image — your own media, or a clearly labelled illustration when no real media was usable. A selection is not proof of what the product is; review it like any other claim.</p>
   </section>;
 }
 

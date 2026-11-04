@@ -159,6 +159,67 @@ describe("campaign concepts retain provenance and review boundaries", () => {
     expect(businessQuantityText("A 4-frame Diwali story. Only 20 portions on 8 November 2026 at ₹500.")).toContain("20 portions on 8 November 2026 at ₹500");
   });
 
+  test("slash-numbered carousel slides are editorial structure, not unsupported quantities", () => {
+    const reported = structuredClone(report);
+    reported.evidence[0].kind = "signal";
+    reported.evidence[0].basis = "meta_cited_summary";
+    const source: CollectedSource = { ...productSource, kind: "business_coverage", acquisition: "meta_cited_summary", url: "https://bakery.example/story", citation: { responseId: "response-1", searchCallIds: ["search-1"], url: "https://bakery.example/story", title: "Reported bakery story", method: "model_reference" } };
+    const carouselIndex = productDraft().channels.findIndex((channel) => channel.id === "instagram_carousel");
+    // The live caption shape (synthetic text): "1/ … 2/ … 3/ …" with no story/carousel/slide keyword.
+    const liveShape = "Weekend loaf, three ways 🍞 1/ The weekend loaf, fresh from the oven. 2/ Shared at the table with family. 3/ Ask the team about the weekend loaf.";
+    const carousel = productDraft(); carousel.channels[carouselIndex].caption = liveShape;
+    expect(validateCampaignCopy(carousel, reported, opportunity, [source], enrichment).channels[carouselIndex].caption).toBe(liveShape);
+    expect(businessQuantityText(liveShape, { channel: "instagram_carousel" })).not.toMatch(/\d/);
+    // A strict 1..n list of item-start markers in any channel is numbering, whatever the marker style.
+    for (const delimiter of ["/", ")", ".", ":"]) {
+      const listed = productDraft();
+      listed.channels[0].caption = `Weekend loaf:\n1${delimiter} Fresh from the oven.\n2${delimiter} Shared at the table.\n3${delimiter} Ask the team.`;
+      expect(() => validateCampaignCopy(listed, reported, opportunity, [source], enrichment)).not.toThrow();
+      const sliding = productDraft();
+      sliding.channels[carouselIndex].caption = `Weekend loaf 1${delimiter} fresh from the oven 2${delimiter} shared at the table 3${delimiter} ask the team.`;
+      expect(() => validateCampaignCopy(sliding, reported, opportunity, [source], enrichment)).not.toThrow();
+    }
+    const twoSlides = productDraft(); twoSlides.channels[carouselIndex].caption = "1/ The weekend loaf. 2/ Ask the team.";
+    expect(() => validateCampaignCopy(twoSlides, reported, opportunity, [source], enrichment)).not.toThrow();
+    // Real quantities, dates and prices inside numbered items are still detected.
+    for (const unsafe of [
+      "1/ The weekend loaf. 2/ Only 20 loaves each Saturday. 3/ Ask the team.",
+      "1/ The weekend loaf. 2/ Baked since 1954. 3/ Ask the team.",
+      "1/ The weekend loaf. 2/ Ready in 2 hours. 3/ Ask the team.",
+      "1/ The weekend loaf. 2/ Order by 8 November. 3/ Ask the team.",
+      "1/ The weekend loaf. 3/ Ask the team.",
+      "Weekend loaf: Buy 1. Get 2. Ask the team.",
+    ]) {
+      const copy = productDraft(); copy.channels[carouselIndex].caption = unsafe;
+      expect(() => validateCampaignCopy(copy, reported, opportunity, [source], enrichment)).toThrow("quantitative promises");
+    }
+    for (const unsafe of ["Weekend loaf: Buy 1. Get 2. Pay 3. Ask the team.", "Weekend loaf 1/ fresh 2/ shared 3/ ask the team.", "Weekend loaf.\n1/ Fresh.\n2/ Shared."]) {
+      const copy = productDraft(); copy.channels[0].caption = unsafe;
+      expect(() => validateCampaignCopy(copy, reported, opportunity, [source], enrichment)).toThrow("quantitative promises");
+    }
+    const price = productDraft(); price.channels[carouselIndex].caption = "1/ The weekend loaf. 2/ Just ₹250. 3/ Ask the team.";
+    expect(() => validateCampaignCopy(price, reported, opportunity, [source], enrichment)).toThrow("unsupported price");
+    // Outside a slide context, two markers or mixed marker styles are not proof of a list.
+    expect(businessQuantityText("Buy 1. Get 2. free")).toContain("1");
+    expect(businessQuantityText("Weekend loaf 1/ fresh 2) shared 3. ask")).toContain("1");
+    // Fractions and 24/7 hours are not markers.
+    expect(businessQuantityText("Mix 1/2 cup. Open 24/7.", { channel: "instagram_carousel" })).toBe("Mix 1/2 cup. Open 24/7.");
+  });
+
+  test("run-in single-word '.' sequences stay quantities even in slide channels and keyword copy", () => {
+    // A strict 1,2,3 run of word-attached "." markers around single words is an offer, not slide numbering.
+    expect(businessQuantityText("Buy 1. Get 2. Pay 3. today", { channel: "instagram_carousel" })).toMatch(/\b1\b.*\b2\b.*\b3\b/);
+    expect(businessQuantityText("Our story: Buy 1. Get 2. free")).toMatch(/\b1\b.*\b2\b/);
+    expect(businessQuantityText("Weekend story: Buy 1. Get 2. Pay 3: today", { channel: "instagram_stories" })).toMatch(/\b1\b.*\b2\b.*\b3\b/);
+    // Real slide shapes still lose only their markers.
+    expect(businessQuantityText("1. Sourdough 2. Rye 3. Brioche", { channel: "instagram_carousel" })).not.toMatch(/\d/);
+    expect(businessQuantityText("Three ways 1) fresh 2) shared", { channel: "instagram_reels" })).not.toMatch(/\d/);
+    expect(businessQuantityText("Weekend loaf 1. fresh from the oven 2. shared at the table", { channel: "whatsapp_status" })).not.toMatch(/\d/);
+    // A line break before a marker starts a list item even after a word, in any channel.
+    expect(businessQuantityText("Our loaves\n1. Sourdough\n2. Rye\n3. Brioche")).not.toMatch(/\d/);
+    expect(businessQuantityText("Our loaves\n1. Sourdough\n2. Only 20 left\n3. Brioche")).toMatch(/\b20\b/);
+  });
+
   test("production caveats belong in review notes, not product captions", () => {
     const copy = productDraft();
     copy.channels[0].caption = "Our weekend loaf. Concept visual for owner review.";
@@ -311,6 +372,31 @@ describe("local export inventory", () => {
       await writeCompletedCopyRecord(directory, campaignInputHash(input), response);
       expect(await hasBoundCompletedCopy(input)).toBe(true);
       for (let attempt = 0; attempt < 2; attempt++) await expect(createCampaign(input)).rejects.toBeInstanceOf(CampaignCopyValidationError);
+      expect((await readCompletedCopyRecord(directory, campaignInputHash(input)))?.outputText).toBe(response.outputText);
+    } finally { vi.unstubAllEnvs(); await rm(directory, { recursive: true, force: true }); }
+  });
+
+  test("a stored carousel response numbered 1/ 2/ 3/ revalidates locally on retry, without another paid request", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "tickr-carousel-response-"));
+    const reported = structuredClone(report);
+    reported.evidence[0].kind = "signal";
+    reported.evidence[0].basis = "meta_cited_summary";
+    const source: CollectedSource = { ...productSource, kind: "business_coverage", acquisition: "meta_cited_summary", url: "https://bakery.example/story", citation: { responseId: "response-1", searchCallIds: ["search-1"], url: "https://bakery.example/story", title: "Reported bakery story", method: "model_reference" } };
+    const input: CreateCampaignInput = { business: { id: "b1", name: "Fixture bakery", locality: "Fixture", vertical: "bakery", goal: "Test carousel numbering", website: null }, report: reported, opportunityId: opportunity.id, sources: [source], enrichment, mode: "synthetic", outputDir: directory, requireCompletedCopy: true };
+    const copy = productDraft(); copy.creativeBrief!.context = { insightIds: [], whyNow: "Explain the offering.", seasonalTheme: { name: null, status: "none", sourceIds: [] } };
+    const carousel = copy.channels.find((channel) => channel.id === "instagram_carousel")!;
+    carousel.caption = "Weekend loaf, three ways 1/ The weekend loaf, fresh from the oven. 2/ Shared at the table with family. 3/ Ask the team about the weekend loaf.";
+    const response: CompletedCopyResponse = { version: 1, status: "completed", responseId: "response-carousel", model: "muse-spark-1.3", requestHash: hashBytes(Buffer.from("fixture request")), receivedAt: new Date().toISOString(), usage: { model: "muse-spark-1.3", inputTokens: 17, outputTokens: 29, elapsedMs: 43 }, outputText: JSON.stringify(copy) };
+    vi.stubEnv("META_API_KEY", "");
+    try {
+      await writeCompletedCopyRecord(directory, campaignInputHash(input), response);
+      expect(await hasBoundCompletedCopy(input)).toBe(true);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const replayed = await readCopyCheckpoint(input, opportunity);
+        expect(replayed?.origin).toBe("completed_response");
+        expect(replayed?.usage).toEqual(response.usage);
+        expect(replayed?.copy.channels.find((channel) => channel.id === "instagram_carousel")?.caption).toBe(carousel.caption);
+      }
       expect((await readCompletedCopyRecord(directory, campaignInputHash(input)))?.outputText).toBe(response.outputText);
     } finally { vi.unstubAllEnvs(); await rm(directory, { recursive: true, force: true }); }
   });

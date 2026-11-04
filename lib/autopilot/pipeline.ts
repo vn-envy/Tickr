@@ -1,13 +1,13 @@
 import { copyFile, lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import sharp from "sharp";
-import { critiqueCampaign } from "../agents/critic";
+import { critiqueCampaign, type CritiqueReport } from "../agents/critic";
 import { renderSamOverlayVideo } from "../campaign/cinema/overlay";
 import { renderStillDepthReel } from "../campaign/cinema/still-depth";
 import { renderTrackedReel } from "../campaign/cinema/tracked";
 import { sha256File } from "../campaign/cinema/encode";
 import { CampaignCopyValidationError, ensureCampaignCopy, renderCampaignKit, type CampaignExtraAsset, type CampaignProduction, type CreateCampaignInput, type PrebuiltReel, type RenderImage, type RoutedChannel } from "../campaign/index";
-import { prepareCampaignVisual } from "../campaign/visual";
+import { illustrationSubjectPhrase, prepareCampaignVisual } from "../campaign/visual";
 import { normalizeOwnerClip, normalizeOwnerRenderClip } from "../media/clip";
 import type { MediaLibrary } from "../media/library";
 import { RequestError } from "../http";
@@ -20,12 +20,12 @@ import type { CampaignVisual, ModelUsage } from "../research/contracts";
 import { analysisOfferings, analyzeHarvest, type AnalysisRecord, type AnalyzeDependencies, type PaidGate } from "./analyze";
 import { AutopilotBudgetError } from "./budget";
 import type { AutopilotRole, PlannedChannel, ProductionPlan } from "./contracts";
-import { applyDeterministicFixes, ARCHIVE_FILE, criticReportDocument, critiqueSnapshot, publicCritic, REEL_FILES, runCritique, SAM_OVERLAY_FILE, withheldKitFiles, type CritiqueOutcome } from "./critique";
+import { applyDeterministicFixes, applyRecheckFixes, ARCHIVE_FILE, combinedVerdict, criticReportDocument, critiqueSnapshot, publicCritic, REEL_FILES, runCritique, SAM_OVERLAY_FILE, withheldKitFiles, type CritiqueOutcome, type RecheckFixes } from "./critique";
 import { planProduction } from "./director";
 import { defaultHarvestDependencies, harvestMedia, harvestThumbnail, officialWebsiteFor, openRunLibrary, type HarvestDependencies, type HarvestRecord } from "./harvest";
 import {
-  prebuiltReel, produceReel, renderImageFor, savedReel, segmentStill, workingStill,
-  MAX_SEGMENTED_STILLS, type ReelDependencies, type ReelRecord, type ReelVariant, type StillLayer, type StillSource,
+  illustrationStill, prebuiltReel, produceReel, renderImageFor, savedReel, segmentStill, workingStill,
+  ILLUSTRATION_ASSET_ID, MAX_SEGMENTED_STILLS, type ReelDependencies, type ReelRecord, type ReelVariant, type StillLayer, type StillSource,
 } from "./produce";
 import { AutopilotPaidStepError, AutopilotResumableError, type AutopilotProductionInput, type AutopilotProductionResult, type AutopilotQuality } from "./production-types";
 import { AutopilotCheckpointError, bounded, digestOf, DirectorRoom, directorReport, planRoles, publicAnalysis, publicSam, readCheckpoint, sha256Hex, writeCheckpoint, type SamRecord } from "./report";
@@ -308,20 +308,27 @@ async function produce(input: AutopilotProductionInput, dependencies: AutopilotD
     business: { name: input.business.name, vertical: input.business.vertical }, mode: input.mode, dependencies,
   };
   const layerDigest = [...layers.values()].map((layer) => [layer.assetId, layer.maskSha256]);
+  /** Set once the labelled illustration has a SAM layer: from then on the Reel is its depth Reel. */
+  let illustration: { still: StillSource; layer: StillLayer } | null = null;
   /**
    * "reel" is the Reel the critic sees; "reel-revised" is its local re-render after a copy fix,
    * with its own checkpoint and files so the critiqued Reel and every binding derived from it
-   * stay intact across retries. The revision only recovers stored responses (never pays).
+   * stay intact across retries. The revision only recovers stored responses (never pays). The
+   * illustration's depth Reel keeps separate checkpoints, so the real-media attempt stays reusable.
    */
   const reelFor = async (forCopy: typeof copy, variant: ReelVariant): Promise<ReelRecord> => {
-    const binding = digestOf({ version: "autopilot-reel-1", variant, plan: planBinding, copy: digestOf(forCopy), layers: layerDigest, tracked: dependencies.renderTracked !== null });
-    const saved = await savedReel(directory, variant, binding);
+    const name = illustration ? `${variant}-illustration` : variant;
+    const binding = digestOf({
+      version: "autopilot-reel-1", variant, plan: planBinding, copy: digestOf(forCopy), layers: layerDigest, tracked: dependencies.renderTracked !== null,
+      ...(illustration ? { illustration: [illustration.still.sha256, illustration.layer.maskSha256, illustration.layer.cutoutSha256] } : {}),
+    });
+    const saved = await savedReel(directory, name, binding);
     if (saved) return saved;
     const produced = await produceReel({
-      ...reelContextBase, variant, copy: forCopy,
+      ...reelContextBase, variant, copy: forCopy, ...(illustration ? { illustration } : {}),
       ...(variant === "reel" ? { gate, onTracking: () => room.save("track", "SAM 3.1 is tracking the product through your footage.") } : { gate: recoverOnly }),
     });
-    await writeCheckpoint(directory, variant, binding, produced);
+    await writeCheckpoint(directory, name, binding, produced);
     return produced;
   };
   let reel = await reelFor(copy, "reel");
@@ -345,6 +352,32 @@ async function produce(input: AutopilotProductionInput, dependencies: AutopilotD
     } catch (error) {
       if (!(error instanceof AutopilotBudgetError)) throw error;
       notes.push("The illustration budget for this run was used up; the campaign uses typography instead.");
+    }
+    if (reelMode === "illustration" && heroImage) {
+      // SAM 3.1 selects the illustration's own central subject (concept prompt, sam_image budget), so
+      // the Reel is a labelled depth Reel instead of a flat slideshow; no usable layer keeps the legacy Reel.
+      await room.save("render", "SAM 3.1 is selecting the illustration's subject for the Reel.");
+      const source = await illustrationStill(heroImage.bytes, directory);
+      const phrase = bounded(illustrationSubjectPhrase({ copy, enrichment: input.enrichment }), 120) || "main subject";
+      const outcome = await segmentStill({ directory, still: source, asset: { width: source.width, height: source.height }, pick: { segmentation: { kind: "concept", phrase, label: phrase } }, gate, segment: dependencies.segment });
+      if (outcome.usage) additionalUsage.push(outcome.usage);
+      if (outcome.record.note && outcome.record.status !== "segmented") notes.push(outcome.record.note.replace("composed crops are used", "the Reel uses composed crops of the illustration"));
+      const record = { ...outcome.record };
+      if (outcome.preview) {
+        record.preview = await room.publish(`mask-${ILLUSTRATION_ASSET_ID}.png`, outcome.preview, "image/png");
+        const filename = `sam-mask-${ILLUSTRATION_ASSET_ID}.png`;
+        await writeFile(join(outputDir, filename), outcome.preview);
+        maskExtras.push({ filename, mediaType: "image", channel: null });
+      }
+      samRecords.push(record);
+      room.state.sam = samRecords.map(publicSam);
+      if (outcome.layer) {
+        illustration = { still: source, layer: outcome.layer };
+        const depth = await reelFor(copy, "reel");
+        notes.push(...depth.notes);
+        // The real-media attempt's SAM record (e.g. failed tracking) stays on record.
+        if (depth.files) reel = { ...depth, sam: reel.sam };
+      }
     }
   }
   if (!heroImage && !Object.keys(channelImages).length && !carouselImages) {
@@ -374,6 +407,7 @@ async function produce(input: AutopilotProductionInput, dependencies: AutopilotD
     "Autopilot selected, ranked and composed this media automatically; director-report.json records every observation, choice and exclusion.",
     ...(harvest.assets.some((asset) => asset.provenance === "official_website" && roles.has(asset.assetId)) ? ["Official-website images have unknown reuse rights; confirm permission before publishing them."] : []),
     ...(layers.size ? ["SAM cutouts select real photo pixels; they do not verify which product is shown."] : []),
+    ...(illustration && record.files && reelMode === "illustration" ? ["The Reel animates the labelled AI illustration with a SAM 3.1 cutout of its own pixels; it is not a photo of the business, its products or premises."] : []),
     ...(record.mode === "tracked_video" ? ["The Reel uses the owner's footage with the SAM-tracked subject; sam-tracking-overlay.mp4 shows what was selected."] : []),
     ...(record.withhold ? ["The Reel failed its subject-visibility check and is withheld from approval."] : []),
   ];
@@ -451,7 +485,8 @@ async function produce(input: AutopilotProductionInput, dependencies: AutopilotD
   // Withholding follows the source pixels, not just the critiqued file (fail closed).
   const heroSources = heroImage ? [visual.kind === "meta_illustration" ? "@illustration" : plan.hero?.assetId ?? "@hero"] : [];
   const reelPlan = plan.reel;
-  const reelSources = reel.mode === "tracked_video" && reelPlan.mode === "tracked_video" ? [reelPlan.clipAssetId, ...(reelPlan.fallbackStill ? [reelPlan.fallbackStill.assetId] : [])]
+  const reelSources = reelMode === "illustration" ? heroSources // The illustration's depth Reel or the legacy Reel of it.
+    : reel.mode === "tracked_video" && reelPlan.mode === "tracked_video" ? [reelPlan.clipAssetId, ...(reelPlan.fallbackStill ? [reelPlan.fallbackStill.assetId] : [])]
     : reel.mode === "still_depth" && reelPlan.mode === "still_depth" ? [reelPlan.still.assetId]
     : reel.mode === "still_depth" && reelPlan.mode === "tracked_video" && reelPlan.fallbackStill ? [reelPlan.fallbackStill.assetId]
     : heroSources; // The in-kit (legacy) Reel and an unattributable depth Reel are composed from the hero.
@@ -463,16 +498,53 @@ async function produce(input: AutopilotProductionInput, dependencies: AutopilotD
     if (filename === SAM_OVERLAY_FILE) return overlaySources;
     if ((REEL_FILES as readonly string[]).includes(filename)) return reelSources;
     const mask = /^sam-mask-(.+)\.png$/.exec(filename);
-    if (mask) return [mask[1]];
+    if (mask) return [mask[1] === ILLUSTRATION_ASSET_ID ? "@illustration" : mask[1]];
     const slide = /^instagram_carousel_([1-4])\.png$/.exec(filename);
     if (slide) return carouselImages ? [plan.carousel[Number(slide[1]) - 1]?.assetId ?? "@carousel"] : heroSources;
     if (filename === "facebook_ads_portrait.png") return channelSources("facebook_ads");
     const placement = /^([a-z_]+)\.png$/.exec(filename);
     return placement && campaign.assets.some((asset) => asset.filename === filename && asset.channel === placement[1]) ? channelSources(placement[1]) : [];
   };
-  const withheldFiles = withheldKitFiles({ files: campaign.assets.map((asset) => asset.filename), withheld, contentWithheld: fixes.contentWithheldFiles, withholdAll: fixes.withholdAll, sourcesOf });
+  const kitFiles = campaign.assets.map((asset) => asset.filename);
+  let withheldFiles = withheldKitFiles({ files: kitFiles, withheld, contentWithheld: fixes.contentWithheldFiles, withholdAll: fixes.withholdAll, sourcesOf });
+
+  // 10. Verification critique -----------------------------------------------------------------
+  // Files the fixes re-rendered are critiqued once more, bound to their final bytes, when the critic
+  // budget allows. Only withholding and owner-review outcomes apply: nothing is rewritten again.
+  const recheckNotes: string[] = [];
+  let recheckReport: CritiqueReport | null = null, recheckFixes: RecheckFixes | null = null;
+  const recheckTargets = recheckFiles.filter((file) => kitFiles.includes(file) && !withheldFiles.includes(file));
+  if (recheckTargets.length) {
+    await room.save("export", "Muse Spark is re-checking the files its fixes changed.");
+    const recheckInput = digestOf({ version: "autopilot-recheck-1", critique: critiqueBinding, files: recheckTargets, copy: digestOf(copy) });
+    const recheckSnapshot = await critiqueSnapshot(campaign, outputDir, directory, recheckInput, { name: "critique-recheck-input", only: recheckTargets });
+    const recheckBinding = digestOf({ version: "autopilot-recheck-1", snapshot: digestOf(recheckSnapshot), copy: digestOf(copy) });
+    let recheck = await readCheckpoint<CritiqueOutcome>(directory, "critique-recheck", recheckBinding);
+    if (!recheck) {
+      recheck = await runCritique({ directory, snapshot: recheckSnapshot, copy, report: input.report, opportunity, business: { name: input.business.name, vertical: input.business.vertical }, goal: input.goal, gate, critique: dependencies.critique, round: 2 });
+      await writeCheckpoint(directory, "critique-recheck", recheckBinding, recheck);
+    }
+    if (recheck.usage) additionalUsage.push(recheck.usage);
+    if (recheck.report) {
+      recheckReport = recheck.report;
+      recheckFixes = applyRecheckFixes(recheck.report, copy, recheckSnapshot, snapshot);
+      recheckFixes.withheldFiles.forEach((file) => withheld.add(file));
+      withheldFiles = withheldKitFiles({
+        files: kitFiles, withheld, contentWithheld: [...fixes.contentWithheldFiles, ...recheckFixes.contentWithheldFiles], withholdAll: fixes.withholdAll || recheckFixes.withholdAll, sourcesOf,
+      });
+      const seen = [...recheckSnapshot.stills, ...(recheckSnapshot.reel ? [recheckSnapshot.reel] : [])];
+      const newlyWithheld = recheckTargets.filter((file) => withheldFiles.includes(file));
+      recheckNotes.push(`A verification critique re-checked ${plural(seen.length, "changed file")} in ${seen.length === 1 ? "its" : "their"} final version: ${recheck.report.verdict === "blocking_findings" ? "it reported blocking problems" : "no blocking findings"}${newlyWithheld.length ? `; ${plural(newlyWithheld.length, "file")} withheld (${newlyWithheld.slice(0, 6).join(", ")})` : ""}.`);
+      // A changed file the verification critique did not see in its final bytes stays disclosed.
+      const unseen = recheckTargets.filter((file) => !withheldFiles.includes(file) && seen.find((item) => item.filename === file)?.sha256 !== campaign.assets.find((asset) => asset.filename === file)?.sha256);
+      if (unseen.length) recheckNotes.push(`${plural(unseen.length, "changed file")} ${unseen.length === 1 ? "was" : "were"} not re-critiqued in ${unseen.length === 1 ? "its" : "their"} final version (${unseen.slice(0, 6).join(", ")}); review ${unseen.length === 1 ? "it" : "them"} closely.`);
+      recheckNotes.push(...recheckFixes.recommendations);
+    }
+    recheckNotes.push(...recheck.notes, ...recheckSnapshot.notes);
+  }
+  const withholdAll = fixes.withholdAll || Boolean(recheckFixes?.withholdAll);
   if (withheldFiles.length > MAX_WITHHELD_FILES) throw new Error("Too many withheld files to record; the kit was not offered for approval.");
-  if (fixes.withholdAll) notes.push("The critic reported a critical problem it could not attribute to one file, so every file is withheld from approval; run Autopilot again for a fresh critique.");
+  if (withholdAll) notes.push("The critic reported a critical problem it could not attribute to one file, so every file is withheld from approval; run Autopilot again for a fresh critique.");
   else {
     const derived = withheldFiles.filter((file) => !withheld.has(file) && file !== ARCHIVE_FILE);
     if (derived.length) notes.push(`${plural(derived.length, "other file")} built from the same photo or footage ${derived.length === 1 ? "is" : "are"} withheld too (${derived.slice(0, 6).join(", ")}).`);
@@ -491,14 +563,16 @@ async function produce(input: AutopilotProductionInput, dependencies: AutopilotD
     try { await room.publish("reel-cover.jpg", await sharp(join(outputDir, cover.filename)).resize({ width: 480, height: 480, fit: "inside" }).jpeg({ quality: 82 }).toBuffer(), "image/jpeg"); }
     catch { /* The preview is optional. */ }
   }
-  room.state.critic = publicCritic(critique.report, { fixesApplied: fixes.fixesApplied, withheldFiles });
+  const fixesApplied = [...fixes.fixesApplied, ...(recheckFixes?.fixesApplied ?? [])];
+  room.state.critic = publicCritic(critique.report, { fixesApplied, withheldFiles }, recheckReport);
   const quality: AutopilotQuality = {
     version: 1, planVersion: plan.version, reelMode,
     mediaAnalyzed: analysis.imagesAnalyzed + analysis.videosLogged, mediaExcluded: plan.excluded.length,
-    criticVerdict: critique.report?.verdict ?? "not_run", findings: critique.report?.findings.length ?? 0,
-    fixesApplied: fixes.fixesApplied.map((fix) => bounded(fix, 300)).slice(0, 40), withheldFiles: withheldFiles.map((file) => bounded(file, 160)),
+    criticVerdict: combinedVerdict(critique.report, recheckReport), findings: (critique.report?.findings.length ?? 0) + (recheckReport?.findings.length ?? 0),
+    fixesApplied: fixesApplied.map((fix) => bounded(fix, 300)).slice(0, 40), withheldFiles: withheldFiles.map((file) => bounded(file, 160)),
     roleCounts: await roleCounts(),
-    notes: [...new Set([...notes, ...finalNotes])].map((note) => bounded(note, 600)).filter(Boolean).slice(0, MAX_NOTES),
+    // The verification outcome leads, so the notes bound never drops it.
+    notes: [...new Set([...recheckNotes, ...notes, ...finalNotes])].map((note) => bounded(note, 600)).filter(Boolean).slice(0, MAX_NOTES),
   };
   await room.save("done", withheldFiles.length ? `Your campaign kit is ready for review; ${plural(withheldFiles.length, "file")} withheld.` : "Your campaign kit is ready for review.");
   return { campaign, usage: copyResult.usage, additionalUsage, quality };

@@ -3,7 +3,7 @@ import type { ClientRequest, IncomingMessage, RequestOptions } from "node:http";
 import type { ConnectionOptions, TLSSocket } from "node:tls";
 import { checkServerIdentity } from "node:tls";
 import { describe, expect, test, vi } from "vitest";
-import { pinnedHttpsRequest, type PinnedHttpsDependencies } from "../../lib/network/pinned-https";
+import { pinnedHttpsRequest, proxyConnectAuthority, type PinnedHttpsDependencies } from "../../lib/network/pinned-https";
 
 class FakeResource extends EventEmitter {
   destroy = vi.fn();
@@ -13,7 +13,7 @@ class FakeResource extends EventEmitter {
   statusCode = 200;
 }
 
-function transport(options: { connectStatus?: number; authorized?: boolean; stallTls?: boolean; stallOrigin?: boolean; headers?: Record<string, string>; chunks?: Buffer[] } = {}) {
+function transport(options: { connectStatus?: number; authorized?: boolean; stallTls?: boolean; stallOrigin?: boolean; headers?: Record<string, string>; chunks?: Buffer[]; environment?: Record<string, string | undefined> } = {}) {
   const tunnel = new FakeResource();
   const secure = new FakeResource();
   secure.authorized = options.authorized ?? true;
@@ -46,7 +46,7 @@ function transport(options: { connectStatus?: number; authorized?: boolean; stal
   const resolver = vi.fn(async () => [{ address: "93.184.216.34", family: 4 }]);
   const dependencies: PinnedHttpsDependencies = {
     resolver,
-    environment: { HTTPS_PROXY: "http://proxy-user:proxy-pass@proxy.example.com:8080/", META_API_KEY: "fixture-meta-key-never-forwarded" },
+    environment: options.environment ?? { HTTPS_PROXY: "http://proxy-user:proxy-pass@proxy.example.com:8080/", META_API_KEY: "fixture-meta-key-never-forwarded" },
     httpRequest: request as unknown as NonNullable<PinnedHttpsDependencies["httpRequest"]>,
     httpsRequest: request as unknown as NonNullable<PinnedHttpsDependencies["httpsRequest"]>,
     tlsConnect: tls as unknown as NonNullable<PinnedHttpsDependencies["tlsConnect"]>,
@@ -146,5 +146,83 @@ describe("pinned official-site HTTPS transport", () => {
     await cancelled;
     late.sendOrigin();
     expect(late.originResponse.destroy).toHaveBeenCalled();
+  });
+
+  describe("opt-in hostname CONNECT for proxies that refuse IP-literal tunnels", () => {
+    const proxied = { HTTPS_PROXY: "http://proxy-user:proxy-pass@proxy.example.com:8080/", META_API_KEY: "fixture-meta-key-never-forwarded" };
+
+    test("default mode and any value other than exactly \"1\" still CONNECT by validated IP", async () => {
+      for (const flag of [undefined, "", "0", "true", "yes", " 1"]) {
+        const mock = transport({ environment: { ...proxied, TICKR_PROXY_CONNECT_BY_HOSTNAME: flag } });
+        await pinnedHttpsRequest(origin, requestOptions(), mock.dependencies);
+        expect(mock.connectRequests[0].options).toMatchObject({ path: "93.184.216.34:443", headers: { Host: "93.184.216.34:443" } });
+      }
+    });
+
+    test("opt-in mode CONNECTs by hostname only after local validation, keeps TLS on the hostname and credentials off the origin", async () => {
+      const mock = transport({ environment: { ...proxied, TICKR_PROXY_CONNECT_BY_HOSTNAME: "1" } });
+      const response = await pinnedHttpsRequest(origin, requestOptions(), mock.dependencies);
+      expect(response.body.toString()).toBe("public website");
+      expect(mock.resolver).toHaveBeenCalledWith("bakery.example.com");
+      expect(mock.resolver.mock.invocationCallOrder[0]).toBeLessThan(mock.request.mock.invocationCallOrder[0]);
+      expect(mock.connectRequests).toHaveLength(1);
+      expect(mock.connectRequests[0].options).toMatchObject({ hostname: "proxy.example.com", method: "CONNECT", path: "bakery.example.com:443", headers: { Host: "bakery.example.com:443", "Proxy-Authorization": `Basic ${Buffer.from("proxy-user:proxy-pass").toString("base64")}` } });
+      expect(mock.tls).toHaveBeenCalledWith({ socket: mock.tunnel, servername: "bakery.example.com", rejectUnauthorized: true, checkServerIdentity });
+      const headers = mock.originRequests[0].options.headers as Record<string, string>;
+      expect(Object.keys(headers).some((header) => /authorization|cookie/i.test(header))).toBe(false);
+      expect(JSON.stringify(headers)).not.toMatch(/proxy-user|proxy-pass|fixture-meta-key/);
+    });
+
+    test("opt-in mode still rejects private, metadata, mixed and unresolvable answers before any CONNECT", async () => {
+      for (const answers of [[{ address: "10.0.0.5", family: 4 }], [{ address: "169.254.169.254", family: 4 }], [{ address: "93.184.216.34", family: 4 }, { address: "127.0.0.1", family: 4 }], [{ address: "2606:2800:220:1::", family: 6 }], []]) {
+        const mock = transport({ environment: { ...proxied, TICKR_PROXY_CONNECT_BY_HOSTNAME: "1" } });
+        mock.resolver.mockResolvedValue(answers);
+        await expect(pinnedHttpsRequest(origin, requestOptions(), mock.dependencies)).rejects.toMatchObject({ code: "DESTINATION_NOT_PUBLIC" });
+        expect(mock.request).not.toHaveBeenCalled();
+        expect(mock.tls).not.toHaveBeenCalled();
+      }
+      const dnsDown = transport({ environment: { ...proxied, TICKR_PROXY_CONNECT_BY_HOSTNAME: "1" } });
+      dnsDown.resolver.mockRejectedValue(new Error("ENOTFOUND"));
+      await expect(pinnedHttpsRequest(origin, requestOptions(), dnsDown.dependencies)).rejects.toMatchObject({ code: "DNS_UNAVAILABLE" });
+      expect(dnsDown.request).not.toHaveBeenCalled();
+    });
+
+    test("opt-in mode still rejects userinfo, non-443 ports, IP literals and non-HTTPS before DNS", async () => {
+      for (const target of ["https://user:pass@bakery.example.com/", "https://bakery.example.com:8443/", "https://93.184.216.34/", "http://bakery.example.com/"]) {
+        const mock = transport({ environment: { ...proxied, TICKR_PROXY_CONNECT_BY_HOSTNAME: "1" } });
+        await expect(pinnedHttpsRequest(new URL(target), requestOptions(), mock.dependencies)).rejects.toMatchObject({ code: "URL_NOT_ALLOWED" });
+        expect(mock.resolver).not.toHaveBeenCalled();
+        expect(mock.request).not.toHaveBeenCalled();
+      }
+    });
+
+    test("a rejected hostname CONNECT is not retried by IP or directly", async () => {
+      const mock = transport({ connectStatus: 403, environment: { ...proxied, TICKR_PROXY_CONNECT_BY_HOSTNAME: "1" } });
+      await expect(pinnedHttpsRequest(origin, requestOptions(), mock.dependencies)).rejects.toMatchObject({ code: "PROXY_CONNECT_REJECTED" });
+      expect(mock.connectRequests).toHaveLength(1);
+      expect(mock.connectRequests[0].options.path).toBe("bakery.example.com:443");
+      expect(mock.originRequests).toHaveLength(0);
+      expect(mock.tls).not.toHaveBeenCalled();
+    });
+
+    test("the flag is ignored without a proxy: the direct connection stays pinned to the validated IP", async () => {
+      const mock = transport({ environment: { TICKR_PROXY_CONNECT_BY_HOSTNAME: "1" } });
+      await pinnedHttpsRequest(origin, requestOptions(), mock.dependencies);
+      expect(mock.connectRequests).toHaveLength(0);
+      expect(mock.tls).not.toHaveBeenCalled();
+      expect(mock.originRequests).toHaveLength(1);
+      const agent = mock.originRequests[0].options.agent as unknown as { options: { lookup: (host: string, options: object, callback: (error: Error | null, address: unknown) => void) => void } };
+      const pinnedAddress = await new Promise((resolve, reject) => agent.options.lookup("bakery.example.com", { all: true }, (error, address) => error ? reject(error) : resolve(address)));
+      expect(pinnedAddress).toEqual([{ address: "93.184.216.34", family: 4 }]);
+      expect(mock.resolver).toHaveBeenCalledOnce();
+    });
+
+    test("authority helper fails closed on unvalidated addresses and unexpected hostnames", () => {
+      expect(() => proxyConnectAuthority(origin, { address: "10.0.0.1" }, { TICKR_PROXY_CONNECT_BY_HOSTNAME: "1" })).toThrow(expect.objectContaining({ code: "DESTINATION_NOT_PUBLIC" }));
+      expect(() => proxyConnectAuthority(new URL("https://bakery.example.com:8443/"), { address: "93.184.216.34" }, { TICKR_PROXY_CONNECT_BY_HOSTNAME: "1" })).toThrow(expect.objectContaining({ code: "URL_NOT_ALLOWED" }));
+      expect(() => proxyConnectAuthority(new URL("https://[::1]/"), { address: "93.184.216.34" }, { TICKR_PROXY_CONNECT_BY_HOSTNAME: "1" })).toThrow(expect.objectContaining({ code: "URL_NOT_ALLOWED" }));
+      expect(proxyConnectAuthority(origin, { address: "93.184.216.34" }, {})).toBe("93.184.216.34:443");
+      expect(proxyConnectAuthority(origin, { address: "93.184.216.34" }, { TICKR_PROXY_CONNECT_BY_HOSTNAME: "1" })).toBe("bakery.example.com:443");
+    });
   });
 });

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import type { CritiqueReport } from "../../lib/agents/critic";
 import type { CampaignCopy } from "../../lib/campaign/copy";
-import { applyDeterministicFixes, withheldKitFiles, type CritiqueSnapshot } from "../../lib/autopilot/critique";
+import { applyDeterministicFixes, applyRecheckFixes, combinedVerdict, publicCritic, withheldKitFiles, type CritiqueSnapshot } from "../../lib/autopilot/critique";
 import { ChannelSchema } from "../../lib/schemas/common";
 
 // SYNTHETIC fixtures only: no model, no network. They exercise the model-free withholding rules
@@ -30,9 +30,9 @@ const boundAssets = [
   { assetId: "reel", filename: "instagram_reel.mp4", sha256: "b".repeat(64), kind: "reel", channel: "instagram_reels" },
 ];
 type Finding = { assetId: string; severity: "critical" | "major" | "minor"; rule: string; gridBox?: unknown };
-function report(findings: Finding[], discarded: Array<{ severity: "critical" | "major" | "minor"; rule: string }> = []): CritiqueReport {
+function report(findings: Finding[], discarded: Array<{ severity: "critical" | "major" | "minor"; rule: string }> = [], bound: ReadonlyArray<(typeof boundAssets)[number]> = boundAssets): CritiqueReport {
   return {
-    rulesVersion: "critic-1", boundAssets,
+    rulesVersion: "critic-1", boundAssets: bound,
     findings: findings.map((finding, index) => ({ id: `f${index + 1}`, assetKind: finding.assetId === "reel" ? "reel" : "still", description: "Synthetic.", gridBox: finding.gridBox ?? null, box: null, boxBasis: null, boxRejected: false, timeSeconds: null, timeRejected: false, ...finding })),
     discardedFindings: discarded.map((finding) => ({ reason: "unknown_asset", assetId: "instagram_feed_typo.png", ...finding })),
     verdict: findings.some((finding) => finding.severity === "critical") || discarded.some((finding) => finding.severity === "critical") ? "blocking_findings" : "no_blocking_findings",
@@ -125,5 +125,51 @@ describe("withholding order", () => {
     const sourcesOf = (file: string) => ({ "instagram_feed.png": ["photo_x"], "instagram_reel.mp4": ["clip_1", "photo_x"], "instagram_reel_cover.png": ["clip_1", "photo_x"], "sam-tracking-overlay.mp4": ["clip_1"] } as Record<string, string[]>)[file] ?? [];
     expect(withheldKitFiles({ files: ["instagram_feed.png", "instagram_reel.mp4", "instagram_reel_cover.png", "sam-tracking-overlay.mp4", "director-report.json"], withheld: ["instagram_feed.png"], contentWithheld: ["instagram_feed.png"], withholdAll: false, sourcesOf }))
       .toEqual(["instagram_feed.png", "instagram_reel.mp4", "instagram_reel_cover.png", "sam-tracking-overlay.mp4"]);
+  });
+});
+
+describe("the verification critique of files changed after the first critique", () => {
+  // Only the re-rendered feed still and the Facebook ad were sent again.
+  const recheckSnapshot: CritiqueSnapshot = { version: 1, stills: [still("instagram_feed", "instagram_feed"), still("facebook_ads", "facebook_ads")], reel: null, notes: [] };
+  const recheckBound = boundAssets.filter((asset) => asset.assetId === "instagram_feed" || asset.assetId === "facebook_ads");
+
+  test("never rewrites copy again: leftover review wording stays an owner edit and a critical finding withholds its files", () => {
+    const draft = copyFixture("Morning cups, made slowly. (draft copy)");
+    const fixes = applyRecheckFixes(report([{ assetId: "instagram_feed", severity: "critical", rule: "review_language_in_consumer_copy" }], [], recheckBound), draft, recheckSnapshot, snapshot);
+    expect(fixes).not.toHaveProperty("copy");
+    expect(fixes.withheldFiles).toEqual(["instagram_feed.png"]);
+    expect(fixes.withholdAll).toBe(false);
+    expect(fixes.recommendations.join(" ")).toMatch(/still found internal review wording .* it was not rewritten again/);
+    expect(fixes.fixesApplied).toEqual([expect.stringMatching(/^Verification critique: Withheld instagram_feed\.png/)]);
+    expect(fixes.fixesApplied.join(" ")).not.toMatch(/Removed internal review wording/);
+    // Not critical: only an owner edit, nothing withheld.
+    const minor = applyRecheckFixes(report([{ assetId: "instagram_feed", severity: "minor", rule: "review_language_in_consumer_copy" }], [], recheckBound), draft, recheckSnapshot, snapshot);
+    expect(minor.withheldFiles).toEqual([]);
+    expect(minor.recommendations.join(" ")).toMatch(/Owner edit needed/);
+  });
+
+  test("withholds like the first critique: critical recommendation-only findings, copy claims across the channel, and unattributed critical problems", () => {
+    const layout = applyRecheckFixes(report([{ assetId: "instagram_feed", severity: "critical", rule: "unreadable_text" }], [], recheckBound), copyFixture(), recheckSnapshot, snapshot);
+    expect(layout.withheldFiles).toEqual(["instagram_feed.png"]);
+    // A claim lives in the channel copy: the unchanged portrait ad of the same channel is withheld too.
+    const claim = applyRecheckFixes(report([{ assetId: "facebook_ads", severity: "critical", rule: "claim_not_supported" }], [], recheckBound), copyFixture(), recheckSnapshot, snapshot);
+    expect(claim.withheldFiles).toEqual(["facebook_ads.png", "facebook_ads_portrait.png"]);
+    const person = applyRecheckFixes(report([{ assetId: "facebook_ads", severity: "major", rule: "person_without_consent" }], [], recheckBound), copyFixture(), recheckSnapshot, snapshot);
+    expect(person.contentWithheldFiles).toEqual(["facebook_ads.png"]);
+    const unattributed = applyRecheckFixes(report([], [{ severity: "critical", rule: "person_without_consent" }], recheckBound), copyFixture(), recheckSnapshot, snapshot);
+    expect(unattributed.withholdAll).toBe(true);
+    const clean = applyRecheckFixes(report([], [], recheckBound), copyFixture(), recheckSnapshot, snapshot);
+    expect(clean).toMatchObject({ withheldFiles: [], contentWithheldFiles: [], withholdAll: false, fixesApplied: [] });
+  });
+
+  test("the public verdict is the worse of both critiques and verification findings are marked", () => {
+    const first = report([]);
+    const second = report([{ assetId: "instagram_feed", severity: "critical", rule: "unreadable_text" }], [], recheckBound);
+    expect(combinedVerdict(first, null)).toBe("no_blocking_findings");
+    expect(combinedVerdict(first, second)).toBe("blocking_findings");
+    expect(combinedVerdict(null, null)).toBe("not_run");
+    const panel = publicCritic(first, { fixesApplied: [], withheldFiles: ["instagram_feed.png"] }, second);
+    expect(panel.verdict).toBe("blocking_findings");
+    expect(panel.findings.map((finding) => finding.id)).toEqual(["r2-f1"]);
   });
 });

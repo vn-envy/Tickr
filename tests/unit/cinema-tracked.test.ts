@@ -12,7 +12,7 @@ import {
   renderSamOverlayVideo, SAM_OVERLAY_LABEL, SAM_OVERLAY_PALETTE, samOverlayDisclosure, samOverlaySize, samOverlayTextColor,
 } from "../../lib/campaign/cinema/overlay";
 import {
-  backedContrast, backingOpacity, CALLOUT_SAFE, MAX_FOOTAGE_UPSCALE, MIN_DISPLAY_CONTRAST, MIN_TEXT_CONTRAST, planTrackedReel, prepareTrackedReel, renderTrackedReel, renderTrackedReelFrame, smoothTrack, TRACKED_COVER_FRAME, TRACKED_LABEL_BANDS, TRACKED_REEL_FRAMES,
+  backedContrast, backingOpacity, CALLOUT_SAFE, HEADLINE_MEASURE_TOLERANCE, MAX_FOOTAGE_UPSCALE, MIN_DISPLAY_CONTRAST, MIN_TEXT_CONTRAST, planTrackedReel, prepareTrackedReel, renderTrackedReel, renderTrackedReelFrame, smoothTrack, TRACKED_COVER_FRAME, TRACKED_LABEL_BANDS, TRACKED_REEL_FRAMES,
   TrackedCinemaError, trackedMaskSigma, type TrackedCrop, type TrackedReelInput,
 } from "../../lib/campaign/cinema/tracked";
 import type { ClipFrame, FrameMask, MaskletReader, MaskletSet, NormalizedClip, OwnerMediaConsent } from "../../lib/media/cinema-types";
@@ -20,7 +20,8 @@ import {
   normalizeOwnerClip, normalizeOwnerRenderClip, OwnerClipError, readClipFrames, readRenderClipFrames, renderClipMatches, renderClipSize, verifyRenderClip, type OwnerRenderClip,
 } from "../../lib/media/clip";
 import { createMaskletWriter } from "../../lib/media/masklets";
-import { MAX_FOREGROUND_OCCLUSION, MAX_HEADLINE_OCCLUSION } from "../../lib/campaign/cinema/still-depth";
+import { MAX_FOREGROUND_OCCLUSION, MAX_HEADLINE_LINE_OCCLUSION, MAX_HEADLINE_OCCLUSION } from "../../lib/campaign/cinema/still-depth";
+import type { TrackedReelComposer } from "../../lib/campaign/cinema/tracked";
 
 // SYNTHETIC fixtures only: an FFmpeg lavfi testsrc2 pattern with a drawn red disk, masks computed
 // from the same disk geometry, invented labels and copy. No real business media, no network.
@@ -52,8 +53,8 @@ function diskMask(objectId: string, frame: number): FrameMask {
 }
 
 /** A synthetic testsrc2 clip with a red disk whose centre x is `xExpr` (an FFmpeg expression in T). */
-async function syntheticDiskClip(name: string, width: number, height: number, seconds: number, xExpr: string, y: number, radius: number): Promise<NormalizedClip> {
-  const raw = join(root, `${name}.mp4`), inside = `lt(hypot(X-(${xExpr}),Y-${y}),${radius})`;
+async function syntheticDiskClip(name: string, width: number, height: number, seconds: number, xExpr: string, y: number | string, radius: number): Promise<NormalizedClip> {
+  const raw = join(root, `${name}.mp4`), inside = `lt(hypot(X-(${xExpr}),Y-(${y})),${radius})`;
   await run("ffmpeg", [
     "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-f", "lavfi", "-i", `testsrc2=size=${width}x${height}:rate=30:duration=${seconds}`,
     "-vf", `format=gbrp,geq=r='if(${inside},235,r(X,Y))':g='if(${inside},60,g(X,Y))':b='if(${inside},40,b(X,Y))',format=yuv420p`,
@@ -113,6 +114,29 @@ function input(extra: Partial<TrackedReelInput> = {}): TrackedReelInput {
 async function decodeFrame(frame: number): Promise<ClipFrame> {
   for await (const decoded of readClipFrames(clip, { fromFrame: frame, toFrame: frame })) return decoded;
   throw new Error("frame missing");
+}
+
+/** Per-frame caps from the live round-2 finding: the subject may hide ≤ 25% of a depth headline and ≤ 20% of any line in any frame. */
+const FRAME_HEADLINE_CAP = 0.25, FRAME_LINE_CAP = 0.2;
+test("the shared depth-headline caps are per-frame caps at the live round-2 limits", () => {
+  expect(MAX_HEADLINE_OCCLUSION).toBeLessThanOrEqual(FRAME_HEADLINE_CAP);
+  expect(MAX_HEADLINE_LINE_OCCLUSION).toBeLessThanOrEqual(FRAME_LINE_CAP);
+});
+
+/** Draws every hook and value frame and returns the rendered depth-headline occlusion per frame. */
+async function headlineFrames(composer: TrackedReelComposer, source: NormalizedClip, masks: MaskletReader) {
+  const out: { index: number; act: string; whole: number; line: number | null | undefined }[] = [];
+  const frames: ClipFrame[] = [];
+  for await (const decoded of readClipFrames(source, { fromFrame: 0, toFrame: composer.plan.footageFrames - 1 })) frames.push(decoded);
+  for (const act of ["hook", "value"] as const) {
+    const [start, end] = composer.plan.acts[act];
+    for (let index = start; index < end; index++) {
+      const frame = composer.plan.frames[index];
+      const { stats } = composer.draw(index, frames[frame.sourceFrame!], await masks.frameMask("1", frame.sourceFrame!));
+      if (stats.headlineOcclusion !== null) out.push({ index, act, whole: stats.headlineOcclusion, line: stats.headlineLineOcclusion });
+    }
+  }
+  return out;
 }
 
 /** Independent bilinear reference of the reframed source (edge-clamped, pixel centres at +0.5). */
@@ -709,6 +733,10 @@ describe("tracked Reel edge quality and text legibility", () => {
       const report = composer.layout.hookHeadline;
       if (report.placement === "behind_subject") {
         expect(report.occlusion).toBeLessThanOrEqual(MAX_HEADLINE_OCCLUSION);
+        // Regression (live round 2): the act mean passed while single frames hid whole words.
+        expect(report.maxFrameOcclusion).toBeLessThanOrEqual(FRAME_HEADLINE_CAP);
+        expect(report.maxFrameLineOcclusion).toBeLessThanOrEqual(FRAME_LINE_CAP);
+        expect(Math.max(...measured)).toBeLessThanOrEqual(FRAME_HEADLINE_CAP + HEADLINE_MEASURE_TOLERANCE);
         expect(measured.length).toBeGreaterThan(10);
         const mean = measured.reduce((sum, value) => sum + value, 0) / measured.length;
         expect(mean).toBeLessThanOrEqual(MAX_HEADLINE_OCCLUSION + 0.05);
@@ -720,12 +748,30 @@ describe("tracked Reel edge quality and text legibility", () => {
       }
     }, 180_000);
 
+    test("every visible frame of the swept hook and value keeps each headline line readable", async () => {
+      const composer = await prepareTrackedReel(vinput());
+      const measured = await headlineFrames(composer, vclip, vreader);
+      for (const report of [composer.layout.hookHeadline, composer.layout.valueHeadline]) {
+        if (report.placement === "behind_subject") expect(report.framesChecked).toBeGreaterThan(0);
+        expect(report.maxFrameOcclusion).toBeLessThanOrEqual(FRAME_HEADLINE_CAP);
+        expect(report.maxFrameLineOcclusion).toBeLessThanOrEqual(FRAME_LINE_CAP);
+      }
+      for (const frame of measured) {
+        expect(frame.whole, `${frame.act} frame ${frame.index}`).toBeLessThanOrEqual(FRAME_HEADLINE_CAP + HEADLINE_MEASURE_TOLERANCE);
+        expect(frame.line, `${frame.act} frame ${frame.index}`).toBeLessThanOrEqual(FRAME_LINE_CAP + HEADLINE_MEASURE_TOLERANCE);
+      }
+    }, 180_000);
+
     test("text backings sit beneath the subject: the swept Reel renders without foreground_occlusion", async () => {
       // Regression: front-text backings drawn over the subject hid >10% of it in the CTA act (frame 137)
       // and the produced Reel was withheld. Backings are drawn beneath the subject; only glyphs are in front.
       const result = await renderTrackedReel(vinput({ outputPath: join(root, "out", "sweep.mp4"), coverPath: join(root, "out", "sweep.png") }));
       expect(result.qa.violations).not.toContain("foreground_occlusion");
       expect(result.ledger.maxSubjectOcclusion).toBeLessThanOrEqual(MAX_FOREGROUND_OCCLUSION / 2);
+      // The rendered per-frame headline occlusion is recorded and stays within the per-frame caps.
+      expect(result.qa.violations).not.toContain("headline_hidden");
+      expect(result.qa.headlineOcclusion.max).toBeLessThanOrEqual(FRAME_HEADLINE_CAP + HEADLINE_MEASURE_TOLERANCE);
+      expect(result.qa.headlineOcclusion.lineMax).toBeLessThanOrEqual(FRAME_LINE_CAP + HEADLINE_MEASURE_TOLERANCE);
       expect(result.layout.textContrast.backingLayer).toBe("beneath_subject");
       // Over the subject the front glyphs have no backing; how much of their area that is gets reported.
       expect(result.qa.frontTextOverSubject.max).toBeGreaterThanOrEqual(0);
@@ -775,6 +821,57 @@ describe("tracked Reel edge quality and text legibility", () => {
       const brightBackdrop = backdrop[Math.floor(backdrop.length * 0.95)];
       const textLum = lum(Buffer.from([...light, 255]), 0);
       expect((textLum + 0.05) / (brightBackdrop + 0.05)).toBeGreaterThanOrEqual(MIN_TEXT_CONTRAST);
+    }, 180_000);
+  });
+
+  // Regression (live round 2): the headline band was chosen on the act-mean subject cover, so a subject
+  // that rose through the headline for a few frames mid-act (low mean) hid whole words in those frames.
+  describe("a subject crossing the headline zone mid-act", () => {
+    const CW = 640, CH = 360, CR = 52, CX = 320, LOW = 290, HIGH = 110;
+    /** Low in the frame, rising into the headline zone for frames 10–19 (hook) and 70–79 (value). */
+    const crossY = (frame: number) => (frame >= 10 && frame < 20) || (frame >= 70 && frame < 80) ? HIGH : LOW;
+    let cclip: NormalizedClip, creader: MaskletReader;
+    const copy = [
+      { kicker: "Synthetic hook", headline: "Slow mornings, warm cups", body: "Synthetic fixture copy for the hook act." },
+      scenes[1],
+      { kicker: "Synthetic value", headline: "Your weekday pause", body: "Synthetic fixture copy for the value act." },
+      scenes[3],
+    ];
+    const cinput = (extra: Partial<TrackedReelInput> = {}) => input({ clip: cclip, reader: creader, scenes: copy, ...extra });
+
+    beforeAll(async () => {
+      const yExpr = `if(between(N,10,19)+between(N,70,79),${HIGH},${LOW})`;
+      cclip = await syntheticDiskClip("synthetic-crossing", CW, CH, 3, String(CX), yExpr, CR);
+      const writer = await createMaskletWriter(join(root, "crossing-masklets"), { sha256: cclip.sha256, width: cclip.width, height: cclip.height, fps: cclip.fps, frameCount: cclip.frameCount });
+      for (let frame = 0; frame < cclip.frameCount; frame++) await writer.add(circleMask("1", frame, CX, crossY(frame), CR, CW, CH, 0.9));
+      creader = await writer.commit({
+        identity: () => ({ label: "Synthetic red disk", origin: "owner_tap" }),
+        set: { responseId: "resp_synthetic_crossing", promptKind: "geometry", propagation: "both", framesBilled: cclip.frameCount, elapsedMs: 1, createdAt: new Date(0).toISOString() },
+        binding: { inputHash: "f".repeat(64), usage: { frames_processed: cclip.frameCount }, unmatchedPromptIds: [] },
+      });
+    }, 180_000);
+
+    test("no single frame hides more than the per-frame caps of the hook or value headline", async () => {
+      const composer = await prepareTrackedReel(cinput());
+      expect(composer.plan.acts.hook).toEqual([0, 30]);
+      expect(composer.plan.acts.value).toEqual([60, 90]);
+      const measured = await headlineFrames(composer, cclip, creader);
+      const { hookHeadline, valueHeadline } = composer.layout;
+      for (const report of [hookHeadline, valueHeadline]) {
+        expect(report.maxFrameOcclusion).toBeLessThanOrEqual(FRAME_HEADLINE_CAP);
+        expect(report.maxFrameLineOcclusion).toBeLessThanOrEqual(FRAME_LINE_CAP);
+        if (report.placement === "behind_subject") {
+          expect(report.framesChecked).toBeGreaterThan(10);
+          expect(report.occlusion).toBeLessThanOrEqual(report.maxFrameOcclusion);
+        } else expect(report.occlusion).toBe(0);
+      }
+      // The headlines are behind the subject on frames it crosses, so those frames are measured too.
+      const crossing = measured.filter((frame) => (frame.index >= 12 && frame.index < 20) || (frame.index >= 72 && frame.index < 80));
+      if (hookHeadline.placement === "behind_subject" && valueHeadline.placement === "behind_subject") expect(crossing.length).toBeGreaterThan(8);
+      for (const frame of measured) {
+        expect(frame.whole, `${frame.act} frame ${frame.index}`).toBeLessThanOrEqual(FRAME_HEADLINE_CAP + HEADLINE_MEASURE_TOLERANCE);
+        expect(frame.line, `${frame.act} frame ${frame.index}`).toBeLessThanOrEqual(FRAME_LINE_CAP + HEADLINE_MEASURE_TOLERANCE);
+      }
     }, 180_000);
   });
 

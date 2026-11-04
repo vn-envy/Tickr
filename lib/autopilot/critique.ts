@@ -30,14 +30,21 @@ export interface CritiqueSnapshot {
  * Private copies of exactly the bytes sent for critique, so a resumed run binds to the same
  * request even after the kit is re-rendered. Reused only when every copy still verifies.
  */
-export async function critiqueSnapshot(kit: CampaignKit, outputDir: string, directory: string, binding: string): Promise<CritiqueSnapshot> {
-  const saved = await readCheckpoint<CritiqueSnapshot>(directory, "critique-input", binding);
+export async function critiqueSnapshot(kit: CampaignKit, outputDir: string, directory: string, binding: string, options: {
+  /** Checkpoint and private folder name ("critique-input" for the first critique). */
+  name?: string;
+  /** Only these kit files (the verification critique of files changed after the first one). */
+  only?: readonly string[];
+} = {}): Promise<CritiqueSnapshot> {
+  const name = options.name ?? "critique-input";
+  const only = options.only ? new Set(options.only) : null;
+  const saved = await readCheckpoint<CritiqueSnapshot>(directory, name, binding);
   if (saved && await snapshotIntact(saved)) return saved;
-  const target = join(directory, "critique-input");
+  const target = join(directory, name);
   await mkdir(target, { recursive: true, mode: 0o700 });
   const notes: string[] = [];
   const stills: CritiqueSnapshot["stills"] = [];
-  for (const asset of kit.assets.filter((item) => item.mediaType === "image" && item.channel !== null && item.filename.endsWith(".png")).slice(0, CRITIC_MAX_ASSETS)) {
+  for (const asset of kit.assets.filter((item) => item.mediaType === "image" && item.channel !== null && item.filename.endsWith(".png") && (!only || only.has(item.filename))).slice(0, CRITIC_MAX_ASSETS)) {
     if (!ID.test(asset.id) || asset.id === CRITIC_REEL_ASSET_ID || !asset.width || !asset.height) continue;
     const path = join(target, asset.filename);
     await copyFile(join(outputDir, asset.filename), path);
@@ -46,7 +53,7 @@ export async function critiqueSnapshot(kit: CampaignKit, outputDir: string, dire
     stills.push({ assetId: asset.id, filename: asset.filename, channel: asset.channel, sha256: asset.sha256, width: asset.width, height: asset.height, path });
   }
   let reel: CritiqueSnapshot["reel"] = null;
-  const video = kit.assets.find((item) => item.filename === "instagram_reel.mp4");
+  const video = kit.assets.find((item) => item.filename === "instagram_reel.mp4" && (!only || only.has(item.filename)));
   if (video && video.bytes <= CRITIC_MAX_REEL_BYTES) {
     const path = join(target, video.filename);
     await copyFile(join(outputDir, video.filename), path);
@@ -55,7 +62,7 @@ export async function critiqueSnapshot(kit: CampaignKit, outputDir: string, dire
     reel = { filename: video.filename, sha256: video.sha256, path, durationSeconds: probe.durationSeconds, width: probe.width, height: probe.height };
   } else if (video) notes.push("The Reel is larger than the critic's 16 MiB limit, so only its cover was critiqued; review the Reel itself before use.");
   const snapshot: CritiqueSnapshot = { version: 1, stills, reel, notes };
-  await writeCheckpoint(directory, "critique-input", binding, snapshot);
+  await writeCheckpoint(directory, name, binding, snapshot);
   return snapshot;
 }
 
@@ -72,15 +79,19 @@ export function criticChannels(copy: CampaignCopy): CriticCampaignChannel[] {
 
 export interface CritiqueOutcome { report: CritiqueReport | null; usage: ModelUsage | null; notes: string[] }
 
-/** One paid critique when the budget allows; an exhausted budget or a failed request leaves it "not_run". */
+/**
+ * One paid critique when the budget allows; an exhausted budget or a failed request leaves it "not_run".
+ * Round 2 is the single verification critique of the files the round-1 fixes changed (never repeated).
+ */
 export async function runCritique(input: {
   directory: string; snapshot: CritiqueSnapshot; copy: CampaignCopy; report: ResearchReport; opportunity: ResearchOpportunity;
-  business: { name: string; vertical: string }; goal: string; gate: PaidGate; critique: typeof critiqueCampaign;
+  business: { name: string; vertical: string }; goal: string; gate: PaidGate; critique: typeof critiqueCampaign; round?: 1 | 2;
 }): Promise<CritiqueOutcome> {
-  if (!input.snapshot.stills.length) return { report: null, usage: null, notes: ["No rendered stills were available to critique."] };
-  const directory = join(input.directory, "spark-critic", "round-1");
+  const round = input.round ?? 1;
+  if (!input.snapshot.stills.length) return { report: null, usage: null, notes: [round === 1 ? "No rendered stills were available to critique." : "None of the files changed after the critique could be sent for a verification critique; review them carefully."] };
+  const directory = join(input.directory, "spark-critic", `round-${round}`);
   const gate = await input.gate("spark_critic", directory, "spark-critic");
-  if (gate === "exhausted") return { report: null, usage: null, notes: ["The critic budget for this run was used up, so the kit was not self-critiqued; review every file carefully."] };
+  if (gate === "exhausted") return { report: null, usage: null, notes: [round === 1 ? "The critic budget for this run was used up, so the kit was not self-critiqued; review every file carefully." : "The critic budget for this run was used up, so the files changed after the critique were not re-critiqued; review those new versions closely."] };
   const evidenceIds = new Set([...input.opportunity.evidenceIds, ...input.copy.evidenceIds]);
   const supportedClaims = input.report.evidence.filter((item) => evidenceIds.has(item.id) && ID.test(item.id)).slice(0, 40).map((item) => ({ evidenceId: item.id, claim: bounded(item.claim, 500) || item.id }));
   const seasonal = input.copy.creativeBrief?.context?.seasonalTheme.status;
@@ -103,7 +114,7 @@ export async function runCritique(input: {
     return { report, usage: { model: report.responseModel ?? report.model, inputTokens: report.usage.inputTokens, outputTokens: report.usage.outputTokens, elapsedMs: Math.max(0, Math.round(report.elapsedMs)) }, notes: [] };
   } catch (error) {
     if (!(error instanceof MetaClientError)) throw error;
-    return { report: null, usage: null, notes: ["The self-critique request did not complete and was not repeated; review every file carefully."] };
+    return { report: null, usage: null, notes: [round === 1 ? "The self-critique request did not complete and was not repeated; review every file carefully." : "The verification critique of the changed files did not complete and was not repeated; review those new versions closely."] };
   }
 }
 
@@ -128,6 +139,14 @@ export interface AppliedFixes {
   /** Critiqued files whose bytes an APPLIED fix re-renders (never recommendation-only remedies). */
   rerenderedFiles: string[];
   recommendations: string[];
+}
+
+/** Kit files a critiqued asset id stands for (the Reel and its cover travel together). */
+function snapshotFilesOf(snapshot: CritiqueSnapshot, assetId: string): string[] {
+  if (assetId === CRITIC_REEL_ASSET_ID) return [...REEL_FILES];
+  const still = snapshot.stills.find((item) => item.assetId === assetId);
+  if (!still) return [];
+  return still.filename === "instagram_reel_cover.png" ? [...REEL_FILES] : [still.filename];
 }
 
 const describeRemedy = (remedy: FixRemedy): string | null => {
@@ -163,12 +182,7 @@ export function applyDeterministicFixes(report: CritiqueReport | null, copy: Cam
   let reelCopyChanged = false, copyChanged = false;
   const withheld = new Set<string>(), contentWithheld = new Set<string>(), rerendered = new Set<string>();
   const critical = new Set(report.findings.filter((finding) => finding.severity === "critical").map((finding) => finding.id));
-  const filesOf = (assetId: string): string[] => {
-    if (assetId === CRITIC_REEL_ASSET_ID) return [...REEL_FILES];
-    const still = snapshot.stills.find((item) => item.assetId === assetId);
-    if (!still) return [];
-    return still.filename === "instagram_reel_cover.png" ? [...REEL_FILES] : [still.filename];
-  };
+  const filesOf = (assetId: string) => snapshotFilesOf(snapshot, assetId);
   const channelOf = (assetId: string) => assetId === CRITIC_REEL_ASSET_ID ? "instagram_reels" : snapshot.stills.find((item) => item.assetId === assetId)?.channel ?? null;
   const withhold = (assetId: string, reasons: readonly string[]) => {
     const files = filesOf(assetId);
@@ -216,6 +230,54 @@ export function applyDeterministicFixes(report: CritiqueReport | null, copy: Cam
   };
 }
 
+export interface RecheckFixes {
+  withheldFiles: string[];
+  contentWithheldFiles: string[];
+  /** Fail closed exactly like the first critique: an unattributable critical finding withholds the kit. */
+  withholdAll: boolean;
+  fixesApplied: string[];
+  recommendations: string[];
+}
+
+/**
+ * Outcomes of the single verification critique over the files the first fixes changed. Only
+ * withholding and owner-review outcomes apply: nothing is rewritten or re-rendered again, so the
+ * critique never loops. A rewrite it would ask for stays an owner edit, and withholds the files
+ * when its finding is critical (an unresolved critical finding is never left approvable).
+ */
+export function applyRecheckFixes(report: CritiqueReport, copy: CampaignCopy, snapshot: CritiqueSnapshot, critiqued: CritiqueSnapshot | null = null): RecheckFixes {
+  const applied = applyDeterministicFixes(report, copy, snapshot);
+  const withheld = new Set(applied.withheldFiles), contentWithheld = new Set(applied.contentWithheldFiles);
+  const fixesApplied = applied.fixesApplied.filter((fix) => fix.startsWith("Withheld"));
+  const recommendations = [...applied.recommendations];
+  const critical = new Set(report.findings.filter((finding) => finding.severity === "critical").map((finding) => finding.id));
+  for (const remedy of applied.plan?.remedies ?? []) {
+    if (remedy.kind === "withhold_asset" && critiqued && remedy.reasons.some((reason) => COPY_REASONS.has(reason))) {
+      // A claim or offer lives in the channel copy: every critiqued file of that channel shares it,
+      // including files the verification critique did not see again.
+      const channel = remedy.assetId === CRITIC_REEL_ASSET_ID ? "instagram_reels" : snapshot.stills.find((item) => item.assetId === remedy.assetId)?.channel ?? null;
+      if (channel) for (const item of critiqued.stills) if (item.channel === channel) snapshotFilesOf(critiqued, item.assetId).forEach((file) => withheld.add(file));
+    }
+    if (remedy.kind !== "strip_review_language") continue;
+    recommendations.push(bounded(`Owner edit needed: the verification critique still found internal review wording (${remedy.removedPhrases.slice(0, 3).map((phrase) => `“${bounded(phrase, 40)}”`).join(", ")}) in the ${remedy.channelId} ${remedy.field}; it was not rewritten again.`, 600));
+    if (!remedy.findingIds.some((id) => critical.has(id))) continue;
+    const files = remedy.assetIds.flatMap((assetId) => snapshotFilesOf(snapshot, assetId));
+    files.forEach((file) => withheld.add(file));
+    if (files.length) fixesApplied.push(bounded(`Withheld ${files.slice(0, 4).join(", ")} from the ready kit (unresolved critical finding in the verification critique: internal review wording).`, 300));
+  }
+  return {
+    withheldFiles: [...withheld].sort(), contentWithheldFiles: [...contentWithheld].sort(), withholdAll: applied.withholdAll,
+    fixesApplied: fixesApplied.map((fix) => bounded(`Verification critique: ${fix}`, 300)), recommendations: [...new Set(recommendations)],
+  };
+}
+
+/** The worse of two critic verdicts ("not_run" only when neither ran). */
+export function combinedVerdict(...reports: Array<CritiqueReport | null>): NonNullable<AutopilotPublicState["critic"]>["verdict"] {
+  const ran = reports.filter((report): report is CritiqueReport => Boolean(report));
+  if (!ran.length) return "not_run";
+  return ran.some((report) => report.verdict === "blocking_findings") ? "blocking_findings" : "no_blocking_findings";
+}
+
 export const SAM_OVERLAY_FILE = "sam-tracking-overlay.mp4";
 export const ARCHIVE_FILE = "campaign-concept.zip";
 
@@ -240,12 +302,13 @@ export function withheldKitFiles(input: { files: readonly string[]; withheld: It
   return [...result].sort();
 }
 
-/** The director's-room critic panel. */
-export function publicCritic(report: CritiqueReport | null, fixes: Pick<AppliedFixes, "fixesApplied" | "withheldFiles">): NonNullable<AutopilotPublicState["critic"]> {
+/** The director's-room critic panel; verification-critique findings follow with an "r2-" id prefix. */
+export function publicCritic(report: CritiqueReport | null, fixes: Pick<AppliedFixes, "fixesApplied" | "withheldFiles">, recheck: CritiqueReport | null = null): NonNullable<AutopilotPublicState["critic"]> {
+  const findings = [...(report?.findings ?? []).map((finding) => ({ finding, id: finding.id })), ...(recheck?.findings ?? []).map((finding) => ({ finding, id: `r2-${finding.id}` }))];
   return {
-    verdict: report?.verdict ?? "not_run",
-    findings: (report?.findings ?? []).slice(0, 60).map((finding) => ({
-      id: bounded(finding.id, 20), assetId: bounded(finding.assetId, 80), severity: finding.severity, rule: finding.rule, description: bounded(finding.description, 400),
+    verdict: combinedVerdict(report, recheck),
+    findings: findings.slice(0, 60).map(({ finding, id }) => ({
+      id: bounded(id, 20), assetId: bounded(finding.assetId, 80), severity: finding.severity, rule: finding.rule, description: bounded(finding.description, 400),
       box: finding.box ? { ...finding.box } : null, timeSeconds: finding.timeSeconds,
     })),
     fixesApplied: fixes.fixesApplied.slice(0, 40).map((fix) => bounded(fix, 300)), withheld: fixes.withheldFiles.slice(0, 80),

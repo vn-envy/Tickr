@@ -43,6 +43,24 @@ export function createPinnedLookup(resolver: PublicResolver = resolveIPv4): Look
   };
 }
 
+/** Environment flag enabling hostname CONNECT through a configured proxy. Off unless exactly "1". */
+export const PROXY_CONNECT_BY_HOSTNAME_ENV = "TICKR_PROXY_CONNECT_BY_HOSTNAME";
+
+/**
+ * The CONNECT authority for a proxied tunnel, chosen only after local DNS
+ * validation has passed. Default: the validated public IP. Opt-in: the
+ * original hostname (never an IP literal, never userinfo, always port 443).
+ */
+export function proxyConnectAuthority(url: URL, pinned: { address: string }, environment: Record<string, string | undefined>): string {
+  if (!isPublicIPv4(pinned.address)) throw new PinnedHttpsError("DESTINATION_NOT_PUBLIC", "The website did not resolve exclusively to public IPv4 addresses.");
+  if (environment[PROXY_CONNECT_BY_HOSTNAME_ENV] !== "1") return `${pinned.address}:443`;
+  const hostname = url.hostname;
+  if (url.protocol !== "https:" || url.username || url.password || (url.port && url.port !== "443") || !hostname || isIP(hostname.replace(/^\[|\]$/g, "")) || !/^[a-z0-9.-]+$/.test(hostname)) {
+    throw new PinnedHttpsError("URL_NOT_ALLOWED", "The transport requires a public hostname HTTPS URL without credentials.");
+  }
+  return `${hostname}:443`;
+}
+
 export interface PinnedHttpsResponse { status: number; headers: Record<string, string | undefined>; body: Buffer }
 export interface PinnedHttpsDependencies {
   resolver?: PublicResolver;
@@ -54,8 +72,18 @@ export interface PinnedHttpsDependencies {
 
 /**
  * One credential-free origin GET. A trusted environment proxy receives only an
- * IP:443 CONNECT; original-hostname TLS verification remains inside the tunnel.
- * No hostname CONNECT, automatic redirects, alternate addresses or retries.
+ * IP:443 CONNECT by default; original-hostname TLS verification remains inside
+ * the tunnel. No automatic redirects, alternate addresses or retries, and no
+ * fallback from one CONNECT form to another.
+ *
+ * Explicit opt-in (`TICKR_PROXY_CONNECT_BY_HOSTNAME=1`, exactly "1"), honoured
+ * only when an environment proxy is configured: for egress proxies that refuse
+ * IP-literal tunnels, CONNECT names `hostname:443` instead. Every local check
+ * still runs first (all answers public IPv4, no userinfo, port 443 only), TLS is
+ * still verified against the original hostname and limits are unchanged. The
+ * proxy then performs its own resolution, so local DNS validation is advisory
+ * against rebinding at the proxy (documented in docs/ARCHITECTURE.md). Direct
+ * (no-proxy) connections always keep strict IP pinning.
  */
 export function pinnedHttpsRequest(url: URL, options: { signal: AbortSignal; maxBytes: number; accept: string }, dependencies: PinnedHttpsDependencies = {}): Promise<PinnedHttpsResponse> {
   return new Promise((resolve, reject) => {
@@ -129,7 +157,7 @@ export function pinnedHttpsRequest(url: URL, options: { signal: AbortSignal; max
       } catch { throw new PinnedHttpsError("PROXY_CONFIGURATION_INVALID", "The configured official-read proxy is invalid."); }
       const proxyAgent = proxy.protocol === "https:" ? new HttpsAgent({ keepAlive: false, maxSockets: 1, rejectUnauthorized: true }) : new HttpAgent({ keepAlive: false, maxSockets: 1 });
       resources.add(proxyAgent);
-      const authority = `${pinned.address}:443`;
+      const authority = proxyConnectAuthority(url, pinned, environment);
       const headers: Record<string, string> = { Host: authority };
       try {
         if (proxy.username || proxy.password) headers["Proxy-Authorization"] = `Basic ${Buffer.from(`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`).toString("base64")}`;
@@ -143,7 +171,7 @@ export function pinnedHttpsRequest(url: URL, options: { signal: AbortSignal; max
       connectRequest.once("connect", (response, socket, head: Buffer) => {
         resources.add(socket);
         if (settled) { socket.destroy(); return; }
-        if (response.statusCode !== 200 || head.length) { fail(new PinnedHttpsError("PROXY_CONNECT_REJECTED", "The configured proxy did not establish a clean public-IP tunnel. No alternate route was attempted.")); return; }
+        if (response.statusCode !== 200 || head.length) { fail(new PinnedHttpsError("PROXY_CONNECT_REJECTED", "The configured proxy did not establish a clean tunnel to the validated destination. No alternate route was attempted.")); return; }
         try {
           const secure = (dependencies.tlsConnect ?? tlsConnect)({ socket, servername: url.hostname, rejectUnauthorized: true, checkServerIdentity });
           resources.add(secure);

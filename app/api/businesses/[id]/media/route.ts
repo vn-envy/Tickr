@@ -2,6 +2,7 @@ import {
   addBusinessUpload, assertSameOriginWrite, businessMediaErrorResponse, getMetaConnectionView, libraryStateMessage, listBusinessUploads,
   parseUploadRequest, requireBusiness, type MetaConnectionView, type OwnerMediaSummary,
 } from "@/lib/autopilot/business-media";
+import { accessDenial } from "@/lib/access";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -14,7 +15,10 @@ const unavailableConnection: MetaConnectionView = { status: "disconnected", prov
  * independently: an unreadable upload library still returns the connection status (with a fixed
  * `mediaError` message and no assets), and a failed connection read never hides the uploads.
  */
-export async function GET(_request: Request, context: { params: Promise<{ id: string }> }) {
+export async function GET(request: Request, context: { params: Promise<{ id: string }> }) {
+  // proxy.ts excludes this path (so upload bodies are never buffered there); gate it here instead.
+  const denied = accessDenial(request);
+  if (denied) return denied;
   try {
     const { id } = await context.params;
     await requireBusiness(id);
@@ -35,6 +39,12 @@ export async function GET(_request: Request, context: { params: Promise<{ id: st
  * validated by magic bytes before it enters the business media library.
  */
 export async function POST(request: Request, context: { params: Promise<{ id: string }> }) {
+  // Before any body byte is read: proxy.ts does not cover this route (see the GET handler).
+  const denied = accessDenial(request);
+  if (denied) {
+    await request.body?.cancel().catch(() => undefined);
+    return denied;
+  }
   try {
     assertSameOriginWrite(request);
     const { id } = await context.params;

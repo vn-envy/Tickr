@@ -10,7 +10,7 @@ import { CinemaEncodeError, openH264Encoder } from "./encode";
 import { gaussianBlurZero } from "./fill";
 import { CompositionLedgerAccumulator, LedgerCanvas } from "./ledger";
 import { refineMaskField } from "./mask-refine";
-import { MAX_FOREGROUND_OCCLUSION, MAX_HEADLINE_LINE_OCCLUSION, MAX_HEADLINE_OCCLUSION, prepareStillDepth, STILL_DEPTH_LABEL_BANDS, type StillDepthComposer, type StillDepthLayoutReport, type StillDepthScene, type StillDepthTheme } from "./still-depth";
+import { HEADLINE_VISIBLE_OPACITY, MAX_FOREGROUND_OCCLUSION, MAX_HEADLINE_LINE_OCCLUSION, MAX_HEADLINE_OCCLUSION, prepareStillDepth, STILL_DEPTH_LABEL_BANDS, type StillDepthComposer, type StillDepthLayoutReport, type StillDepthScene, type StillDepthTheme } from "./still-depth";
 import { cleanText, pill, svgDocument, textBlock, type Bounds, type FontFace, type TextBlock } from "./typography";
 
 /**
@@ -71,8 +71,14 @@ const SUBJECT_VERTICAL_ANCHOR = 0.54;
 const SUBJECT_FIT_MARGIN = 1.3;
 const BACKGROUND_SIGMA = 3.2;
 const CALLOUT_HEIGHT = 68, CALLOUT_POINTER = 16, CALLOUT_GAP = 22;
-/** Hook headline: mean share of its glyphs covered by the real subject above this is a review flag. */
+/** Depth headlines: mean share of their glyphs covered by the real subject above this is a review flag. */
 export const MAX_TRACKED_HEADLINE_OCCLUSION = 0.5;
+/**
+ * Rendered depth-headline occlusion may exceed the planned per-frame caps (MAX_HEADLINE_OCCLUSION,
+ * MAX_HEADLINE_LINE_OCCLUSION) by at most this much (feathered mask edges, ledger-cell rounding)
+ * before the Reel is flagged headline_hidden.
+ */
+export const HEADLINE_MEASURE_TOLERANCE = 0.05;
 /** Contrast floor for kickers, body copy and labels over footage (WCAG AA normal text), even over white. */
 export const MIN_TEXT_CONTRAST = 4.5;
 /** Contrast floor for the large serif display headlines over footage (WCAG AA large text), even over white. */
@@ -163,7 +169,8 @@ export interface TrackedReelInput {
  * - subject_missing: more than 10% of frames show no subject outside deliberate transition washes.
  * - tracking_lost: some footage frames had no hero mask (shown treated, without pop-out).
  * - subject_cropped: more than 10% of frames crop the subject at the frame edge by over 5%.
- * - headline_hidden: the real subject covers most of the hook's depth headline on average.
+ * - headline_hidden: in some rendered frame the real subject covers more of a depth headline (or one of
+ *   its lines) than the per-frame caps allow, or most of it on average.
  * - end_card_fallback: the supplied still-depth end card could not be used; a freeze was rendered.
  * - low_resolution_footage: more than 10% of footage frames enlarge their source pixels by over MAX_FOOTAGE_UPSCALE.
  */
@@ -181,14 +188,24 @@ export interface TrackedFootageUpscale {
   framesOverLimit: number;
 }
 
-/** Where a depth headline was placed against the subject's motion over its whole act. */
+/**
+ * Where a depth headline was placed against the subject's motion. Behind the subject, every frame of
+ * the act where the headline is visible (opacity ≥ HEADLINE_VISIBLE_OPACITY, at its rise offset) keeps
+ * the covered share ≤ MAX_HEADLINE_OCCLUSION overall and ≤ MAX_HEADLINE_LINE_OCCLUSION per line.
+ */
 export interface TrackedHeadlinePlacement {
-  /** Behind the subject (depth typography) or, when no band keeps it readable, in front (on a backing that stays beneath the subject). */
+  /** Behind the subject (depth typography) or, when no band keeps it readable in every frame, in front (on a backing that stays beneath the subject). */
   placement: "behind_subject" | "in_front";
-  /** Planned mean share of the glyph area the tracked subject covers over the act (0 in front). */
+  /** Planned mean share of the glyph area the tracked subject covers over the visible frames (0 in front). */
   occlusion: number;
   /** Worst single line's planned mean share (0 in front). */
   lineOcclusion: number;
+  /** Planned worst single-frame share of the whole headline (0 in front). */
+  maxFrameOcclusion: number;
+  /** Planned worst single-frame share of any one line (0 in front). */
+  maxFrameLineOcclusion: number;
+  /** Act frames the placement was checked on (subject mask present, headline visible). */
+  framesChecked: number;
   /** Planned mean share of the subject hidden by the headline glyphs (0 behind; its backing sits beneath the subject). */
   foregroundOcclusion: number;
   fontSize: number;
@@ -235,8 +252,12 @@ export interface TrackedReelResult {
     framesSubjectHiddenByTransition: number;
     /** Footage frames whose hero mask was missing (tracking lost). */
     footageFramesWithoutMask: number;
-    /** Share of the hook depth headline's glyphs covered by the real subject (frames where it is fully shown). */
-    headlineOcclusion: { mean: number; max: number };
+    /**
+     * Share of the depth headlines' (hook and value, behind the subject) glyphs covered by the real
+     * subject, per rendered frame where a headline is visible (opacity ≥ HEADLINE_VISIBLE_OPACITY):
+     * mean and worst frame for the whole headline, and the worst single line in any frame.
+     */
+    headlineOcclusion: { mean: number; max: number; lineMax: number };
     /**
      * Share of the in-front text glyphs (body copy, proof stack, in-front headlines, CTA brand/body)
      * drawn over the real subject, where their backing is beneath the subject and only the glyph
@@ -586,25 +607,61 @@ function addMaskCoverage(map: Float32Array, mask: FrameMask, crop: TrackedCrop):
   }
 }
 
-/**
- * Share of a graphic's glyph area covered by `cover` with the graphic moved down by `dy` output
- * pixels, optionally only on output rows [rows[0], rows[1]) after the move (one text line).
- */
-function glyphCover(g: Graphic, cover: Float32Array, dy: number, rows?: readonly [number, number]): number {
-  const shift = Math.round(dy / LEDGER_FACTOR);
-  const x0 = Math.max(0, Math.floor(g.x / LEDGER_FACTOR)), x1 = Math.min(LW, Math.ceil((g.x + g.width) / LEDGER_FACTOR));
-  const y0 = Math.max(0, Math.floor(g.y / LEDGER_FACTOR)), y1 = Math.min(LH, Math.ceil((g.y + g.height) / LEDGER_FACTOR));
-  let total = 0, covered = 0;
-  for (let y = y0; y < y1; y++) {
-    const ty = y + shift, centre = ty * LEDGER_FACTOR + LEDGER_FACTOR / 2;
-    if (ty < 0 || ty >= LH || (rows && (centre < rows[0] || centre >= rows[1]))) continue;
-    for (let x = x0; x < x1; x++) {
+/** Opacity and rise offset of a layout item `actTime` s into an act `actLength` s long (shared by the layout checks and the compositor). */
+function itemMotion(item: HeadlineMotion, actTime: number, actLength: number): { opacity: number; dy: number } {
+  const scale = Math.min(1, actLength / 3);
+  const e = easeOut((actTime - item.start * scale) / (0.55 * Math.max(0.35, scale)));
+  return { opacity: e * (item.fadeOut ? clamp01((actLength - actTime) / 0.2) : 1), dy: Math.round((1 - e) * item.rise) };
+}
+interface HeadlineMotion { start: number; rise: number; fadeOut: boolean }
+/** Entrance of the hook and value depth headlines (also used to check their placement frame by frame). */
+const HOOK_HEADLINE_MOTION: HeadlineMotion = { start: 0.2, rise: 44, fadeOut: true };
+const VALUE_HEADLINE_MOTION: HeadlineMotion = { start: 0.16, rise: 44, fadeOut: true };
+
+/** The subject's ledger cells on one act frame where a depth headline is visible, and the headline's rise offset then. */
+interface FrameCover { index: number; cells: Int32Array; rowMin: number; rowMax: number; dy: number }
+/** Per-frame subject cover over an act (visible-headline frames) plus the act-mean cover map. */
+interface ActCoverage { frames: FrameCover[]; mean: Float32Array }
+
+/** A glyph graphic's alpha: whole and per text line (rows whose ledger-cell centre lies inside the line box). */
+interface GlyphProfile { total: number; lineTotals: number[]; rowLines: Uint8Array; rowTop: number; rowBottom: number }
+function glyphProfile(g: Graphic, lines: readonly (readonly [number, number])[]): GlyphProfile {
+  const rowLines = new Uint8Array(LH), lineTotals = lines.map(() => 0);
+  const rowTop = Math.max(0, Math.floor(g.y / LEDGER_FACTOR)), rowBottom = Math.min(LH, Math.ceil((g.y + g.height) / LEDGER_FACTOR));
+  let total = 0;
+  for (let y = rowTop; y < rowBottom; y++) {
+    const centre = y * LEDGER_FACTOR + LEDGER_FACTOR / 2;
+    lines.forEach(([top, bottom], index) => { if (centre >= top && centre < bottom) rowLines[y] |= 1 << index; });
+    for (let x = 0; x < LW; x++) {
       const a = g.reduced[y * LW + x];
-      if (a <= 0) continue;
-      total += a; covered += a * Math.min(1, cover[ty * LW + x]);
+      if (!(a > 0)) continue;
+      total += a;
+      for (let line = 0; line < lineTotals.length; line++) if (rowLines[y] & (1 << line)) lineTotals[line] += a;
     }
   }
-  return total > 0 ? covered / total : 0;
+  return { total, lineTotals, rowLines, rowTop, rowBottom };
+}
+
+/**
+ * Share of a glyph graphic, moved down by `shift` ledger rows, that the subject covers on one frame;
+ * each line's share is written to `lineShare`.
+ */
+function frameGlyphCover(g: Graphic, profile: GlyphProfile, frame: FrameCover, shift: number, lineShare: Float64Array): number {
+  lineShare.fill(0);
+  if (!(profile.total > 0) || frame.rowMax < profile.rowTop + shift || frame.rowMin >= profile.rowBottom + shift) return 0;
+  const offset = shift * LW;
+  let covered = 0;
+  for (const cell of frame.cells) {
+    const source = cell - offset;
+    if (source < 0 || source >= g.reduced.length) continue;
+    const a = g.reduced[source];
+    if (!(a > 0)) continue;
+    covered += a;
+    const lines = profile.rowLines[(source / LW) | 0];
+    if (lines) for (let line = 0; line < profile.lineTotals.length; line++) if (lines & (1 << line)) lineShare[line] += a;
+  }
+  for (let line = 0; line < profile.lineTotals.length; line++) lineShare[line] = profile.lineTotals[line] > 0 ? lineShare[line] / profile.lineTotals[line] : 0;
+  return covered / profile.total;
 }
 
 /** Share of the (mean) subject coverage hidden by the union of graphics moved down by `dy`. */
@@ -627,8 +684,9 @@ const shaded = (svg: string) => renderGraphic(svg ? `<g filter="url(#shade)">${s
 // Layout
 // ---------------------------------------------------------------------------
 
-type ItemRole = "hook_headline" | "front_text";
-interface ActItem { g: Graphic | null; layer: "behind" | "front"; start: number; rise: number; fadeOut: boolean; role?: ItemRole }
+type ItemRole = "depth_headline" | "front_text";
+/** `lines`: output rows [top, bottom) of each text line of a depth headline, before its rise offset. */
+interface ActItem { g: Graphic | null; layer: "behind" | "front"; start: number; rise: number; fadeOut: boolean; role?: ItemRole; lines?: readonly (readonly [number, number])[] }
 interface SubjectStats { top: number; bottom: number; cy: number }
 
 function subjectStats(plan: TrackedReelPlan, act: TrackedAct): SubjectStats | null {
@@ -701,28 +759,45 @@ async function prepareLayout(input: TrackedReelInput, plan: TrackedReelPlan, cal
   const backed = async (items: ActItem[], laid: readonly (TextBlock | null)[], alpha: number, item: Omit<ActItem, "g">, shade = true) => {
     const present = laid.filter((value): value is TextBlock => Boolean(value));
     if (!present.length) return;
-    items.push({ ...item, layer: "behind", role: undefined, g: await backing([unionBounds(present)], alpha) });
+    items.push({ ...item, layer: "behind", role: undefined, lines: undefined, g: await backing([unionBounds(present)], alpha) });
     const role = item.layer === "front" ? "front_text" : item.role;
     for (const value of present) items.push({ ...item, role, g: shade ? await shaded(value.svg) : await renderGraphic(value.svg) });
   };
 
-  // Depth headlines are placed against the subject's mask over the whole act (it moves), never one frame.
-  const coverage = async (act: TrackedAct) => {
+  // Depth headlines are placed against the subject's mask in every frame of the act where they are
+  // visible (it moves): an act mean would let a passing subject hide whole words in single frames.
+  const coverage = async (act: TrackedAct, motion: HeadlineMotion): Promise<ActCoverage> => {
     const [start, end] = plan.acts[act];
-    const map = new Float32Array(LW * LH);
-    let frames = 0;
-    for (let index = start; index < end; index += 2) {
+    const length = (end - start) / FPS;
+    const map = new Float32Array(LW * LH), mean = new Float32Array(LW * LH);
+    const frames: FrameCover[] = [];
+    let counted = 0;
+    for (let index = start; index < end; index++) {
       const frame = plan.frames[index];
       if (frame.kind !== "footage" || !frame.crop || frame.sourceFrame === null) continue;
       const mask = await input.reader.frameMask(input.heroObjectId, frame.sourceFrame);
       if (!mask) continue;
-      frames++;
+      counted++;
+      map.fill(0);
       addMaskCoverage(map, mask, frame.crop);
+      const cells: number[] = [];
+      let rowMin = LH, rowMax = -1;
+      for (let i = 0; i < map.length; i++) {
+        if (!(map[i] > 0)) continue;
+        mean[i] += map[i];
+        cells.push(i);
+        const row = (i / LW) | 0;
+        if (row < rowMin) rowMin = row;
+        if (row > rowMax) rowMax = row;
+      }
+      const { opacity, dy } = itemMotion(motion, frame.actTime, length);
+      if (opacity >= HEADLINE_VISIBLE_OPACITY) frames.push({ index, cells: Int32Array.from(cells), rowMin, rowMax, dy });
     }
-    if (frames) for (let i = 0; i < map.length; i++) map[i] /= frames;
-    return map;
+    if (counted) for (let i = 0; i < mean.length; i++) mean[i] /= counted;
+    return { frames, mean };
   };
-  const placeHeadline = async (name: string, text: string, cover: Float32Array, sizes: readonly number[], minTop: number, maxBottom: number) => {
+  const placeHeadline = async (name: string, text: string, cover: ActCoverage, sizes: readonly number[], minTop: number, maxBottom: number) => {
+    const round = (value: number) => Number(value.toFixed(4));
     for (const [index, size] of sizes.entries()) {
       const last = index === sizes.length - 1;
       const spec: TextSpec = { text, face: "serif", size, minSize: last ? Math.round(size * 0.85) : size, maxLines: 3, color: theme.light, lineHeight: 1.02 };
@@ -730,47 +805,63 @@ async function prepareLayout(input: TrackedReelInput, plan: TrackedReelPlan, cal
       if ((probe.truncated || probe.brokenWords) && !last) continue;
       const glyphs = await shaded(probe.svg);
       if (!glyphs) continue;
-      let best: { top: number; occlusion: number; line: number; score: number } | null = null;
-      for (let top = minTop; top + probe.bounds.bottom - minTop <= maxBottom; top += LEDGER_FACTOR * 6) {
-        const occlusion = glyphCover(glyphs, cover, top - minTop);
-        if (occlusion > MAX_HEADLINE_OCCLUSION) continue;
-        const line = Math.max(0, ...probe.boxes.map((box) => glyphCover(glyphs, cover, top - minTop, [box.y + top - minTop, box.y + box.height + top - minTop])));
-        if (line > MAX_HEADLINE_LINE_OCCLUSION) continue;
-        const score = Math.abs(occlusion - 0.16) + 0.25 * top / H;
-        if (!best || score < best.score) best = { top, occlusion, line, score };
+      const profile = glyphProfile(glyphs, probe.boxes.map((box) => [box.y, box.y + box.height] as const));
+      const lineShare = new Float64Array(profile.lineTotals.length);
+      let best: { top: number; mean: number; lineMean: number; worst: number; worstLine: number; score: number } | null = null;
+      band: for (let top = minTop; top + probe.bounds.bottom - minTop <= maxBottom; top += LEDGER_FACTOR * 6) {
+        let sum = 0, worst = 0, worstLine = 0;
+        const lineSums = new Float64Array(profile.lineTotals.length);
+        // Every visible frame, at that frame's rise offset, must keep the whole headline and each line readable.
+        for (const frame of cover.frames) {
+          const whole = frameGlyphCover(glyphs, profile, frame, Math.round((top - minTop + frame.dy) / LEDGER_FACTOR), lineShare);
+          const line = Math.max(0, ...lineShare);
+          if (whole > MAX_HEADLINE_OCCLUSION || line > MAX_HEADLINE_LINE_OCCLUSION) continue band;
+          sum += whole; worst = Math.max(worst, whole); worstLine = Math.max(worstLine, line);
+          lineShare.forEach((value, i) => { lineSums[i] += value; });
+        }
+        const count = Math.max(1, cover.frames.length);
+        // The band that hides the least in its worst frame; ties go to the higher band.
+        const score = Math.max(worst, worstLine) + 0.25 * top / H;
+        if (!best || score < best.score) best = { top, mean: sum / count, lineMean: Math.max(0, ...Array.from(lineSums, (value) => value / count)), worst, worstLine, score };
       }
       if (!best) continue;
       const laid = block(spec, SIDE - 4, best.top, textWidth);
       note(name, laid);
-      const report: TrackedHeadlinePlacement = { placement: "behind_subject", occlusion: Number(best.occlusion.toFixed(4)), lineOcclusion: Number(best.line.toFixed(4)), foregroundOcclusion: 0, fontSize: laid.size, top: best.top };
-      return { laid, report, layer: "behind" as const };
+      const report: TrackedHeadlinePlacement = {
+        placement: "behind_subject", occlusion: round(best.mean), lineOcclusion: round(best.lineMean), maxFrameOcclusion: round(best.worst), maxFrameLineOcclusion: round(best.worstLine),
+        framesChecked: cover.frames.length, foregroundOcclusion: 0, fontSize: laid.size, top: best.top,
+      };
+      return { laid, report, layer: "behind" as const, lines: laid.boxes.map((box) => [box.y, box.y + box.height] as const) };
     }
-    // No band keeps the moving subject off most of the headline: it goes in front (its backing stays
-    // beneath the subject), where its glyphs hide the subject least.
+    // No band keeps the moving subject off the headline in every frame: it goes in front (its backing
+    // stays beneath the subject), where its glyphs hide the subject least over the act.
     const spec: TextSpec = { text, face: "serif", size: 96, minSize: 72, maxLines: 3, color: theme.light, lineHeight: 1.04 };
     const probe = block(spec, SIDE - 4, minTop, textWidth);
     const glyphs = await shaded(probe.svg);
     let best = { top: minTop, hidden: Infinity };
     for (let top = minTop; top + probe.bounds.bottom - minTop <= maxBottom; top += LEDGER_FACTOR * 6) {
-      const hidden = subjectHidden(cover, [glyphs], top - minTop);
+      const hidden = subjectHidden(cover.mean, [glyphs], top - minTop);
       if (hidden < best.hidden - 1e-6) best = { top, hidden };
     }
     const laid = block(spec, SIDE - 4, best.top, textWidth);
     note(name, laid);
-    const report: TrackedHeadlinePlacement = { placement: "in_front", occlusion: 0, lineOcclusion: 0, foregroundOcclusion: Number((Number.isFinite(best.hidden) ? best.hidden : 0).toFixed(4)), fontSize: laid.size, top: best.top };
-    return { laid, report, layer: "front" as const };
+    const report: TrackedHeadlinePlacement = {
+      placement: "in_front", occlusion: 0, lineOcclusion: 0, maxFrameOcclusion: 0, maxFrameLineOcclusion: 0, framesChecked: cover.frames.length,
+      foregroundOcclusion: round(Number.isFinite(best.hidden) ? best.hidden : 0), fontSize: laid.size, top: best.top,
+    };
+    return { laid, report, layer: "front" as const, lines: undefined };
   };
   const acts: Record<TrackedAct, ActItem[]> = { hook: [], proof: [], value: [], cta: [] };
 
   // HOOK — kicker and giant headline behind the subject (placed against its motion over the act); body in front at the bottom.
   const hookBodySpec: TextSpec = { text: hookScene.body, face: "sans", size: 36, maxLines: 3, color: theme.light, lineHeight: 1.3 };
   const hookBodyTop = H - 150 - block(hookBodySpec, 0, 0, textWidth).bounds.bottom;
-  const hookPlaced = await placeHeadline("hook.headline", hookScene.headline, await coverage("hook"), HOOK_HEADLINE_SIZES, 176, Math.min(H - 300, hookScene.body.trim() ? hookBodyTop - 40 : H - 300));
+  const hookPlaced = await placeHeadline("hook.headline", hookScene.headline, await coverage("hook", HOOK_HEADLINE_MOTION), HOOK_HEADLINE_SIZES, 176, Math.min(H - 300, hookScene.body.trim() ? hookBodyTop - 40 : H - 300));
   if (hookScene.kicker.trim()) {
     const kicker = block({ text: hookScene.kicker, face: "sansBold", size: 26, maxLines: 1, color: kickerColor, letterSpacing: 5, uppercase: true }, SIDE, Math.max(140, hookPlaced.laid.bounds.top - 60), textWidth);
     await backed(acts.hook, [kicker], opacity.kicker, { layer: "behind", start: 0.12, rise: 40, fadeOut: true }, false);
   }
-  await backed(acts.hook, [hookPlaced.laid], opacity.display, { layer: hookPlaced.layer, start: 0.2, rise: 44, fadeOut: true, role: hookPlaced.layer === "behind" ? "hook_headline" : undefined });
+  await backed(acts.hook, [hookPlaced.laid], opacity.display, { layer: hookPlaced.layer, ...HOOK_HEADLINE_MOTION, role: hookPlaced.layer === "behind" ? "depth_headline" : undefined, lines: hookPlaced.lines });
   if (hookScene.body.trim()) {
     const laid = block(hookBodySpec, SIDE, hookBodyTop, textWidth);
     note("hook.body", laid);
@@ -812,12 +903,12 @@ async function prepareLayout(input: TrackedReelInput, plan: TrackedReelPlan, cal
   const valueBodySpec: TextSpec = { text: valueScene.body, face: "sans", size: 33, minSize: 27, maxLines: 3, color: theme.light, lineHeight: 1.32, opacity: 0.94 };
   const valueBodyHeight = valueScene.body.trim() ? block(valueBodySpec, 0, 0, textWidth).bounds.bottom : 0;
   const valueBodyTop = H - 150 - valueBodyHeight;
-  const valuePlaced = await placeHeadline("value.headline", valueScene.headline, await coverage("value"), VALUE_HEADLINE_SIZES, 176, Math.min(H - 300, valueBodyHeight ? valueBodyTop - 40 : H - 300));
+  const valuePlaced = await placeHeadline("value.headline", valueScene.headline, await coverage("value", VALUE_HEADLINE_MOTION), VALUE_HEADLINE_SIZES, 176, Math.min(H - 300, valueBodyHeight ? valueBodyTop - 40 : H - 300));
   if (valueScene.kicker.trim()) {
     const kicker = block({ text: valueScene.kicker, face: "sansBold", size: 24, maxLines: 1, color: kickerColor, letterSpacing: 4.5, uppercase: true }, SIDE, Math.max(140, valuePlaced.laid.bounds.top - 56), textWidth);
     await backed(acts.value, [kicker], opacity.kicker, { layer: "behind", start: 0.1, rise: 36, fadeOut: true }, false);
   }
-  await backed(acts.value, [valuePlaced.laid], opacity.display, { layer: valuePlaced.layer, start: 0.16, rise: 44, fadeOut: true });
+  await backed(acts.value, [valuePlaced.laid], opacity.display, { layer: valuePlaced.layer, ...VALUE_HEADLINE_MOTION, role: valuePlaced.layer === "behind" ? "depth_headline" : undefined, lines: valuePlaced.lines });
   if (valueBodyHeight) {
     const laid = block(valueBodySpec, SIDE, valueBodyTop, textWidth);
     note("value.body", laid);
@@ -873,10 +964,13 @@ async function prepareLayout(input: TrackedReelInput, plan: TrackedReelPlan, cal
 // Per-frame compositor
 // ---------------------------------------------------------------------------
 
-interface DrawOp { g: Graphic; dx: number; dy: number; opacity: number; role?: ItemRole }
+interface DrawOp { g: Graphic; dx: number; dy: number; opacity: number; role?: ItemRole; lines?: readonly (readonly [number, number])[] }
 export interface TrackedFrameStats {
   maskPresent: boolean;
+  /** Share of the visible behind-subject depth headline's glyph area covered by the subject; null when none is visible or no mask. */
   headlineOcclusion: number | null;
+  /** Worst single line's share of that headline covered by the subject on this frame; null as above. */
+  headlineLineOcclusion: number | null;
   /** Share of the shown in-front text glyph area drawn over the real subject (no backing there); null when no front text is shown. */
   frontTextOverSubject: number | null;
   /** Mask pixels the compositing refinement dropped (specks) or filled (pin-holes) on this frame; null without a footage mask. */
@@ -1048,18 +1142,26 @@ class FootageCompositor {
       drawGraphicPixels(this.out, op.g, op.dx, op.dy, op.opacity);
       canvas.over("background_graphics", shiftedReduced(op.g, op.dx, op.dy, this.ledgerScratch), clamp01(op.opacity));
     }
-    let headlineOcclusion: number | null = null, frontTextOverSubject: number | null = null, maskRefinement: TrackedFrameStats["maskRefinement"] = null;
+    let headlineOcclusion: number | null = null, headlineLineOcclusion: number | null = null, frontTextOverSubject: number | null = null, maskRefinement: TrackedFrameStats["maskRefinement"] = null;
     if (mask) {
       const popped = this.popSubject(mask, crop);
       maskRefinement = popped.refined;
       canvas.addSubjectInstance({ insideArea: popped.insideArea, totalArea: popped.totalArea });
       canvas.over("subject", this.subjectReduced, 1);
-      const headline = behind.find((op) => op.role === "hook_headline" && op.opacity >= 0.9);
+      const headline = behind.find((op) => op.role === "depth_headline" && op.opacity >= HEADLINE_VISIBLE_OPACITY);
       if (headline) {
         const glyphs = shiftedReduced(headline.g, headline.dx, headline.dy, this.ledgerScratch);
+        const lines = headline.lines ?? [], lineTotal = lines.map(() => 0), lineCovered = lines.map(() => 0);
         let total = 0, covered = 0;
-        for (let i = 0; i < glyphs.length; i++) { if (glyphs[i] > 0) { total += glyphs[i]; covered += glyphs[i] * Math.min(1, this.subjectReduced[i]); } }
+        for (let i = 0; i < glyphs.length; i++) {
+          if (!(glyphs[i] > 0)) continue;
+          const c = glyphs[i] * Math.min(1, this.subjectReduced[i]);
+          total += glyphs[i]; covered += c;
+          const centre = ((i / LW) | 0) * LEDGER_FACTOR + LEDGER_FACTOR / 2 - headline.dy;
+          lines.forEach(([top, bottom], line) => { if (centre >= top && centre < bottom) { lineTotal[line] += glyphs[i]; lineCovered[line] += c; } });
+        }
         headlineOcclusion = total > 0 ? covered / total : null;
+        if (headlineOcclusion !== null) headlineLineOcclusion = Math.max(0, ...lineTotal.map((value, line) => value > 0 ? lineCovered[line] / value : 0));
       }
     }
     const text = front.filter((op) => op.role === "front_text");
@@ -1082,7 +1184,7 @@ class FootageCompositor {
     }
     if (wash > 0) { this.wash(wash); canvas.over("transition", this.ones, clamp01(wash)); }
     if (chrome) { drawGraphicPixels(this.out, chrome, 0, 0, 1); canvas.over("foreground_graphics", chrome.reduced, 1); }
-    return { rgba: this.toRgba(), canvas, stats: { maskPresent: Boolean(mask), headlineOcclusion, frontTextOverSubject, maskRefinement } };
+    return { rgba: this.toRgba(), canvas, stats: { maskPresent: Boolean(mask), headlineOcclusion, headlineLineOcclusion, frontTextOverSubject, maskRefinement } };
   }
 }
 
@@ -1170,14 +1272,13 @@ async function composeTrackedReel(input: TrackedReelInput): Promise<TrackedReelC
 
   const opsFor = (frame: TrackedFramePlan, maskPresent: boolean) => {
     const [start, end] = plan.acts[frame.act];
-    const length = (end - start) / FPS, scale = Math.min(1, length / 3);
+    const length = (end - start) / FPS;
     const behind: DrawOp[] = [], front: DrawOp[] = [];
     for (const item of layout.acts[frame.act]) {
       if (!item.g) continue;
-      const e = easeOut((frame.actTime - item.start * scale) / (0.55 * Math.max(0.35, scale)));
-      const opacity = e * (item.fadeOut ? clamp01((length - frame.actTime) / 0.2) : 1);
+      const { opacity, dy } = itemMotion(item, frame.actTime, length);
       if (opacity <= 0) continue;
-      (item.layer === "behind" ? behind : front).push({ g: item.g, dx: 0, dy: Math.round((1 - e) * item.rise), opacity, role: item.role });
+      (item.layer === "behind" ? behind : front).push({ g: item.g, dx: 0, dy, opacity, role: item.role, lines: item.lines });
     }
     // The callout follows the smoothed track; it is hidden whenever this frame has no hero mask.
     if (maskPresent && frame.crop && frame.box && frame.centroid && (frame.act === "proof" || frame.act === "value")) {
@@ -1214,7 +1315,7 @@ async function composeTrackedReel(input: TrackedReelInput): Promise<TrackedReelC
       const frame = plan.frames[index];
       if (frame.kind === "still_depth") {
         const k = frame.endCardFrame!;
-        return { rgba: still!.renderFrame(k), canvas: still!.analyzeFrame(k), stats: { maskPresent: true, headlineOcclusion: null, frontTextOverSubject: null, maskRefinement: null } };
+        return { rgba: still!.renderFrame(k), canvas: still!.analyzeFrame(k), stats: { maskPresent: true, headlineOcclusion: null, headlineLineOcclusion: null, frontTextOverSubject: null, maskRefinement: null } };
       }
       if (!source || source.frame !== frame.sourceFrame || source.width !== sourceWidth || source.height !== sourceHeight || source.rgba.length !== sourceWidth * sourceHeight * 4) {
         throw new TrackedCinemaError("A decoded footage frame does not match the plan.");
@@ -1273,7 +1374,7 @@ export async function renderTrackedReel(input: TrackedReelInput, options: { time
   const encoder = openH264Encoder({ outputPath: parsed.outputPath, width: W, height: H, fps: FPS, expectedFrames: TRACKED_REEL_FRAMES, timeoutMs: options.timeoutMs ?? 420_000 });
   const ledger = new CompositionLedgerAccumulator();
   let coverPng: Buffer | null = null, missingMasks = 0;
-  const occlusions: number[] = [], frontText: number[] = [];
+  const occlusions: number[] = [], lineOcclusions: number[] = [], frontText: number[] = [];
   const refinement = { edgeSigma: { min: 0, max: 0 }, framesRefined: 0, framesWithSpecksRemoved: 0, framesWithHolesFilled: 0, removedPixels: 0, filledPixels: 0 };
   let held: { source: ClipFrame; mask: FrameMask | null } | null = null;
   const emit = async (index: number, source: ClipFrame | null, mask: FrameMask | null) => {
@@ -1283,6 +1384,7 @@ export async function renderTrackedReel(input: TrackedReelInput, options: { time
     written.catch(() => undefined);
     ledger.addFrame(canvas);
     if (stats.headlineOcclusion !== null) occlusions.push(stats.headlineOcclusion);
+    if (stats.headlineLineOcclusion !== null) lineOcclusions.push(stats.headlineLineOcclusion);
     if (stats.frontTextOverSubject !== null) frontText.push(stats.frontTextOverSubject);
     if (stats.maskRefinement) {
       const sigma = Number(stats.maskRefinement.edgeSigma.toFixed(3));
@@ -1330,11 +1432,14 @@ export async function renderTrackedReel(input: TrackedReelInput, options: { time
   }
   const violations: TrackedReelViolation[] = [];
   const headlineMean = occlusions.length ? occlusions.reduce((sum, value) => sum + value, 0) / occlusions.length : 0;
+  const headlineMax = occlusions.length ? Math.max(...occlusions) : 0, headlineLineMax = lineOcclusions.length ? Math.max(...lineOcclusions) : 0;
   if (finished.maxSubjectOcclusion > MAX_FOREGROUND_OCCLUSION) violations.push("foreground_occlusion");
   if (finished.framesWithoutSubject > TRACKED_REEL_FRAMES * 0.1) violations.push("subject_missing");
   if (missingMasks > 0) violations.push("tracking_lost");
   if (finished.framesSubjectCropped > TRACKED_REEL_FRAMES * 0.1) violations.push("subject_cropped");
-  if (headlineMean > MAX_TRACKED_HEADLINE_OCCLUSION) violations.push("headline_hidden");
+  // Fail closed on single frames, not only on average: one frame hiding a word is an illegible hook.
+  if (headlineMean > MAX_TRACKED_HEADLINE_OCCLUSION || headlineMax > MAX_HEADLINE_OCCLUSION + HEADLINE_MEASURE_TOLERANCE
+    || headlineLineMax > MAX_HEADLINE_LINE_OCCLUSION + HEADLINE_MEASURE_TOLERANCE) violations.push("headline_hidden");
   if (composer.endCardFallback) violations.push("end_card_fallback");
   const drawnFootage = plan.frames.filter((frame) => frame.crop).length;
   if (composer.footageUpscale.framesOverLimit > drawnFootage * 0.1) violations.push("low_resolution_footage");
@@ -1347,7 +1452,7 @@ export async function renderTrackedReel(input: TrackedReelInput, options: { time
     endCard: composer.endCard,
     qa: {
       violations, framesSubjectHiddenByTransition: ledger.framesSubjectHiddenByTransition, footageFramesWithoutMask: missingMasks,
-      headlineOcclusion: { mean: Number(headlineMean.toFixed(4)), max: Number((occlusions.length ? Math.max(...occlusions) : 0).toFixed(4)) },
+      headlineOcclusion: { mean: Number(headlineMean.toFixed(4)), max: Number(headlineMax.toFixed(4)), lineMax: Number(headlineLineMax.toFixed(4)) },
       frontTextOverSubject: {
         mean: Number((frontText.length ? frontText.reduce((sum, value) => sum + value, 0) / frontText.length : 0).toFixed(4)),
         max: Number((frontText.length ? Math.max(...frontText) : 0).toFixed(4)),

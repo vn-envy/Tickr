@@ -1066,3 +1066,21 @@ select { font: inherit; color: inherit; }
   .ap-tile-scan, .ap-rail-pulse, .ap-live > span { animation: none !important; }
   .ap-log-list li, .ap-tile { animation: none !important; }
 }
+
+/* ---- Owner access gate (/access) — begin ---- */
+.access-page { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 32px 16px; background: var(--canvas); }
+.access-card { width: 100%; max-width: 420px; background: var(--paper); border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 3px 10px #282b2208; padding: 36px 32px 30px; }
+.access-brand { margin: 0 0 28px; }
+.access-card h1 { font-size: 26px; letter-spacing: -.8px; }
+.access-lede { margin-top: 10px; font-size: 13px; line-height: 1.7; color: var(--muted); }
+.access-form { display: flex; flex-direction: column; gap: 10px; margin-top: 24px; }
+.access-form label { font-size: 11px; font-weight: 600; letter-spacing: .4px; color: #4b5045; }
+.access-form input { width: 100%; height: 46px; padding: 0 14px; border: 1px solid #d9dbd1; border-radius: 8px; background: #fff; color: var(--ink); font-size: 15px; }
+.access-form input[aria-invalid="true"] { border-color: var(--orange-dark); }
+.access-form button { margin-top: 8px; height: 46px; border: 0; border-radius: 8px; background: var(--ink); color: #fff; font-weight: 600; font-size: 14px; }
+.access-form button:hover { background: #3a3c37; }
+.access-error { font-size: 12px; color: var(--orange-dark); background: var(--orange-soft); border-radius: 6px; padding: 9px 11px; margin: 0; }
+.access-note { margin-top: 20px; font-size: 11px; line-height: 1.7; color: #8a8d82; }
+.access-home { display: inline-block; margin-top: 20px; font-weight: 600; color: var(--orange-dark); }
+@media (max-width: 460px) { .access-card { padding: 28px 20px 24px; } }
+/* ---- Owner access gate (/access) — end ---- */

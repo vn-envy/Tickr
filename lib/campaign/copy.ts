@@ -67,16 +67,36 @@ export function cleanConsumerCopy(value: string, removed?: string[]): string {
     .trim();
 }
 
-/** Editorial numbering is not a business quantity; dates, inventory, prices and durations remain visible. */
-export function businessQuantityText(value: string): string {
-  const editorialContext = /\b(?:story|carousel|slides?|scenes?|reel|video|film|introduction)\b/i.test(value);
+/** Channels whose copy is inherently a numbered sequence of slides, frames or scenes. */
+const SEQUENCE_CHANNELS = new Set<string>(["instagram_carousel", "instagram_stories", "instagram_reels", "whatsapp_status"]);
+
+/**
+ * Editorial numbering is not a business quantity; dates, inventory, prices and durations remain visible.
+ * Only the list markers themselves are removed, and only when they form a strict 1..n sequence: every
+ * number inside a list item (stock, prices, years, durations) still counts as a quantity.
+ */
+export function businessQuantityText(value: string, options: { channel?: string; contextText?: string } = {}): string {
+  const keywordContext = /\b(?:story|carousel|slides?|scenes?|reel|video|film|introduction)\b/i.test(`${options.contextText ?? ""} ${value}`);
+  const channelContext = options.channel !== undefined && SEQUENCE_CHANNELS.has(options.channel);
   let text = value.replace(/\b(?:[1-9]|1[0-2])\s*[-–]\s*(?:part|slide|scene|panel|frame)(?=\s+(?:[a-z][a-z'’–-]*\s+){0,4}(?:story|carousel|reel|video|film|introduction|sequence|series)\b)/gi, "editorial-part");
-  if (editorialContext) {
-    const markers = /(^|[\s:;])([1-9]|1[0-2])[):.](?=\s+(?!(?:January|February|March|April|May|June|July|August|September|October|November|December)\b)\S)/gi;
-    const matches = [...text.matchAll(markers)];
-    // A sequential list beginning 1,2 is editorial structure; isolated dates/quantities are not.
-    if (matches.length >= 2 && matches.every((match, index) => Number(match[2]) === index + 1)) text = text.replace(markers, "$1");
-  }
+  const markers = /(^|[\s:;])([1-9]|1[0-2])([):./])(?=\s+(?!(?:January|February|March|April|May|June|July|August|September|October|November|December)\b)\S)/gi;
+  const matches = [...text.matchAll(markers)];
+  // A sequential list beginning 1,2 is editorial structure; isolated dates/quantities are not.
+  if (matches.length < 2 || !matches.every((match, index) => Number(match[2]) === index + 1)) return text;
+  const consistent = matches.every((match) => match[3] === matches[0][3]);
+  // An item marker starts the text or follows punctuation, a symbol or a line break, never a word ("Buy 1. Get 2.").
+  const itemStart = (match: RegExpExecArray | RegExpMatchArray) => {
+    const before = text.slice(0, match.index! + match[1].length);
+    return /\n[^\S\n]*$/.test(before) || /(?:^|[^\p{L}\p{N}])$/u.test(before.trimEnd());
+  };
+  const bounded = matches.every(itemStart);
+  // In slide context, run-in markers ("three ways 1/ … 2/ …") are numbering when the list visibly starts as a list,
+  // uses an unambiguous "/" or ")" marker, or numbers multi-word items. "Buy 1. Get 2. Pay 3. today" is none of these.
+  const items = matches.slice(1).map((match, index) => text.slice(matches[index].index! + matches[index][0].length, match.index! + match[1].length).trim());
+  const runIn = consistent && (itemStart(matches[0]) || ["/", ")"].includes(matches[0][3]) || items.every((item) => item.split(/\s+/).length >= 2));
+  const editorial = ((keywordContext || channelContext) && (bounded || runIn))
+    || (consistent && bounded && matches.length >= 3);
+  if (editorial) text = text.replace(markers, "$1");
   return text;
 }
 
@@ -135,10 +155,10 @@ export function validateCampaignCopy(input: unknown, report: ResearchReport, opp
   const summarySourceIds = new Set(sources.filter((source) => source.acquisition === "meta_cited_summary").map((source) => source.id));
   const isSummary = (id: string) => ownFacts.get(id)!.basis === "meta_cited_summary" || summarySourceIds.has(ownFacts.get(id)!.sourceId);
   const normalize = (value: string) => value.toLowerCase().replace(/\s+/g, " ").trim();
-  const quantities = (text: string) => [
-    ...(businessQuantityText(text).match(/\b\d(?:[\d,.]*\d)?\b/g) ?? []),
-    ...(businessQuantityText(text).match(/\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|twenty|thirty|forty|fifty|hundred|thousand|several|multiple)\s*(?:[-–]\s*)?(?:years?|months?|weeks?|days?|hours?|minutes?|generations?|orders?|appointments?|slots?|customers?|percent|kilos?|pounds?)\b/gi) ?? []),
-  ].map(normalize);
+  const quantities = (text: string, prepared = false) => { const quantityText = prepared ? text : businessQuantityText(text); return [
+    ...(quantityText.match(/\b\d(?:[\d,.]*\d)?\b/g) ?? []),
+    ...(quantityText.match(/\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|twenty|thirty|forty|fifty|hundred|thousand|several|multiple)\s*(?:[-–]\s*)?(?:years?|months?|weeks?|days?|hours?|minutes?|generations?|orders?|appointments?|slots?|customers?|percent|kilos?|pounds?)\b/gi) ?? []),
+  ].map(normalize); };
   // These guards target consequential promises, not generic reported story themes.
   const sensitiveClaims = (text: string) => (text.match(/\b(?:certified|accredited|licensed|clinically proven|award[- ]winning|guarantee(?:s|d)?|risk[- ]free|pain[- ]free|weight[- ]loss|fat[- ]loss|whiter teeth|straighter teeth|regrow(?:s)? hair|(?:cures?|treats?|prevents?|reverses?) (?:diabetes|disease|cancer|infection|hair loss|aging|pain)|gluten[- ]free|allergen[- ]free|dairy[- ]free|nut[- ]free|sugar[- ]free|organic|vegan|complimentary|discount(?:s|ed)?|half[- ]price|limited[- ]time offer|free (?:trial|consultation|delivery|shipping|sample|session)|unlimited|same[- ]day delivery|next[- ]day delivery)\b/gi) ?? []).map(normalize);
   const hasScopedSources = sources.some((source) => source.context) || Boolean(enrichment?.branch);
@@ -154,14 +174,15 @@ export function validateCampaignCopy(input: unknown, report: ResearchReport, opp
     if ((commercialPromise || availabilityPromise) && !currentOffer) throw new Error("Current offers and availability need dated, original evidence for this exact location.");
     if (enrichment?.branch && enrichment.branch.status !== "matched" && /\b(?:visit us|visit (?:our|the|this) (?!website\b|page\b|profile\b|menu\b)|we(?:'re| are) (?:located|based)|at (?:our|this|the) [^.!?]{0,50}\b(?:branch|store|shop|clinic|studio|location)|our (?:local|nearby) (?:branch|store|shop|clinic|studio))\b/i.test(claimText)) throw new Error("An unresolved branch cannot be presented as a confirmed local destination.");
   };
-  const validateSensitiveCopy = (publicCopy: string, evidenceIds: string[]) => {
+  /** quantityText, when given, is publicCopy with editorial numbering already removed field by field. */
+  const validateSensitiveCopy = (publicCopy: string, evidenceIds: string[], quantityText?: string) => {
     // A retrieved model summary is not original wording or owner confirmation.
     const referenceText = evidenceIds.filter((id) => !isSummary(id)).map((id) => ownFacts.get(id)!.quote).join(" ");
     if (destinations(publicCopy).some((value) => !destinations(referenceText).includes(value))) throw new Error("The draft introduced an unsupported destination.");
     if (offers(publicCopy).some((value) => !offers(referenceText).includes(value))) throw new Error("The draft introduced an unsupported price or percentage.");
     if (phones(publicCopy).some((value) => !phones(referenceText).includes(value))) throw new Error("The draft introduced an unsupported contact number.");
     if (evidenceIds.some(isSummary)) {
-      if (quantities(publicCopy).some((value) => !quantities(referenceText).includes(value))) throw new Error("Dates and quantitative promises from Meta summaries need original source or owner confirmation before advertising.");
+      if (quantities(quantityText ?? publicCopy, quantityText !== undefined).some((value) => !quantities(referenceText).includes(value))) throw new Error("Dates and quantitative promises from Meta summaries need original source or owner confirmation before advertising.");
       if (sensitiveClaims(publicCopy).some((value) => !sensitiveClaims(referenceText).includes(value))) throw new Error("Promotional, certification and medical claims from Meta summaries need original source or owner confirmation before advertising.");
     }
   };
@@ -214,8 +235,9 @@ export function validateCampaignCopy(input: unknown, report: ResearchReport, opp
   // Questions are consumer strings, not JSON syntax or text joined across field boundaries.
   for (const text of [copy.name, copy.coreMessage, copy.primaryCta, copy.conversation.opener, copy.conversation.qualificationQuestion, copy.conversation.nextAction, ...copy.conversation.commonReplies.flatMap((reply) => [reply.question, reply.answer])]) validateCurrentClaims(text, copy.evidenceIds);
   for (const channel of copy.channels) {
-    const text = `${channel.title} ${channel.headline} ${channel.body} ${channel.caption} ${channel.cta}`;
-    validateSensitiveCopy(text, channel.evidenceIds);
+    const fields = [channel.title, channel.headline, channel.body, channel.caption, channel.cta];
+    // Each field is its own numbered list (a carousel caption's "1/ 2/ 3/"), never a sequence joined across fields.
+    validateSensitiveCopy(fields.join(" "), channel.evidenceIds, fields.map((field) => businessQuantityText(field, { channel: channel.id, contextText: fields.join(" ") })).join(" "));
     for (const field of [channel.title, channel.headline, channel.body, channel.caption, channel.cta]) validateCurrentClaims(field, channel.evidenceIds);
   }
   copy.evidenceIds = [...new Set([...copy.evidenceIds, ...copy.channels.flatMap((channel) => channel.evidenceIds)])];

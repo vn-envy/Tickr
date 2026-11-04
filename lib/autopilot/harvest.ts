@@ -154,6 +154,17 @@ async function exists(path: string): Promise<boolean> {
   try { return (await lstat(path)).isDirectory(); } catch { return false; }
 }
 
+/**
+ * Owner-facing note for a gallery that yielded no photos. A site Tickr could not reach (or whose
+ * images could not be downloaded) is a media-access limitation, never "the website has no photos".
+ */
+export function emptyGalleryNote(gallery: Pick<OfficialGalleryResult, "status" | "assets" | "pagesRead" | "skipped">): string | null {
+  if (gallery.assets.length) return null;
+  // No page read at all, or every photo download failed: the site was not readable this time.
+  const unreadable = !gallery.pagesRead.length || (gallery.status !== "no_candidates" && gallery.skipped.some((item) => item.reason === "fetch_failed"));
+  return unreadable ? "Tickr could not read the official website this time; no website photos were used." : "The official website offered no usable photos.";
+}
+
 /** Default dependencies: the worker's real business library, official gallery reader and Meta Graph connection. */
 export const defaultHarvestDependencies: HarvestDependencies = {
   openBusinessLibrary: async (directory, businessId) => {
@@ -302,7 +313,8 @@ export async function harvestMedia(input: {
       const gallery = await dependencies.collectGallery({ officialWebsite: input.website, outputDir: galleryDir });
       const outcomes = await library.importFromGallery(gallery);
       const rejected = outcomes.filter((outcome) => outcome.status === "rejected").length;
-      if (!gallery.assets.length) notes.push("The official website offered no usable photos.");
+      const emptyNote = emptyGalleryNote(gallery);
+      if (emptyNote) notes.push(emptyNote);
       if (rejected) notes.push(`${rejected} website image${rejected === 1 ? "" : "s"} could not be added to the media library.`);
     } catch (error) {
       if (error instanceof MediaLibraryError && error.code !== "ASSET_INVALID") throw error;
