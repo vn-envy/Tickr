@@ -4,11 +4,11 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { RotateCcw } from "lucide-react";
 import type { RunView } from "@/lib/research/contracts";
 import type { AutopilotPublicState } from "@/lib/autopilot/public-state";
-import { approveRun, getAutopilotState, getRun, HttpError, retryRun } from "./api";
-import { AutopilotIntake } from "./autopilot-intake";
+import { approveRun, getAutopilotState, getBusiness, getRun, HttpError, retryRun } from "./api";
+import { AutopilotIntake, writeStoredDraft } from "./autopilot-intake";
 import { AutopilotReady } from "./autopilot-ready";
 import { DirectorsRoom, type StateStatus } from "./directors-room";
-import { isActiveRun, isOAuthReturn, isUuid, RUN_STORAGE_KEY, stoppedStateRetryDelay } from "./model";
+import { type IntakeFocus, isActiveRun, isOAuthReturn, isUuid, restoreSearch, restoreTarget, RUN_STORAGE_KEY, stoppedStateRetryDelay } from "./model";
 
 function rememberRun(id: string) {
   try { window.localStorage.setItem(RUN_STORAGE_KEY, id); } catch { /* Browsing without storage is supported. */ }
@@ -30,6 +30,7 @@ export function AutopilotExperience({ onStudio }: { onStudio: () => void }) {
   const [restoring, setRestoring] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
   const [retrying, setRetrying] = useState(false);
+  const [intakeFocus, setIntakeFocus] = useState<IntakeFocus | null>(null);
   const headingRef = useRef<HTMLDivElement>(null);
   const onStudioRef = useRef(onStudio);
   useEffect(() => { onStudioRef.current = onStudio; }, [onStudio]);
@@ -110,11 +111,37 @@ export function AutopilotExperience({ onStudio }: { onStudio: () => void }) {
   }, [runId, active]);
 
   const started = useCallback((next: RunView) => {
-    setState(null); setStateStatus("loading"); setNotice(null); setRun(next); rememberRun(next.id);
+    setIntakeFocus(null); setState(null); setStateStatus("loading"); setNotice(null); setRun(next); rememberRun(next.id);
     window.scrollTo({ top: 0 }); window.setTimeout(() => headingRef.current?.focus(), 0);
   }, []);
   function startOver() {
-    forgetRun(); setRun(null); setState(null); setStateStatus("loading"); setNotice(null);
+    forgetRun(); setRun(null); setState(null); setStateStatus("loading"); setNotice(null); setIntakeFocus(null);
+    window.scrollTo({ top: 0 });
+  }
+  /**
+   * Back to the intake for the same business, link and goal, with the dropzone (or connection) focused.
+   * Reuses the OAuth-return restore: the draft is saved to sessionStorage and ?business= marks it, so
+   * the owner's new uploads attach to this business and Run Autopilot starts a new run for them.
+   * The link and goal come from the persisted business row (what the owner pasted), never from
+   * RunView.business, whose website discovery may have replaced with the matched official site.
+   */
+  const addingMedia = useRef(false);
+  const runRef = useRef(run);
+  useEffect(() => { runRef.current = run; }, [run]);
+  async function addMedia(focus: IntakeFocus) {
+    if (!run || addingMedia.current) return;
+    addingMedia.current = true;
+    const from = run;
+    let target: ReturnType<typeof restoreTarget>;
+    try { const { business } = await getBusiness(from.businessId); target = restoreTarget(from.businessId, business); }
+    catch { setNotice("We couldn’t reopen your link and goal right now. Try again in a moment."); return; }
+    finally { addingMedia.current = false; }
+    if (runRef.current?.id !== from.id) return; // The owner moved on (e.g. started over) while this loaded.
+    if (!target) { startOver(); return; }
+    writeStoredDraft(target);
+    forgetRun();
+    const url = new URL(window.location.href); url.search = restoreSearch(url.search, target.businessId); window.history.replaceState(null, "", url);
+    setRun(null); setState(null); setStateStatus("loading"); setNotice(null); setIntakeFocus(focus);
     window.scrollTo({ top: 0 });
   }
   async function retry() {
@@ -140,8 +167,8 @@ export function AutopilotExperience({ onStudio }: { onStudio: () => void }) {
     {notice && <p className="ap-notice ap-notice-inline" role="status">{notice}</p>}
     {run && <div className="ap-run-bar"><button type="button" className="ap-text-button" onClick={startOver}><RotateCcw size={13} />Start a new run</button></div>}
     <div ref={headingRef} tabIndex={-1} className="ap-focus-anchor" aria-label={run ? "Autopilot run" : "Autopilot intake"} />
-    {!run ? <AutopilotIntake restoring={restoring} onStarted={started} />
-      : run.campaign && !active ? <AutopilotReady run={run} state={state} stateStatus={stateStatus} onApprove={approve} />
-      : <DirectorsRoom run={run} state={state} stateStatus={stateStatus} onRetry={() => void retry()} retrying={retrying} onStudio={onStudio} />}
+    {!run ? <AutopilotIntake restoring={restoring} onStarted={started} focus={intakeFocus} />
+      : run.campaign && !active ? <AutopilotReady run={run} state={state} stateStatus={stateStatus} onApprove={approve} onAddMedia={(focus) => void addMedia(focus)} />
+      : <DirectorsRoom run={run} state={state} stateStatus={stateStatus} onRetry={() => void retry()} retrying={retrying} onStudio={onStudio} onAddMedia={(focus) => void addMedia(focus)} />}
   </div>;
 }

@@ -17,10 +17,12 @@ type Props = {
   onAdd: (files: File[]) => void; onRemoveQueued: (id: string) => void; onRemoveUploaded: (assetId: string) => void;
   onRights: (value: boolean) => void; onPeople: (value: PeopleVisible) => void;
   consentRef: RefObject<HTMLFieldSetElement | null>;
+  /** The "Choose files" button, so the intake can focus it when the owner comes back to add photos. */
+  pickRef?: RefObject<HTMLButtonElement | null>;
 };
 
 /** Optional owner photos & videos: drop or pick, preview, remove; consent is required before anything uploads. */
-export function MediaDropzone({ queue, uploaded, rejected, disabled, rights, people, consentError, onAdd, onRemoveQueued, onRemoveUploaded, onRights, onPeople, consentRef }: Props) {
+export function MediaDropzone({ queue, uploaded, rejected, disabled, rights, people, consentError, onAdd, onRemoveQueued, onRemoveUploaded, onRights, onPeople, consentRef, pickRef }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
   const helpId = useId();
@@ -36,10 +38,11 @@ export function MediaDropzone({ queue, uploaded, rejected, disabled, rights, peo
     <div className={`ap-dropzone ${dragging ? "is-dragging" : ""} ${disabled || full ? "is-disabled" : ""}`} onDragEnter={(event) => { event.preventDefault(); if (!disabled && !full) setDragging(true); }} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = disabled || full ? "none" : "copy"; }} onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false); }} onDrop={drop}>
       <Upload size={20} strokeWidth={1.6} aria-hidden="true" />
       <p><strong>Drop files here</strong> or</p>
-      <button type="button" className="button button-secondary ap-pick" disabled={disabled || full} onClick={() => inputRef.current?.click()} aria-describedby={helpId}>Choose files</button>
+      <button ref={pickRef} type="button" className="button button-secondary ap-pick" disabled={disabled || full} onClick={() => inputRef.current?.click()} aria-describedby={helpId}>Choose files</button>
       <input ref={inputRef} className="ap-visually-hidden" type="file" multiple accept={UPLOAD_ACCEPT} tabIndex={-1} aria-hidden="true" onChange={(event) => { onAdd(Array.from(event.target.files ?? [])); event.target.value = ""; }} />
       <p className="ap-drop-help" id={helpId}>{full ? `You’ve added the maximum of ${MAX_UPLOADS} files.` : "JPEG, PNG, WebP up to 20 MB · MP4, MOV, WebM up to 300 MB"}</p>
     </div>
+    <p className="ap-help">Tip: you can download photos from your own Google Business Profile and add them here.</p>
     {rejected.length > 0 && <ul className="ap-rejected" role="alert">{rejected.map((message, index) => <li key={index}><CircleAlert size={14} />{message}</li>)}</ul>}
     {total > 0 && <ul className="ap-thumbs" aria-label="Your files">
       {uploaded.map((asset) => <li key={asset.id} className="ap-thumb is-uploaded">

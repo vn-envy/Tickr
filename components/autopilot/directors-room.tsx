@@ -5,7 +5,8 @@ import { Ban, Check, CircleAlert, Clapperboard, Crosshair, Eye, Film, ImageOff, 
 import type { RunView } from "@/lib/research/contracts";
 import type { AutopilotPublicState } from "@/lib/autopilot/public-state";
 import { BoxedImage } from "./boxed-image";
-import { autopilotFileUrl, CHANNEL_LABEL, deriveRail, directorLog, GOAL_FIT_LABEL, isListed, type MediaStateStatus, mediaWallMode, PROVENANCE_LABEL, REEL_MODE_LABEL, RIGHTS_LABEL, roleBadges, roomHeadline, SAM_ORIGIN_LABEL, type PublicMedia, type RailStep } from "./model";
+import { RealMediaCard } from "./real-media-card";
+import { autopilotFileUrl, CHANNEL_LABEL, deriveRail, directorLog, GOAL_FIT_LABEL, isListed, type IntakeFocus, type MediaStateStatus, mediaWallMode, PROVENANCE_LABEL, REEL_MODE_LABEL, RIGHTS_LABEL, roleBadges, roomHeadline, SAM_ORIGIN_LABEL, type PublicMedia, type RailStep } from "./model";
 
 export type StateStatus = MediaStateStatus;
 
@@ -138,7 +139,7 @@ export function SelectionCard({ run }: { run: RunView }) {
   </section>;
 }
 
-export function DirectorsRoom({ run, state, stateStatus, onRetry, retrying, onStudio }: { run: RunView; state: AutopilotPublicState | null; stateStatus: StateStatus; onRetry: () => void; retrying: boolean; onStudio: () => void }) {
+export function DirectorsRoom({ run, state, stateStatus, onRetry, retrying, onStudio, onAddMedia }: { run: RunView; state: AutopilotPublicState | null; stateStatus: StateStatus; onRetry: () => void; retrying: boolean; onStudio: () => void; onAddMedia?: (focus: IntakeFocus) => void }) {
   const rail = deriveRail(run, state);
   const busy = ["queued", "running"].includes(run.status);
   const headline = roomHeadline(run);
@@ -156,6 +157,7 @@ export function DirectorsRoom({ run, state, stateStatus, onRetry, retrying, onSt
     {run.status === "failed" && <div className="ap-error" role="alert"><strong>Autopilot stopped</strong><p>{run.error ?? "This run could not finish."}</p><div className="ap-error-actions"><button type="button" className="button button-secondary" onClick={onRetry} disabled={retrying}>{retrying ? <LoaderCircle size={15} className="spin" /> : null}{retrying ? "Checking…" : "Try resuming"}</button></div></div>}
     {waitingOnOwner && <div className="ap-notice" role="status"><strong>Autopilot needs a little more from you.</strong><p>{run.error ?? "The research didn’t find enough supported evidence to choose a campaign on its own. Review the open questions in the step-by-step studio."}</p><button type="button" className="button button-secondary" onClick={onStudio}>Open the step-by-step studio</button></div>}
     {!busy && run.status !== "failed" && !waitingOnOwner && run.error && <div className="ap-notice" role="status"><p>{run.error}</p></div>}
+    {onAddMedia && <RealMediaCard run={run} state={state} onAddMedia={onAddMedia} />}
     <div className="ap-room-grid">
       <div className="ap-room-main">
         <MediaWall run={run} state={state} status={stateStatus} />

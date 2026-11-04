@@ -6,8 +6,9 @@ import type { RunView } from "@/lib/research/contracts";
 import type { AutopilotPublicState } from "@/lib/autopilot/public-state";
 import { CampaignPanel, ExportPanel } from "../research-panels";
 import { BoxedImage } from "./boxed-image";
+import { RealMediaCard } from "./real-media-card";
 import { DirectorLog, MediaWall, PhaseRail, PlanCard, SamPanel, SelectionCard, type StateStatus } from "./directors-room";
-import { APPROVAL_STATEMENT, approvalReview, approvedDownloads, autopilotFileUrl, campaignFilename, carouselAssets, deriveRail, findingTarget, formatBytes, offerableArchive, REEL_MODE_LABEL, reelAsset, runFileUrl, serverWithheld, shortDigest, trackingOverlay, withoutWithheld } from "./model";
+import { APPROVAL_STATEMENT, approvalReview, approvedDownloads, autopilotFileUrl, campaignFilename, carouselAssets, deriveRail, findingTarget, formatBytes, type IntakeFocus, offerableArchive, REEL_MODE_LABEL, reelAsset, runFileUrl, serverWithheld, shortDigest, trackingOverlay, withoutWithheld } from "./model";
 
 function ReelPlayer({ run, state, withheld }: { run: RunView; state: AutopilotPublicState | null; withheld: ReadonlySet<string> }) {
   const reel = reelAsset(run.campaign);
@@ -143,7 +144,7 @@ export function ApprovalBlock({ run, state, onApprove }: { run: RunView; state: 
   </section>;
 }
 
-export function AutopilotReady({ run, state, stateStatus, onApprove }: { run: RunView; state: AutopilotPublicState | null; stateStatus: StateStatus; onApprove: (digest: string) => Promise<void> }) {
+export function AutopilotReady({ run, state, stateStatus, onApprove, onAddMedia }: { run: RunView; state: AutopilotPublicState | null; stateStatus: StateStatus; onApprove: (digest: string) => Promise<void>; onAddMedia?: (focus: IntakeFocus) => void }) {
   const campaign = run.campaign!;
   const rail = deriveRail(run, state);
   const withheld = useMemo(() => new Set(serverWithheld(run)), [run]);
@@ -156,6 +157,7 @@ export function AutopilotReady({ run, state, stateStatus, onApprove }: { run: Ru
       <p>{campaign.coreMessage}</p>
       <PhaseRail steps={rail.steps} compact />
     </header>
+    {onAddMedia && <RealMediaCard run={run} state={state} onAddMedia={onAddMedia} />}
     <div className="ap-ready-grid">
       <ReelPlayer run={run} state={state} withheld={withheld} />
       <div className="ap-ready-side">

@@ -23,6 +23,12 @@ export const ResearchInputSchema = z.object({
   enrichFromLink: z.boolean().optional(),
   /** One-shot Autopilot: auto-select the best-supported opportunity and continue to a review-ready kit. */
   autopilot: z.boolean().optional(),
+  /**
+   * Digest of the business's owner media (uploads and connection) when the run was requested. It is
+   * part of the run input hash only, so new uploads or a new connection start a fresh run while an
+   * unchanged retry still reuses the existing one. It is never treated as evidence.
+   */
+  mediaRevision: z.string().regex(/^[a-f0-9]{16,64}$/).optional(),
 }).strict();
 export type ResearchInput = z.infer<typeof ResearchInputSchema>;
 

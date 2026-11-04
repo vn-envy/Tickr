@@ -6,24 +6,43 @@ import type { RunView } from "@/lib/research/contracts";
 import { DEFAULT_CAMPAIGN_GOAL } from "@/lib/businesses/input";
 import { createBusiness, deleteBusinessMedia, disconnectMeta, getBusiness, getBusinessMedia, HttpError, startAutopilotRun, uploadMedia, type BusinessMedia, type MetaConnection } from "./api";
 import { MediaDropzone, type QueuedFile } from "./media-dropzone";
-import { classifyUpload, composeGoal, connectUrl, DRAFT_STORAGE_KEY, GOALS, isUuid, LINK_KIND_LABEL, MAX_UPLOADS, normalizeBusinessLink, resolveOAuthReturn, type GoalId, type PeopleVisible } from "./model";
+import { classifyUpload, composeGoal, connectUrl, deriveMediaRevision, DRAFT_STORAGE_KEY, GOALS, type IntakeFocus, isUuid, LINK_KIND_LABEL, MAX_UPLOADS, type MediaLibrary, mediaRevisionSource, normalizeBusinessLink, resolveOAuthReturn, type GoalId, type PeopleVisible, type RestoreDraft } from "./model";
 import { UploadCancelledError, uploadBatch } from "./upload-batch";
 
 type Draft = { businessId: string; url: string; goal: string };
-type StoredDraft = Draft & { link: string; goalId: GoalId | null; goalText: string };
+type StoredDraft = RestoreDraft;
 type MediaStatus = "idle" | "loading" | "ready" | "unavailable";
 type Busy = null | "draft" | "upload" | "start" | "connect";
 
 const linkIcons = { maps: MapPin, instagram: AtSign, facebook: Globe, website: Globe };
-function readStoredDraft(): StoredDraft | null {
+export function readStoredDraft(): StoredDraft | null {
   try { const value = JSON.parse(window.sessionStorage.getItem(DRAFT_STORAGE_KEY) ?? "null") as StoredDraft | null; return value && isUuid(value.businessId) ? value : null; } catch { return null; }
 }
-function writeStoredDraft(value: StoredDraft | null) {
+export function writeStoredDraft(value: StoredDraft | null) {
   try { if (value) window.sessionStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(value)); else window.sessionStorage.removeItem(DRAFT_STORAGE_KEY); } catch { /* Optional storage. */ }
 }
 
-/** Intake: one link, one goal, optional media and account connection, one primary action. */
-export function AutopilotIntake({ restoring, onStarted }: { restoring: boolean; onStarted: (run: RunView) => void }) {
+/**
+ * The current owner media as a run-input revision, read fresh from the server (retried once) so it
+ * matches what the worker will harvest. If the library can't be read, the library this intake knows
+ * locally (files it listed or just uploaded) is used instead, so a re-run after adding photos still
+ * starts a new run. Null only when neither is known: the run then de-duplicates as before.
+ */
+async function currentMediaRevision(businessId: string, local: MediaLibrary | null): Promise<string | null> {
+  let server: BusinessMedia | null = null;
+  for (let attempt = 0; attempt < 2 && !server; attempt += 1) {
+    try { server = await getBusinessMedia(businessId); } catch { /* Retried once, then the local library. */ }
+  }
+  const source = mediaRevisionSource(server, local);
+  return source ? deriveMediaRevision(source.assetIds, source.connection) : null;
+}
+
+/**
+ * Intake: one link, one goal, optional media and account connection, one primary action.
+ * `focus` is set when the owner comes back from a run to add their own photos or connect an account:
+ * once the saved draft is restored, the matching control is focused.
+ */
+export function AutopilotIntake({ restoring, onStarted, focus = null }: { restoring: boolean; onStarted: (run: RunView) => void; focus?: IntakeFocus | null }) {
   const [link, setLink] = useState("");
   const [linkTouched, setLinkTouched] = useState(false);
   const [goalId, setGoalId] = useState<GoalId | null>(null);
@@ -41,6 +60,11 @@ export function AutopilotIntake({ restoring, onStarted }: { restoring: boolean; 
   const [busy, setBusy] = useState<Busy>(null);
   const [error, setError] = useState<string | null>(null);
   const [stoppedNotice, setStoppedNotice] = useState<string | null>(null);
+  const [focusRequest, setFocusRequest] = useState<{ focus: IntakeFocus } | null>(null);
+  const [resumed, setResumed] = useState(false);
+  const focusRef = useRef(focus);
+  const pickRef = useRef<HTMLButtonElement>(null);
+  const attestRef = useRef<HTMLInputElement>(null);
   const errorRef = useRef<HTMLDivElement>(null);
   const linkRef = useRef<HTMLInputElement>(null);
   const consentRef = useRef<HTMLFieldSetElement>(null);
@@ -97,6 +121,7 @@ export function AutopilotIntake({ restoring, onStarted }: { restoring: boolean; 
         }
         setConnectNotice(target.notice);
         await loadMedia(businessId);
+        if (!stopped && focusRef.current) { setResumed(true); setFocusRequest({ focus: focusRef.current }); }
       } catch { if (!stopped) setError("We couldn’t restore your draft after connecting. Paste your link again to continue."); }
       finally { if (!stopped) stripReturnParams(); }
     })();
@@ -104,6 +129,14 @@ export function AutopilotIntake({ restoring, onStarted }: { restoring: boolean; 
   }, [loadMedia]);
 
   useEffect(() => () => { for (const item of queueRef.current) URL.revokeObjectURL(item.previewUrl); }, []);
+  // After a restore for "Add your photos" / "Connect": focus the dropzone, or the connection
+  // attestation when the connector is available (otherwise the dropzone).
+  useEffect(() => {
+    if (!focusRequest) return;
+    const target = (focusRequest.focus === "connect" ? attestRef.current : null) ?? pickRef.current;
+    target?.scrollIntoView({ block: "center", behavior: "smooth" });
+    target?.focus({ preventScroll: true });
+  }, [focusRequest]);
 
   function fail(cause: unknown) {
     setError(cause instanceof Error ? cause.message : "Something went wrong. Please try again.");
@@ -154,14 +187,17 @@ export function AutopilotIntake({ restoring, onStarted }: { restoring: boolean; 
     setConsentError(true); window.setTimeout(() => consentRef.current?.focus(), 0);
     throw new Error("Confirm the rights to your photos and videos before they upload.");
   }
-  async function uploadQueued(businessId: string, consent: PeopleVisible, signal: AbortSignal) {
-    const pending = queueRef.current.filter((item) => item.status !== "uploading" && !removedRef.current.has(item.id));
-    if (!pending.length) return;
-    setBusy("upload");
-    let unremoved = 0;
+  /** Uploads the queue; returns the library this intake now knows for the business (listed + uploaded). */
+  async function uploadQueued(businessId: string, consent: PeopleVisible, signal: AbortSignal): Promise<MediaLibrary> {
+    const sameBusiness = draft?.businessId === businessId;
     // Assets this library already lists, or that a kept file of this batch uploaded: never undone.
     // (Only when the listed library belongs to this business: a fresh draft starts empty.)
-    const kept = new Set(draft?.businessId === businessId ? (media?.assets ?? []).map((asset) => asset.id) : []);
+    const kept = new Set(sameBusiness ? (media?.assets ?? []).map((asset) => asset.id) : []);
+    const known = (): MediaLibrary => ({ assetIds: [...kept], connection: sameBusiness ? media?.connection ?? null : null });
+    const pending = queueRef.current.filter((item) => item.status !== "uploading" && !removedRef.current.has(item.id));
+    if (!pending.length) return known();
+    setBusy("upload");
+    let unremoved = 0;
     const { failures } = await uploadBatch(pending, signal, {
       isRemoved: (id) => removedRef.current.has(id),
       track: (id, controller) => { if (controller) uploadsRef.current.set(id, controller); else uploadsRef.current.delete(id); },
@@ -189,6 +225,7 @@ export function AutopilotIntake({ restoring, onStarted }: { restoring: boolean; 
     });
     if (unremoved) throw new Error(`${unremoved === 1 ? "A file you removed" : `${unremoved} files you removed`} had already uploaded and couldn’t be taken back out. Remove ${unremoved === 1 ? "it" : "them"} from your uploaded files before running.`);
     if (failures) throw new Error(`${failures} file${failures === 1 ? "" : "s"} didn’t upload. Try again, or remove ${failures === 1 ? "it" : "them"} to continue without.`);
+    return known();
   }
   function cancelUpload() { batchRef.current?.abort(); }
   /** One controller per Run/Connect action: cancelling or leaving stops the uploads and the step after them. */
@@ -212,11 +249,11 @@ export function AutopilotIntake({ restoring, onStarted }: { restoring: boolean; 
       const url = validLink();
       const consent = consentReady();
       const businessId = await ensureDraft(url);
-      await uploadQueued(businessId, consent, signal);
+      const local = await uploadQueued(businessId, consent, signal);
       // Cancelled, or the owner left the intake: never start a run they walked away from.
       if (signal.aborted || !mountedRef.current) throw new UploadCancelledError();
       setBusy("start");
-      const { run: started } = await startAutopilotRun(businessId);
+      const { run: started } = await startAutopilotRun(businessId, await currentMediaRevision(businessId, local));
       writeStoredDraft(null);
       if (mountedRef.current) onStarted(started);
     } catch (cause) { settle(cause); }
@@ -251,6 +288,8 @@ export function AutopilotIntake({ restoring, onStarted }: { restoring: boolean; 
 
   const LinkIcon = normalized.ok ? linkIcons[normalized.kind] : Search;
   const connectHidden = connectNotice === "not_configured" || mediaStatus === "unavailable" || connection?.status === "not_configured";
+  // Offered only when the connector is set up and the account isn't already connected.
+  const connectOffered = !connectHidden && (connection?.status === "disconnected" || connection?.status === "expired");
   const actionLabel = busy === "draft" ? "Saving your link…" : busy === "upload" ? "Uploading your files…" : busy === "start" ? "Starting Autopilot…" : busy === "connect" ? "Opening Meta login…" : "Run Autopilot";
 
   return <div className="ap-intake">
@@ -279,9 +318,10 @@ export function AutopilotIntake({ restoring, onStarted }: { restoring: boolean; 
         <textarea id={`${ids}-goal`} rows={2} maxLength={600} value={goalText} onChange={(event) => setGoalText(event.target.value)} placeholder={goalId ? "Anything specific? e.g. our new pistachio croissant, weekday mornings" : "Or say it in your own words — e.g. get more people in for weekday breakfast"} />
       </fieldset>
 
+      {resumed && <p className="ap-hint is-success" role="status">Your link and goal are just as before. Add photos you own{connectOffered ? " or connect Instagram / Facebook" : ""}, then press Run Autopilot again.</p>}
       {media?.mediaError && <p className="ap-hint is-warning" role="status">{media.mediaError}</p>}
       <div className="ap-extras">
-        <MediaDropzone queue={queue} uploaded={media?.assets ?? []} rejected={rejected} disabled={disabled} rights={rights} people={people} consentError={consentError} consentRef={consentRef}
+        <MediaDropzone pickRef={pickRef} queue={queue} uploaded={media?.assets ?? []} rejected={rejected} disabled={disabled} rights={rights} people={people} consentError={consentError} consentRef={consentRef}
           onAdd={addFiles} onRemoveQueued={removeQueued} onRemoveUploaded={(assetId) => void removeUploaded(assetId)} onRights={(value) => { setRights(value); if (value && people) setConsentError(false); }} onPeople={(value) => { setPeople(value); if (rights) setConsentError(false); }} />
         <section className="ap-connect" aria-labelledby={`${ids}-connect`}>
           <div className="ap-card-heading"><span className="ap-card-icon" aria-hidden="true"><PlugZap size={18} strokeWidth={1.7} /></span><div><h2 id={`${ids}-connect`}>Connect Instagram / Facebook <span className="ap-optional">Optional</span></h2><p>Let Autopilot use the photos and videos you’ve already posted.</p></div></div>
@@ -292,7 +332,7 @@ export function AutopilotIntake({ restoring, onStarted }: { restoring: boolean; 
           </div> : connectHidden ? <p className="ap-hint">Account connection isn’t set up on this Tickr install. Autopilot will use your website and any files you add.</p> : <>
             {connection?.status === "expired" && <p className="ap-hint is-warning">Your connection expired. Reconnect to include recent posts.</p>}
             {connectNotice === "error" && <p className="ap-hint is-warning" role="status">The connection didn’t complete. You can try again or continue without it.</p>}
-            <label className="ap-check"><input type="checkbox" checked={attest} disabled={disabled} onChange={(event) => setAttest(event.target.checked)} /><span>I own or license the media on these accounts, and people shown have agreed to appear in my business’s marketing.</span></label>
+            <label className="ap-check"><input ref={attestRef} type="checkbox" checked={attest} disabled={disabled} onChange={(event) => setAttest(event.target.checked)} /><span>I own or license the media on these accounts, and people shown have agreed to appear in my business’s marketing.</span></label>
             <button type="button" className="button button-secondary ap-connect-button" disabled={disabled || !attest} onClick={() => void connect()}>{busy === "connect" ? <LoaderCircle size={15} className="spin" /> : <Link2 size={15} />}{connection?.status === "expired" ? "Reconnect with Meta" : "Connect with Meta"}</button>
             <p className="ap-help">You’ll sign in on Meta. Tickr only reads your media; it never posts.</p>
           </>}

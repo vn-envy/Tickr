@@ -1,5 +1,6 @@
 import type { CampaignKit, RunEvent, RunView } from "@/lib/research/contracts";
 import type { AutopilotPublicState } from "@/lib/autopilot/public-state";
+import { DEFAULT_CAMPAIGN_GOAL } from "@/lib/businesses/input";
 
 /**
  * Pure, browser-safe view logic for the one-shot Autopilot experience. Nothing here reads
@@ -107,6 +108,106 @@ export function resolveOAuthReturn(search: string, storedDraftBusinessId: string
   if (isUuid(business)) return { businessId: business, fromDraft: stored === business, notice: connected === "error" ? "error" : connected === "meta" ? "returned" : null };
   // No verified business: an unverified "connected=meta" is not trusted as success.
   return { businessId: stored, fromDraft: stored !== null, notice: connected === null ? null : "error" };
+}
+
+/* ---------- Owner media: re-run revision, no-real-media fallback ---------- */
+
+export type MediaRevisionConnection = { status: string; accountName?: string | null; instagramUsername?: string | null; pageName?: string | null };
+/**
+ * Canonical text the media revision hashes: the sorted, de-duplicated owner asset ids plus the
+ * connection's status and identity. Order-independent, so the same library always gives the same text.
+ */
+export function mediaRevisionInput(assetIds: readonly string[], connection: MediaRevisionConnection | null): string {
+  const ids = [...new Set(assetIds)].sort();
+  const account = connection ? [connection.status, connection.accountName ?? "", connection.instagramUsername ?? "", connection.pageName ?? ""] : ["unknown", "", "", ""];
+  return JSON.stringify({ v: 1, assets: ids, connection: account });
+}
+
+type Digest = (algorithm: "SHA-256", data: Uint8Array<ArrayBuffer>) => Promise<ArrayBuffer>;
+/** 64-bit FNV-1a, hex: only for a browser without Web Crypto (an insecure, non-localhost origin). Not a security digest. */
+export function fnv1a64(data: Uint8Array): string {
+  let hash = 0xcbf29ce484222325n;
+  for (const byte of data) hash = ((hash ^ BigInt(byte)) * 0x100000001b3n) & 0xffffffffffffffffn;
+  return hash.toString(16).padStart(16, "0");
+}
+/**
+ * The run input's mediaRevision: SHA-256 (hex) of mediaRevisionInput. New uploads or a new connection
+ * yield a new value (so Autopilot starts a new run); an unchanged library yields the same one (so a
+ * plain retry still reuses its run). It is a de-duplication key, not a security boundary. `digest`
+ * defaults to Web Crypto; without it (insecure origins) a 64-bit FNV-1a value keeps the same behaviour.
+ */
+export async function deriveMediaRevision(assetIds: readonly string[], connection: MediaRevisionConnection | null, digest?: Digest | null): Promise<string> {
+  const data = new TextEncoder().encode(mediaRevisionInput(assetIds, connection));
+  const subtle = digest === undefined ? globalThis.crypto?.subtle : null;
+  const run = digest ?? (subtle ? (algorithm: "SHA-256", bytes: Uint8Array<ArrayBuffer>) => subtle.digest(algorithm, bytes) : null);
+  if (!run) return fnv1a64(data);
+  return Array.from(new Uint8Array(await run("SHA-256", data)), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/** `connected`: a Meta account was connected for this run (so the copy must not claim there was none). */
+export type MediaLibrary = { assetIds: readonly string[]; connection: MediaRevisionConnection | null };
+/**
+ * Which library the run's mediaRevision is derived from: the server's (authoritative, what the worker
+ * harvests) when it could be read; otherwise the library this intake knows locally (e.g. files it just
+ * uploaded), so a re-run after adding photos still starts a new run. Null only when neither is known,
+ * and the run then de-duplicates as it did before revisions existed.
+ */
+export function mediaRevisionSource(server: { assets: readonly { id: string }[]; connection: MediaRevisionConnection; mediaError?: string } | null, local: MediaLibrary | null): MediaLibrary | null {
+  if (server && !server.mediaError) return { assetIds: server.assets.map((asset) => asset.id), connection: server.connection };
+  if (local && local.assetIds.length > 0) return local;
+  return null;
+}
+
+export type NoRealMedia = { reason: "none_gathered" | "none_usable" | "illustration"; connected: boolean };
+/**
+ * Whether Autopilot ended up without any real photos or videos of the business: nothing was gathered
+ * from the website, uploads or connected accounts once harvesting finished, or the plan fell back to
+ * an illustration. Returns null while that isn't known yet (no state, still harvesting, or a run that
+ * stopped before harvesting) and whenever real media was used.
+ */
+export function noRealMedia(state: Pick<AutopilotPublicState, "phase" | "sources" | "plan"> | null, quality?: { reelMode: string } | null): NoRealMedia | null {
+  const counts = state?.sources;
+  const gathered = counts ? counts.officialWebsite + counts.ownerUploads + counts.ownerInstagram + counts.ownerFacebook : null;
+  const harvested = Boolean(state && state.phase !== "harvest" && state.phase !== "failed");
+  const connected = Boolean(counts?.connected);
+  if (harvested && gathered === 0) return { reason: "none_gathered", connected };
+  if (state?.plan?.reelMode === "illustration" || (!state && quality?.reelMode === "illustration")) return { reason: gathered === null ? "illustration" : gathered === 0 ? "none_gathered" : "none_usable", connected };
+  return null;
+}
+
+export type IntakeFocus = "media" | "connect";
+export type RestoreDraft = { businessId: string; url: string; goal: string; link: string; goalId: GoalId | null; goalText: string };
+/** The persisted business row (GET /api/businesses/:id): the link and goal exactly as the owner submitted them. */
+export type SavedBusiness = { website: string | null; goal: string };
+/**
+ * Where "Add your photos" / "Connect Instagram / Facebook" sends the owner: the intake draft for the
+ * same business, link and goal (the shape the intake keeps in sessionStorage), so their uploads attach
+ * to this business and Run Autopilot reuses it. `saved` must be the persisted business row, not
+ * RunView.business: discovery replaces the run's website with the official site it matched, whereas
+ * the row keeps the link the owner pasted (often a Maps or Instagram link) — the snapshot the run input
+ * hashes. The goal is stored exactly as the intake composes it, so the restored draft is not mistaken
+ * for a changed one. Null when the business has no usable link.
+ */
+export function restoreTarget(businessId: string, saved: SavedBusiness): RestoreDraft | null {
+  if (!isUuid(businessId)) return null;
+  const link = saved.website ?? "";
+  const normalized = normalizeBusinessLink(link);
+  if (!normalized.ok) return null;
+  return restoreGoal(businessId, normalized.url, link, saved.goal === DEFAULT_CAMPAIGN_GOAL ? "" : saved.goal);
+}
+function restoreGoal(businessId: string, url: string, link: string, saved: string): RestoreDraft {
+  // A goal composed from a chip comes back as that chip (plus any extra words); anything else as free text.
+  for (const preset of GOALS) {
+    const goalText = saved === preset.goal ? "" : saved.startsWith(`${preset.goal} `) ? saved.slice(preset.goal.length + 1) : null;
+    if (goalText !== null && composeGoal(preset.id, goalText) === saved) return { businessId, url, goal: saved, link, goalId: preset.id, goalText };
+  }
+  return { businessId, url, goal: composeGoal(null, saved), link, goalId: null, goalText: saved };
+}
+/** The intake URL that restores a saved draft (the same marker the Meta OAuth return uses). */
+export function restoreSearch(search: string, businessId: string): string {
+  const params = new URLSearchParams(search);
+  params.delete("run"); params.delete("connected"); params.set("business", businessId);
+  return `?${params.toString()}`;
 }
 
 /* ---------- Director's room: phases, log, media ---------- */

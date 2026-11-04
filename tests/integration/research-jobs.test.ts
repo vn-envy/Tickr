@@ -218,6 +218,19 @@ test("identical research input reuses one run and a lease cannot be claimed twic
   await expect(store.markStage(first.id, "worker-b", "researching", "Wrong owner")).rejects.toThrow("no longer owns");
 });
 
+test("a changed owner-media revision starts a new run while an unchanged retry still reuses it", async () => {
+  const withMedia = { ...input, autopilot: true, mediaRevision: "a".repeat(64) };
+  const first = await store.enqueueResearch(businessId, withMedia);
+  const retry = await store.enqueueResearch(businessId, { ...withMedia });
+  expect(retry.id).toBe(first.id);
+  const changed = await store.enqueueResearch(businessId, { ...withMedia, mediaRevision: "b".repeat(64) });
+  expect(changed.id).not.toBe(first.id);
+  const without = await store.enqueueResearch(businessId, { ...input, autopilot: true });
+  expect(new Set([first.id, changed.id, without.id]).size).toBe(3);
+  expect(await client.run.count()).toBe(3);
+  await expect(store.enqueueResearch(businessId, { ...withMedia, mediaRevision: "NOT-HEX" })).rejects.toThrow();
+});
+
 test("campaign selection is run-scoped and finished research is reused without a second analysis", async () => {
   const dep = dependencies();
   const run = await store.enqueueResearch(businessId, input);

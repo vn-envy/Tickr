@@ -28,7 +28,8 @@ export const getBusiness = (id: string) => requestJson<{ business: { id: string;
 export const getBusinessMedia = (id: string) => requestJson<BusinessMedia>(`/api/businesses/${encodeURIComponent(id)}/media`);
 export const deleteBusinessMedia = (id: string, assetId: string) => requestJson<{ ok: true }>(`/api/businesses/${encodeURIComponent(id)}/media/${encodeURIComponent(assetId)}`, { method: "DELETE" });
 export const disconnectMeta = (id: string) => requestJson<{ ok: true }>(`/api/businesses/${encodeURIComponent(id)}/connection`, { method: "DELETE" });
-export const startAutopilotRun = (businessId: string) => postJson<{ run: RunView }>(`/api/businesses/${encodeURIComponent(businessId)}/runs`, { mode: "live", readWebsite: true, sources: [], discoverFromLink: true, enrichFromLink: true, autopilot: true });
+/** mediaRevision (see model.deriveMediaRevision) makes new uploads or a new connection start a new run instead of reusing the last one. */
+export const startAutopilotRun = (businessId: string, mediaRevision?: string | null) => postJson<{ run: RunView }>(`/api/businesses/${encodeURIComponent(businessId)}/runs`, { mode: "live", readWebsite: true, sources: [], discoverFromLink: true, enrichFromLink: true, autopilot: true, ...(mediaRevision ? { mediaRevision } : {}) });
 export const getRun = (id: string) => requestJson<{ run: RunView }>(`/api/runs/${encodeURIComponent(id)}`);
 export const getAutopilotState = (id: string) => requestJson<{ state: AutopilotPublicState | null }>(`/api/runs/${encodeURIComponent(id)}/autopilot`);
 export const retryRun = (id: string) => postJson<{ run: RunView }>(`/api/runs/${encodeURIComponent(id)}/retry`, {});
