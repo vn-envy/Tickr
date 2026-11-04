@@ -242,6 +242,31 @@ describe("official gallery harvest", () => {
     expect(result.status).toBe("partial");
   });
 
+  test("acquires site-builder photos whose srcset URLs contain commas (Zyro/Cloudflare image resizing)", async () => {
+    const ZYRO = "https://assets.zyrosite.com";
+    const resized = (n: number, width: number) => `${ZYRO}/cdn-cgi/image/format=auto,w=${width},fit=crop/AwvJ8Xv2kGsVqxEL/photo-${n}-Yk2bQx.JPG`;
+    const widths = [375, 768, 1024, 1440];
+    const html = Array.from({ length: 3 }, (_, n) => `<img alt="Synthetic plate ${n}" src="${resized(n, 1024)}" srcset="${widths.map((width) => `${resized(n, width)} ${width}w`).join(",")}">`).join("")
+      + `<img src="${ZYRO}/cdn-cgi/image/w=375/https://attacker.example/x.jpg" alt="Resizer pointed elsewhere">`;
+    const requests: string[] = [];
+    const result = await collectOfficialGallery({ officialWebsite: `${SITE}/`, outputDir: await directory() }, {
+      transport: async (url) => {
+        requests.push(url.href);
+        if (url.pathname === "/robots.txt") return response("", "text/plain", 404);
+        if (url.href === `${SITE}/`) return response(html);
+        if (url.origin !== ZYRO) return response("missing", "text/plain", 404);
+        const [, width, n] = /w=(\d+),fit=crop\/AwvJ8Xv2kGsVqxEL\/photo-(\d+)-/.exec(url.pathname)!.map(Number);
+        return response(await jpeg(700 + n, width, Math.round(width * 0.75)), "image/jpeg");
+      },
+    });
+    expect(result.assets).toHaveLength(3);
+    // The widest rendition of each picture is fetched whole: no comma fragments resolved against the page origin.
+    expect(result.assets.map((asset) => asset.sourceUrl).sort()).toEqual([0, 1, 2].map((n) => resized(n, 1440)));
+    expect(requests.filter((href) => href.startsWith(SITE) && !href.endsWith("/robots.txt") && href !== `${SITE}/`)).toEqual([]);
+    expect(requests.some((href) => href.includes("attacker.example"))).toBe(false);
+    expect(result.status).toBe("partial");
+  });
+
   test("gives image downloads fresh readers bounded by the remaining gallery budget", async () => {
     const pages = `<a href="/gallery">Gallery</a><a href="/menu">Menu</a>`;
     const homeImages = Array.from({ length: 6 }, (_, n) => `<img src="/img/home-${n}.jpg" alt="Synthetic home ${n}">`).join("");

@@ -289,6 +289,10 @@ export async function runNextJob(options: { store?: JobStore; dependencies?: Wor
       message = "The campaign copy request budget for this run is already used and no saved copy is available, so the run cannot continue without another paid request. Retry is withheld.";
       retrySafe = false;
     }
+    if (error instanceof CampaignCopyValidationError && error.usage) {
+      // The completed response was paid for even though its copy did not validate; meter it once.
+      await store.recordCompletedCopyUsage(id, owner, error.usage).catch(() => { /* Accounting never changes the failure outcome. */ });
+    }
     if (error instanceof CampaignCopyValidationError && renderInput && dependencies) {
       try {
         if (await dependencies.hasBoundCompletedCopy(renderInput)) {

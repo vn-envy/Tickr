@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { z } from "zod";
-import { ModelUsageSchema } from "../research/contracts";
+import { ModelUsageSchema, type ModelUsage } from "../research/contracts";
 import { hashBytes, safeOutputPath } from "./archive";
 
 export const CompletedCopyResponseSchema = z.object({
@@ -14,9 +14,12 @@ const recordSchema = z.object({ inputHash: z.string().regex(/^[a-f0-9]{64}$/), r
 export class CampaignCopyValidationError extends Error {
   readonly retrySafe = true;
   readonly completedResponseStored = true;
-  constructor() {
+  /** Metering of the completed (paid) response, so a run that stops on validation still accounts for it. */
+  readonly usage: ModelUsage | null;
+  constructor(usage: ModelUsage | null = null) {
     super("Meta completed the campaign response, but validation did not pass. The input-bound response is saved; a local validation retry will not request paid copy again.");
     this.name = "CampaignCopyValidationError";
+    this.usage = usage;
   }
 }
 

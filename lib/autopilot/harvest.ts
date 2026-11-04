@@ -155,14 +155,20 @@ async function exists(path: string): Promise<boolean> {
 }
 
 /**
- * Owner-facing note for a gallery that yielded no photos. A site Tickr could not reach (or whose
- * images could not be downloaded) is a media-access limitation, never "the website has no photos".
+ * Owner-facing note for a gallery that yielded no photos. A site Tickr could not reach, or whose
+ * photos could not be downloaded, is a media-access limitation, never "the website has no photos";
+ * and a site whose pages were read is never described as unreadable.
  */
+export const GALLERY_NOTE_UNREADABLE = "Tickr could not read the official website this time; no website photos were used.";
+export const GALLERY_NOTE_DOWNLOADS_FAILED = "Tickr read your website, but its photos could not be downloaded (for example the image host blocks automated access); no website photos were used.";
+export const GALLERY_NOTE_NO_PHOTOS = "The official website offered no usable photos.";
+
 export function emptyGalleryNote(gallery: Pick<OfficialGalleryResult, "status" | "assets" | "pagesRead" | "skipped">): string | null {
   if (gallery.assets.length) return null;
-  // No page read at all, or every photo download failed: the site was not readable this time.
-  const unreadable = !gallery.pagesRead.length || (gallery.status !== "no_candidates" && gallery.skipped.some((item) => item.reason === "fetch_failed"));
-  return unreadable ? "Tickr could not read the official website this time; no website photos were used." : "The official website offered no usable photos.";
+  if (!gallery.pagesRead.length) return GALLERY_NOTE_UNREADABLE;
+  // Pages were read but photo downloads failed or were blocked (robots, HTTP errors, lost connection).
+  const downloadsFailed = gallery.status !== "no_candidates" && gallery.skipped.some((item) => item.reason === "fetch_failed");
+  return downloadsFailed ? GALLERY_NOTE_DOWNLOADS_FAILED : GALLERY_NOTE_NO_PHOTOS;
 }
 
 /** Default dependencies: the worker's real business library, official gallery reader and Meta Graph connection. */

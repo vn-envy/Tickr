@@ -14,6 +14,12 @@ const STATIC_IMAGE_RULES: ReadonlyArray<{ origin: string; path: RegExp }> = [
   { origin: "https://static.wixstatic.com", path: /^\/media\// },
   // Shopify storefront files and product images.
   { origin: "https://cdn.shopify.com", path: /^\/s\/files\// },
+  // Zyro / Hostinger Website Builder site uploads: /<site id>/<file> or the same upload behind
+  // Cloudflare image resizing, /cdn-cgi/image/<options>/<site id>/<file>. The resizing options
+  // segment is restricted to plain option syntax and the source must be a relative site upload
+  // (never an absolute or nested URL, nor an encoded separator), so the resizer cannot be pointed
+  // at another origin.
+  { origin: "https://assets.zyrosite.com", path: /^(?!.*%(?:2f|5c))\/(?:cdn-cgi\/image\/(?=[^/]*=)[a-z0-9=,._-]{1,200}\/)?[A-Za-z0-9]{8,40}\/[A-Za-z0-9][A-Za-z0-9._~%()-]{0,200}\.(?:jpe?g|png|webp)$/i },
 ];
 
 export function isApprovedStaticCdnAsset(url: URL): boolean {

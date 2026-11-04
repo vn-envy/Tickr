@@ -4,7 +4,7 @@ import { join } from "node:path";
 import sharp from "sharp";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import {
-  collectOfficialMedia, extractOfficialMediaCandidates, MAX_IMAGE_DOWNLOAD_BYTES,
+  collectOfficialMedia, extractOfficialGalleryReferences, extractOfficialMediaCandidates, MAX_IMAGE_DOWNLOAD_BYTES, parseSrcset,
   createOfficialMediaReader, normalizeOfficialImage, publicMediaMetadata,
   type MediaTransport, type RawMediaResponse,
 } from "../../lib/media";
@@ -67,6 +67,85 @@ describe("official-page media extraction", () => {
     const candidates = extractOfficialMediaCandidates(page, PAGE, { preferredProduct: "Blueberry Cheesecake Jar" });
     expect(candidates).toHaveLength(24);
     expect(candidates[0]).toMatchObject({ label: "Blueberry Cheesecake Jar", eligible: false, exclusionReason: "cross_origin" });
+  });
+});
+
+describe("srcset parsing (HTML Standard algorithm)", () => {
+  const ZYRO = "https://assets.zyrosite.com/cdn-cgi/image";
+  test("keeps commas inside URLs (CDN image-resizing options) as part of the URL", () => {
+    const srcset = `${ZYRO}/format=auto,w=375,fit=crop/AwvJ8Xv2kGsVqxEL/img_1234.JPG 375w,${ZYRO}/format=auto,w=768,fit=crop/AwvJ8Xv2kGsVqxEL/img_1234.JPG 768w, ${ZYRO}/format=auto,w=1440,fit=crop/AwvJ8Xv2kGsVqxEL/img_1234.JPG 1440w`;
+    expect(parseSrcset(srcset)).toEqual([
+      { url: `${ZYRO}/format=auto,w=375,fit=crop/AwvJ8Xv2kGsVqxEL/img_1234.JPG`, width: 375, density: 1 },
+      { url: `${ZYRO}/format=auto,w=768,fit=crop/AwvJ8Xv2kGsVqxEL/img_1234.JPG`, width: 768, density: 1 },
+      { url: `${ZYRO}/format=auto,w=1440,fit=crop/AwvJ8Xv2kGsVqxEL/img_1234.JPG`, width: 1440, density: 1 },
+    ]);
+  });
+
+  test("reads w and x descriptors, bare URLs and trailing-comma URLs", () => {
+    expect(parseSrcset("/a.jpg 1x, /a@2x.jpg 2x,/b.jpg, /c.jpg 1.5x,\n\t/d.jpg   640w ,  /e.jpg,, /f.jpg")).toEqual([
+      { url: "/a.jpg", width: 0, density: 1 }, { url: "/a@2x.jpg", width: 0, density: 2 },
+      { url: "/b.jpg", width: 0, density: 1 }, { url: "/c.jpg", width: 0, density: 1.5 }, { url: "/d.jpg", width: 640, density: 1 },
+      { url: "/e.jpg", width: 0, density: 1 }, { url: "/f.jpg", width: 0, density: 1 },
+    ]);
+    // As in browsers, a URL is a run of non-whitespace: an inner comma with no space stays in the URL.
+    expect(parseSrcset("/b.jpg,/c.jpg 1.5x")).toEqual([{ url: "/b.jpg,/c.jpg", width: 0, density: 1.5 }]);
+    expect(parseSrcset("/a.jpg 800w 600h, /b.jpg")).toEqual([{ url: "/a.jpg", width: 800, density: 1 }, { url: "/b.jpg", width: 0, density: 1 }]);
+  });
+
+  test("ignores data:/blob: URLs and drops candidates with malformed descriptors", () => {
+    expect(parseSrcset("data:image/png;base64,iVBORw0KGgo= 1x, /real.jpg 2x, blob:https://x.example/1 3x")).toEqual([{ url: "/real.jpg", width: 0, density: 2 }]);
+    expect(parseSrcset("/a.jpg 100w 2x, /b.jpg 0w, /c.jpg -1x, /d.jpg 300q, /e.jpg 100w 200w, /f.jpg 600h, /g.jpg foo(1, 2) 1x, /ok.jpg 500w")).toEqual([{ url: "/ok.jpg", width: 500, density: 1 }]);
+    expect(parseSrcset("")).toEqual([]);
+    expect(parseSrcset(undefined)).toEqual([]);
+    expect(parseSrcset(" , ,, ")).toEqual([]);
+  });
+
+  test("bounds the input and the number of candidates", () => {
+    expect(parseSrcset(Array.from({ length: 40 }, (_, n) => `/p-${n}.jpg ${n + 1}w`).join(", "))).toHaveLength(16);
+    // A candidate cut off by the input bound is never returned as a (partial) URL.
+    const long = `/keep.jpg 100w, /${"x".repeat(20_000)}.jpg 200w`;
+    expect(parseSrcset(long)).toEqual([{ url: "/keep.jpg", width: 100, density: 1 }]);
+  });
+
+  test("the standard extractor records whole comma-bearing srcset URLs, never fragments", () => {
+    const srcset = [375, 768, 1024, 1440, 1920, 2880].map((width) => `${ZYRO}/format=auto,w=${width},fit=crop/AwvJ8Xv2kGsVqxEL/img_1234.JPG ${width}w`).join(",");
+    const candidates = extractOfficialMediaCandidates(`<img alt="Pancakes" src="${ZYRO}/format=auto,w=1440,fit=crop/AwvJ8Xv2kGsVqxEL/img_1234.JPG" srcset="${srcset}">`, "https://synthetic-diner.example.com/");
+    const urls = candidates.map((item) => item.imageUrl);
+    expect(urls).toContain(`${ZYRO}/format=auto,w=1920,fit=crop/AwvJ8Xv2kGsVqxEL/img_1234.JPG`);
+    expect(urls.every((url) => url.startsWith(`${ZYRO}/format=auto,w=`))).toBe(true);
+    expect(urls.some((url) => /fit=crop\/AwvJ/.test(url) && url.startsWith("https://synthetic-diner.example.com/"))).toBe(false);
+    expect(candidates.every((item) => item.eligible)).toBe(true);
+  });
+
+  test("a page of many site-builder pictures keeps every picture's preferred rendition reader-referenced", () => {
+    const resized = (n: number, width: number) => `${ZYRO}/format=auto,w=${width},fit=crop/AwvJ8Xv2kGsVqxEL/photo-${n}.JPG`;
+    const widths = [375, 768, 1024, 1440, 1920, 2880];
+    const html = Array.from({ length: 20 }, (_, n) => `<img alt="Synthetic plate ${n}" src="${resized(n, 1024)}" srcset="${widths.map((width) => `${resized(n, width)} ${width}w`).join(",")}">`).join("");
+    const page = "https://synthetic-diner.example.com/";
+    const candidates = extractOfficialMediaCandidates(html, page);
+    expect(candidates).toHaveLength(24);
+    const urls = new Set(candidates.map((item) => item.imageUrl));
+    // Breadth first: the preferred (widest <= 2000 px) rendition of all 20 pictures precedes any fallback.
+    for (let n = 0; n < 20; n++) expect(urls.has(resized(n, 1920))).toBe(true);
+    expect(candidates.slice(0, 20).map((item) => item.imageUrl)).toEqual(Array.from({ length: 20 }, (_, n) => resized(n, 1920)));
+    const references = extractOfficialGalleryReferences(html, page, { max: 20 });
+    expect(references).toHaveLength(20);
+    expect(references.every((reference) => reference.candidate.eligible)).toBe(true);
+    expect(references.map((reference) => reference.candidate.imageUrl)).toEqual(Array.from({ length: 20 }, (_, n) => resized(n, 1920)));
+  });
+
+  test("lazy data-srcset renditions are references too, in the gallery's preference order", () => {
+    const html = `<img alt="Lazy" src="/img/placeholder.jpg" data-srcset="${ZYRO}/format=auto,w=640,fit=crop/AwvJ8Xv2kGsVqxEL/lazy.JPG 640w, ${ZYRO}/format=auto,w=1280,fit=crop/AwvJ8Xv2kGsVqxEL/lazy.JPG 1280w">`;
+    const page = "https://synthetic-diner.example.com/";
+    const candidates = extractOfficialMediaCandidates(html, page);
+    expect(candidates.map((item) => item.imageUrl)).toEqual([
+      `${ZYRO}/format=auto,w=1280,fit=crop/AwvJ8Xv2kGsVqxEL/lazy.JPG`,
+      `${ZYRO}/format=auto,w=640,fit=crop/AwvJ8Xv2kGsVqxEL/lazy.JPG`,
+      `${page}img/placeholder.jpg`,
+    ]);
+    const [reference] = extractOfficialGalleryReferences(html, page);
+    expect(reference.candidate.imageUrl).toBe(`${ZYRO}/format=auto,w=1280,fit=crop/AwvJ8Xv2kGsVqxEL/lazy.JPG`);
+    expect(reference.alternates.map((item) => item.imageUrl)).toEqual([`${ZYRO}/format=auto,w=640,fit=crop/AwvJ8Xv2kGsVqxEL/lazy.JPG`, `${page}img/placeholder.jpg`]);
   });
 });
 

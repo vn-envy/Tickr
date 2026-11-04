@@ -9,7 +9,7 @@ import { critiqueCampaign, type CritiqueReport } from "../../lib/agents/critic";
 import type { renderStillDepthReel } from "../../lib/campaign/cinema/still-depth";
 import type { renderTrackedReel } from "../../lib/campaign/cinema/tracked";
 import type { CampaignCopy } from "../../lib/campaign/copy";
-import { prepareCampaignVisual } from "../../lib/campaign/visual";
+import { illustrationSubjectPhrase, prepareCampaignVisual } from "../../lib/campaign/visual";
 import type { CampaignCopyResult, CreateCampaignInput } from "../../lib/campaign/index";
 import type { NormalizedClip, OwnerMediaConsent } from "../../lib/media/cinema-types";
 import type { OfficialGalleryResult } from "../../lib/media/gallery";
@@ -526,38 +526,41 @@ describe("Autopilot production pipeline", () => {
     expect(result.additionalUsage.map((usage) => usage.model)).toContain("muse-image-1.0");
     expect((await h.budget.counts()).muse_image).toBe(1);
     expect((await readPublicState(h.input.outputDir))?.plan).toMatchObject({ heroAssetId: null, reelMode: "illustration" });
-    // SAM 3.1 concept-segments the labelled illustration (the brief's offering as the phrase), and the
-    // Reel is its depth Reel, still labelled an illustrative image, not the flat legacy slideshow.
-    expect(h.calls.samImage).toBe(1);
-    expect((await h.budget.counts()).sam_image).toBe(1);
+    // Spark points, SAM cuts: Muse Spark locates the illustration's subject, SAM 3.1 box-segments it,
+    // and the Reel is its depth Reel, still labelled an illustrative image, not the flat legacy slideshow.
+    expect(h.calls).toMatchObject({ media: 1, samImage: 1 });
+    expect(await h.budget.counts()).toMatchObject({ spark_media: 1, sam_image: 1 });
     expect(h.segmentRequests).toHaveLength(1);
-    expect(h.segmentRequests[0]).toMatchObject({ prompt: "Flat white", sourceAssetId: ILLUSTRATION_ASSET_ID, sourceProvenance: "meta_illustration" });
-    expect(h.segmentRequests[0].geometry).toBeUndefined();
+    expect(h.segmentRequests[0]).toMatchObject({ sourceAssetId: ILLUSTRATION_ASSET_ID, sourceProvenance: "meta_illustration" });
+    expect(h.segmentRequests[0].prompt).toBeUndefined();
+    expect(h.segmentRequests[0].geometry?.[0]).toMatchObject({ label: "synthetic cup", origin: "spark_grounding" });
     const illustrated = JSON.parse(await kitFile(h.input.outputDir, "director-report.json")) as { reel: { mode: string; provenanceLabel: string; ledger: unknown } };
     expect(illustrated.reel).toMatchObject({ mode: "illustration", provenanceLabel: ILLUSTRATION_REEL_LABEL });
     expect(illustrated.reel.ledger).not.toBeNull();
     const illustratedState = (await readPublicState(h.input.outputDir))!;
-    expect(illustratedState.sam).toEqual([expect.objectContaining({ assetId: ILLUSTRATION_ASSET_ID, media: "image", promptKind: "concept", origin: "concept_prompt", status: "segmented", preview: `mask-${ILLUSTRATION_ASSET_ID}.png` })]);
+    expect(illustratedState.sam).toEqual([expect.objectContaining({ assetId: ILLUSTRATION_ASSET_ID, media: "image", promptKind: "geometry", origin: "spark_grounding", label: "synthetic cup", status: "segmented", preview: `mask-${ILLUSTRATION_ASSET_ID}.png` })]);
     expect(await readPublicFile(h.input.outputDir, `mask-${ILLUSTRATION_ASSET_ID}.png`)).not.toBeNull();
     expect(result.campaign.assets.map((asset) => asset.filename)).toEqual(expect.arrayContaining(["instagram_reel.mp4", "instagram_reel_cover.png", `sam-mask-${ILLUSTRATION_ASSET_ID}.png`]));
     expect(result.campaign.reviewNotes.join(" ")).toMatch(/labelled AI illustration with a SAM 3\.1 cutout/);
-    // A second pass reuses the stored SAM selection and the saved depth Reel.
+    // A second pass reuses the stored analysis, SAM selection and the saved depth Reel.
     await produceAutopilotCampaign(h.input, h.deps);
-    expect(h.calls.samImage).toBe(1);
+    expect(h.calls).toMatchObject({ media: 1, samImage: 1 });
     expect(images).toBe(1);
 
-    // SAM finds nothing usable in the illustration: the legacy in-kit Reel remains, still labelled.
+    // SAM finds nothing usable in the illustration with any prompt (box, Spark's label, the brief's
+    // offering, each tried once): the legacy in-kit Reel remains, still labelled.
     const noMatch = await withIllustration(undefined, "illustration-no-match", (target) => {
       target.deps.segment = (request, dependencies) => segmentMetaImage(request, { ...dependencies, client: fakeClient(() => { target.calls.samImage++; target.segmentRequests.push(request); return samResponse(""); }) });
     });
     expect(images).toBe(2);
-    expect(noMatch.h.calls.samImage).toBe(1);
+    expect(noMatch.h.calls.samImage).toBe(3);
+    expect(noMatch.h.segmentRequests.map((request) => request.geometry ? "box" : request.prompt)).toEqual(["box", "synthetic cup", "Flat white"]);
     expect(noMatch.result.quality.reelMode).toBe("illustration");
     const fallback = JSON.parse(await kitFile(noMatch.h.input.outputDir, "director-report.json")) as { reel: { provenanceLabel: string | null } };
     expect(fallback.reel.provenanceLabel).toBeNull();
     expect(noMatch.result.campaign.assets.some((asset) => asset.filename === "instagram_reel.mp4")).toBe(true);
     expect(noMatch.result.quality.notes.join(" ")).toMatch(/the Reel uses composed crops of the illustration/);
-    expect((await readPublicState(noMatch.h.input.outputDir))!.sam).toEqual([expect.objectContaining({ assetId: ILLUSTRATION_ASSET_ID, status: "no_match", preview: null })]);
+    expect((await readPublicState(noMatch.h.input.outputDir))!.sam).toEqual(Array.from({ length: 3 }, () => expect.objectContaining({ assetId: ILLUSTRATION_ASSET_ID, status: "no_match", preview: null })));
 
     const typography = await withIllustration({ muse_image: 0 }, "typography");
     expect(images).toBe(2);
@@ -566,6 +569,121 @@ describe("Autopilot production pipeline", () => {
     expect(typography.h.calls.samImage).toBe(0);
     expect(typography.result.quality.notes.join(" ")).toMatch(/illustration budget/);
   }, 400_000);
+
+  test("the illustration's subject is located by Spark and cut by SAM, falling back once per step before the legacy Reel", async () => {
+    // A synthetic labelled illustration (plain colour field) from a fake Muse image call.
+    const illustrated = (h: Harness) => {
+      h.deps.prepareVisual = (input) => prepareCampaignVisual(input, { generateImage: async () => {
+        const bytes = await sharp({ create: { width: 1024, height: 1536, channels: 3, background: "#c8a26b" } }).png().toBuffer();
+        return { bytes, mimeType: "image/png", width: 1024, height: 1536, sha256: "0".repeat(64), model: "muse-image-1.0", endpoint: "/images/generations", createdAt: null, usage: { inputTokens: 5, outputTokens: 0, totalTokens: 5 },
+          provenance: { kind: "meta_generated_illustration", originalBusinessPhoto: false, referencePreservationVerified: false, referenceAssetIds: [], promptSha256: "0".repeat(64), implicitSearchEnabled: false, externalImageDownloads: false, requiresOwnerReview: true } };
+      } });
+    };
+    /** SAM matches only the prompts `matches` accepts ("box" for a geometry prompt, else the concept phrase). */
+    const samMatching = (h: Harness, matches: (prompt: string) => boolean) => {
+      h.deps.segment = (request, dependencies) => segmentMetaImage(request, { ...dependencies, client: fakeClient(() => {
+        h.calls.samImage++;
+        h.segmentRequests.push(request);
+        return matches(request.geometry ? "box" : request.prompt ?? "") ? samImageResponse(request) : samResponse("");
+      }) });
+    };
+    const prompts = (h: Harness) => h.segmentRequests.map((request) => request.geometry ? "box" : request.prompt);
+    const director = async (h: Harness) => JSON.parse(await kitFile(h.input.outputDir, "director-report.json")) as { reel: { mode: string; provenanceLabel: string | null }; segmentation: Array<{ status: string; origin: string; promptKind: string }> };
+
+    // The hosted repro: no named offering, so the old concept phrase ("main subject") matched nothing.
+    // Spark's located box is tried first and selects the subject: a depth Reel, labelled an illustration.
+    const located = await harness("illustration-located", {});
+    illustrated(located);
+    located.input.enrichment = undefined;
+    samMatching(located, (prompt) => prompt === "box");
+    const locatedResult = await produceAutopilotCampaign(located.input, located.deps);
+    expect(located.calls).toMatchObject({ media: 1, samImage: 1 });
+    expect(prompts(located)).toEqual(["box"]);
+    expect(locatedResult.quality.reelMode).toBe("illustration");
+    expect((await director(located)).reel).toMatchObject({ mode: "illustration", provenanceLabel: ILLUSTRATION_REEL_LABEL });
+    expect(locatedResult.campaign.assets.map((asset) => asset.filename)).toContain(`sam-mask-${ILLUSTRATION_ASSET_ID}.png`);
+    expect(await located.budget.counts()).toMatchObject({ spark_media: 1, sam_image: 1 });
+    expect(locatedResult.quality.notes.join(" ")).not.toMatch(/composed crops of the illustration/);
+
+    // Box no match: Spark's label as a concept prompt selects the subject.
+    const label = await harness("illustration-label", {});
+    illustrated(label);
+    samMatching(label, (prompt) => prompt === "synthetic cup");
+    const labelResult = await produceAutopilotCampaign(label.input, label.deps);
+    expect(prompts(label)).toEqual(["box", "synthetic cup"]);
+    expect(labelResult.quality.reelMode).toBe("illustration");
+    expect((await director(label)).reel.provenanceLabel).toBe(ILLUSTRATION_REEL_LABEL);
+    expect((await readPublicState(label.input.outputDir))!.sam).toEqual([
+      expect.objectContaining({ promptKind: "geometry", origin: "spark_grounding", status: "no_match", preview: null }),
+      expect.objectContaining({ promptKind: "concept", origin: "concept_prompt", label: "synthetic cup", status: "segmented", preview: `mask-${ILLUSTRATION_ASSET_ID}.png` }),
+    ]);
+    // A retry reuses every stored attempt: no paid request is repeated.
+    await produceAutopilotCampaign(label.input, label.deps);
+    expect(label.calls).toMatchObject({ media: 1, samImage: 2 });
+    expect(await label.budget.counts()).toMatchObject({ spark_media: 1, sam_image: 2 });
+
+    // Box and Spark's label miss: the illustration prompt's deterministic category subject selects it.
+    const category = await harness("illustration-category", {});
+    illustrated(category);
+    category.input.enrichment = undefined;
+    samMatching(category, (prompt) => prompt === "cafe item");
+    const categoryResult = await produceAutopilotCampaign(category.input, category.deps);
+    expect(prompts(category)).toEqual(["box", "synthetic cup", "cafe item"]);
+    expect(categoryResult.quality.reelMode).toBe("illustration");
+    expect((await director(category)).reel.provenanceLabel).toBe(ILLUSTRATION_REEL_LABEL);
+    expect((await director(category)).segmentation.map((record) => record.status)).toEqual(["no_match", "no_match", "segmented"]);
+
+    // No spark_media budget left: no analysis request, the deterministic phrase alone is tried.
+    const noAnalysis = await harness("illustration-no-analysis", { caps: { spark_media: 0 } });
+    illustrated(noAnalysis);
+    samMatching(noAnalysis, () => true);
+    const noAnalysisResult = await produceAutopilotCampaign(noAnalysis.input, noAnalysis.deps);
+    expect(noAnalysis.calls).toMatchObject({ media: 0, samImage: 1 });
+    expect(prompts(noAnalysis)).toEqual(["Flat white"]);
+    expect(noAnalysisResult.quality.notes.join(" ")).toMatch(/media-analysis budget .* did not locate the illustration's subject/);
+    expect((await director(noAnalysis)).reel.provenanceLabel).toBe(ILLUSTRATION_REEL_LABEL);
+
+    // Spark's analysis fails: it is not repeated, and the concept phrase still selects the subject.
+    const analysisFailed = await harness("illustration-analysis-failed", {});
+    illustrated(analysisFailed);
+    analysisFailed.deps.analyzeMedia = (request, dependencies) => analyzeMediaAssets(request, { ...dependencies, client: fakeClient(() => { analysisFailed.calls.media++; return { status: "failed" }; }) });
+    samMatching(analysisFailed, () => true);
+    const failedResult = await produceAutopilotCampaign(analysisFailed.input, analysisFailed.deps);
+    expect(analysisFailed.calls).toMatchObject({ media: 1, samImage: 1 });
+    expect(prompts(analysisFailed)).toEqual(["Flat white"]);
+    expect(failedResult.quality.notes.join(" ")).toMatch(/could not locate the illustration's subject; .*not repeated/);
+    expect(failedResult.quality.reelMode).toBe("illustration");
+    // A retry recovers the stored failed analysis and the stored SAM attempt: nothing is paid for again.
+    const failedRetry = await produceAutopilotCampaign(analysisFailed.input, analysisFailed.deps);
+    expect(analysisFailed.calls).toMatchObject({ media: 1, samImage: 1 });
+    expect(await analysisFailed.budget.counts()).toMatchObject({ spark_media: 1, sam_image: 1 });
+    expect(failedRetry.quality.reelMode).toBe("illustration");
+
+    // The SAM budget runs out after the box misses: the chain stops without another request and the legacy Reel remains.
+    const exhausted = await harness("illustration-sam-exhausted", { caps: { sam_image: 1 } });
+    illustrated(exhausted);
+    samMatching(exhausted, () => false);
+    const exhaustedResult = await produceAutopilotCampaign(exhausted.input, exhausted.deps);
+    expect(exhausted.calls).toMatchObject({ media: 1, samImage: 1 });
+    expect(prompts(exhausted)).toEqual(["box"]);
+    expect(exhaustedResult.quality.reelMode).toBe("illustration");
+    expect((await director(exhausted)).reel.provenanceLabel).toBeNull();
+    expect((await director(exhausted)).segmentation.map((record) => record.status)).toEqual(["no_match", "skipped"]);
+    expect(exhaustedResult.quality.notes.join(" ")).toMatch(/SAM budget for this run was used up; the Reel uses composed crops of the illustration/);
+
+    // A failed SAM request ends the chain (never paid for again with another prompt).
+    const samFailed = await harness("illustration-sam-failed", {});
+    illustrated(samFailed);
+    samFailed.deps.segment = (request, dependencies) => segmentMetaImage(request, { ...dependencies, client: fakeClient(() => { samFailed.calls.samImage++; samFailed.segmentRequests.push(request); return { status: "failed" }; }) });
+    const samFailedResult = await produceAutopilotCampaign(samFailed.input, samFailed.deps);
+    expect(samFailed.calls.samImage).toBe(1);
+    expect((await director(samFailed)).segmentation.map((record) => record.status)).toEqual(["failed"]);
+    expect(samFailedResult.quality.notes.join(" ")).toMatch(/SAM selection did not complete; the Reel uses composed crops of the illustration/);
+    // A retry reuses the failed attempt's checkpoint: no further SAM request with this or another prompt.
+    await produceAutopilotCampaign(samFailed.input, samFailed.deps);
+    expect(samFailed.calls.samImage).toBe(1);
+    expect((await samFailed.budget.counts()).sam_image).toBe(1);
+  }, 600_000);
 
   test("files changed by the critic's fixes get one verification critique bound to their final bytes, whose critical finding withholds them", async () => {
     const h = await harness("recheck", { photos: 1, recheckFindings: [{ assetId: "instagram_feed", severity: "critical", rule: "unreadable_text", description: "Synthetic unreadable headline.", box: null, timeSeconds: null }] });
@@ -648,6 +766,24 @@ describe("Autopilot production pipeline", () => {
     expect((await visual.budget.counts()).muse_image).toBe(1);
   }, 400_000);
 
+  test("a completed copy response that fails validation reaches the worker with its metering, and a retry stays local", async () => {
+    const { CampaignCopyValidationError } = await import("../../lib/campaign/index");
+    const h = await harness("copy-invalid", {});
+    const stored = { model: "muse-spark-1.3", inputTokens: 11, outputTokens: 22, elapsedMs: 33 };
+    let paid = 0;
+    h.deps.ensureCopy = async (_input, copyOptions) => {
+      // As ensureCampaignCopy does: only the first attempt pays; the retry revalidates the stored response.
+      if (paid++ === 0) await copyOptions?.reserveCopyCall?.();
+      throw new CampaignCopyValidationError(stored);
+    };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const error = await produceAutopilotCampaign(h.input, h.deps).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(CampaignCopyValidationError);
+      expect((error as InstanceType<typeof CampaignCopyValidationError>).usage).toEqual(stored);
+    }
+    expect(h.runCalls.count).toBe(1);
+  }, 120_000);
+
   test("a lost lease stops before the first paid request", async () => {
     const h = await harness("lease", { photos: 1 });
     h.input.leaseLost = () => true;
@@ -693,6 +829,15 @@ describe("Autopilot pipeline helpers", () => {
     ];
     expect(heroTrack(objects, 90)?.objectId).toBe("2");
     expect(heroTrack([{ objectId: "1", framesPresent: 90, meanCoverage: 0.001, label: "a" }], 90)).toBeNull();
+  });
+
+  test("the illustration's deterministic SAM subject phrase mirrors the illustration prompt's subject", () => {
+    const copy = copyFixture();
+    const withoutFocus = { ...copy, creativeBrief: { ...copy.creativeBrief!, focus: { ...copy.creativeBrief!.focus, offeringId: null } } } as CampaignCopy;
+    expect(illustrationSubjectPhrase({ copy, enrichment: enrichment("b"), business: { vertical: "cafe" } })).toBe("Flat white");
+    expect(illustrationSubjectPhrase({ copy, enrichment: undefined, business: { vertical: " Family\nbakery " } })).toBe("Family bakery item");
+    expect(illustrationSubjectPhrase({ copy: withoutFocus, enrichment: enrichment("b"), business: { vertical: "florist" } })).toBe("florist item");
+    expect(illustrationSubjectPhrase({ copy, enrichment: undefined, business: { vertical: " " } })).toBe("botanical forms");
   });
 
   test("withholding the Reel withholds its cover, and copy fixes only delete listed wording", () => {

@@ -119,6 +119,7 @@ describe("website gallery notes", () => {
   });
   const unreadable = "Tickr could not read the official website this time; no website photos were used.";
   const noPhotos = "The official website offered no usable photos.";
+  const downloadsFailed = "Tickr read your website, but its photos could not be downloaded (for example the image host blocks automated access); no website photos were used.";
 
   async function notesFor(result: OfficialGalleryResult, name: string) {
     const base = join(root, `gallery-${name}`);
@@ -137,8 +138,23 @@ describe("website gallery notes", () => {
     expect(notes).not.toContain(noPhotos);
   });
 
-  test("a read page whose photo downloads all failed is also reported as unreadable", () => {
-    expect(emptyGalleryNote(gallery({ pagesRead: ["https://synthetic-cafe.example/"], candidatesFound: 2, attempted: 2, skipped: [{ imageUrl: "https://synthetic-cafe.example/a.jpg", reason: "fetch_failed" }] }))).toBe(unreadable);
+  test("a read page whose photo downloads all failed says the site was read but its photos could not be downloaded", async () => {
+    const failed = gallery({ pagesRead: ["https://synthetic-cafe.example/"], candidatesFound: 2, attempted: 2, skipped: [
+      { imageUrl: "https://synthetic-cafe.example/a.jpg", reason: "fetch_failed" }, { imageUrl: "https://synthetic-cafe.example/b.jpg", reason: "fetch_failed" },
+    ] });
+    expect(emptyGalleryNote(failed)).toBe(downloadsFailed);
+    const notes = await notesFor(failed, "downloads-failed");
+    expect(notes).toContain(downloadsFailed);
+    expect(notes).not.toContain(unreadable);
+    expect(notes).not.toContain(noPhotos);
+    // Mixed: some photos were too small, the rest could not be downloaded.
+    expect(emptyGalleryNote(gallery({ pagesRead: ["https://synthetic-cafe.example/"], candidatesFound: 2, attempted: 2, skipped: [
+      { imageUrl: "https://synthetic-cafe.example/icon.png", reason: "too_small" }, { imageUrl: "https://synthetic-cafe.example/a.jpg", reason: "fetch_failed" },
+    ] }))).toBe(downloadsFailed);
+  });
+
+  test("any harvested photo means no empty-gallery note", () => {
+    expect(emptyGalleryNote({ status: "partial", pagesRead: [], assets: [{} as OfficialGalleryResult["assets"][number]], skipped: [] })).toBeNull();
   });
 
   test("a read page with no candidate photos keeps the no-usable-photos wording", async () => {

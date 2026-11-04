@@ -65,7 +65,7 @@ export async function readCopyCheckpoint(input: CreateCampaignInput, opportunity
     const completed = await readCompletedCopyRecord(input.outputDir, campaignInputHash(input));
     if (!completed) return null;
     try { return { copy: validateCompletedCampaignCopy(JSON.parse(completed.outputText), input.report, opportunity, input.sources, input.enrichment), usage: completed.usage, origin: "completed_response" }; }
-    catch { throw new CampaignCopyValidationError(); }
+    catch { throw new CampaignCopyValidationError(completed.usage); }
   }
   try {
     const saved = JSON.parse(bytes) as { inputHash?: string; copy?: unknown; usage?: unknown };

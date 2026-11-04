@@ -749,7 +749,7 @@ test("completed copy responses that fail validation can only be explicitly reval
       copyCalls++;
       await writeFile(join(campaignInput.outputDir, "copy-response.json"), savedResponse);
     }
-    if (!validationFixed) throw new CampaignCopyValidationError();
+    if (!validationFixed) throw new CampaignCopyValidationError(usage);
     await campaignInput.reserveAdditionalModelCall?.();
     return { campaign, usage, additionalUsage: [{ ...usage, model: "image-test-double-no-inference" }] };
   });
@@ -762,6 +762,8 @@ test("completed copy responses that fail validation can only be explicitly reval
     await runNextJob({ store, dependencies: dep });
     expect((await store.view(run.id)).status).toBe("failed");
     expect((await client.run.findUniqueOrThrow({ where: { id: run.id } })).retrySafe).toBe(true);
+    // The completed copy response was paid for: a validation failure still records its metering.
+    expect((await store.view(run.id)).usage).toEqual([usage, usage]);
     expect(await runNextJob({ store, dependencies: dep })).toBeNull();
     dep.hasCopyCheckpoint = completedLookup;
     await store.retry(run.id);
@@ -769,6 +771,8 @@ test("completed copy responses that fail validation can only be explicitly reval
     expect((await store.view(run.id)).status).toBe("failed");
     expect(copyCalls).toBe(1);
     expect((await client.run.findUniqueOrThrow({ where: { id: run.id } })).modelCalls).toBe(2);
+    // A repeated local failure of the same stored response is not metered twice.
+    expect((await store.view(run.id)).usage).toHaveLength(2);
     expect(dep.hasCopyCheckpoint).not.toHaveBeenCalled();
     validationFixed = true;
     await store.retry(run.id);

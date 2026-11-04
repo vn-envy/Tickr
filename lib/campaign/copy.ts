@@ -126,6 +126,29 @@ export function selectedCampaignInsights(enrichment: BusinessEnrichment | undefi
   return (enrichment?.insights ?? []).map((insight) => ({ ...insight, sourceIds: [...new Set(insight.sourceIds.filter((id) => selectedSourceIds.has(id) && presentSourceIds.has(id)))] })).filter((insight) => insight.sourceIds.length > 0);
 }
 
+/** "customer" marks text a customer sends (the WhatsApp opener/prefilled message and suggested customer questions). */
+export type CopyVoice = "business" | "customer";
+
+/** Rhetorical second-person openers ("Can you believe…") assert rather than ask. */
+const RHETORICAL = String.raw`believe|imagine|resist|guess|beat|wait|handle|say no|tell the difference`;
+const GREETING = String.raw`(?:(?:hi|hello|hey|hiya|namaste|greetings|good (?:morning|afternoon|evening))\b[^,.!?\n]{0,40}[,:;\u2013\u2014-]\s*)?`;
+/** A customer's polite request is not an assertion; rhetorical or pitch openers ("Could you resist…", "Would you like…", "Could I tempt you…") stay claims. Business copy gets no such exemption: "Could you use a free delivery today?" is an ad offer. */
+const POLITE_REQUEST = new RegExp(String.raw`^${GREETING}(?:(?:could|would|may) (?:you|i|someone|the team)\b(?!\s+(?:${RHETORICAL}|like|love|care|fancy|prefer|use|suggest|tempt|recommend|offer|interest|introduce|treat|present)\b)|(?:could|would|may) we\s+(?:ask|check|know|find out|see|confirm|get (?:a|the) (?:list|menu|details))\b|(?:please\s+)?(?:share|tell (?:me|us)|let (?:me|us) know)\b)`, "iu");
+/** Plain customer questions ("What's available this weekend?") are inquiries only when the customer sends them. */
+const CUSTOMER_INQUIRY = new RegExp(String.raw`^${GREETING}(?:what(?:['’]?s)?|which|when|where|how|is there|are there|any|do you|does the|i(?:['’]d| would) like to know|i want to know|i(?:['’]m| am) (?:wondering|curious))\b`, "iu");
+/** A customer's yes/no question ("Can you deliver today?") asks. In business copy the same shape pitches ("Do you want free delivery today?", "Are bookings open today? Yes!"), so it stays subject to claim checks. */
+const CUSTOMER_YES_NO_QUESTION = new RegExp(String.raw`(?<=^|[.!?]\s+)(?:is|are|can|do|does|will)\b(?!\s+(?:you|u|ya)\s+(?:${RHETORICAL})\b)[^.!?]*\?`, "giu");
+const QUESTION_END = /\?[\s"'”’)\]\p{Extended_Pictographic}\uFE0F\u200D]*$/u;
+
+/** Removes whole customer-voice question sentences that ask rather than assert; any other sentence, including every business-voice sentence, stays subject to claim checks. */
+export function withoutInquiries(text: string, voice: CopyVoice = "business"): string {
+  return text.split(/(?<=[.!?])\s+|\n+/).filter((sentence) => {
+    const trimmed = sentence.trim();
+    if (!QUESTION_END.test(trimmed)) return true;
+    return !(voice === "customer" && (POLITE_REQUEST.test(trimmed) || CUSTOMER_INQUIRY.test(trimmed)));
+  }).join(" ");
+}
+
 /** New completed responses use the current schema; saved historical kits retain their optional fields. */
 export function validateCompletedCampaignCopy(input: unknown, report: ResearchReport, opportunity: ResearchOpportunity, sources: readonly CollectedSource[], enrichment?: BusinessEnrichment): CampaignCopy {
   return validateCampaignCopy(GeneratedCampaignCopySchema.parse(input), report, opportunity, sources, enrichment);
@@ -162,15 +185,16 @@ export function validateCampaignCopy(input: unknown, report: ResearchReport, opp
   // These guards target consequential promises, not generic reported story themes.
   const sensitiveClaims = (text: string) => (text.match(/\b(?:certified|accredited|licensed|clinically proven|award[- ]winning|guarantee(?:s|d)?|risk[- ]free|pain[- ]free|weight[- ]loss|fat[- ]loss|whiter teeth|straighter teeth|regrow(?:s)? hair|(?:cures?|treats?|prevents?|reverses?) (?:diabetes|disease|cancer|infection|hair loss|aging|pain)|gluten[- ]free|allergen[- ]free|dairy[- ]free|nut[- ]free|sugar[- ]free|organic|vegan|complimentary|discount(?:s|ed)?|half[- ]price|limited[- ]time offer|free (?:trial|consultation|delivery|shipping|sample|session)|unlimited|same[- ]day delivery|next[- ]day delivery)\b/gi) ?? []).map(normalize);
   const hasScopedSources = sources.some((source) => source.context) || Boolean(enrichment?.branch);
-  const validateCurrentClaims = (publicCopy: string, evidenceIds: string[]) => {
+  const validateCurrentClaims = (publicCopy: string, evidenceIds: string[], voice: CopyVoice = "business") => {
     if (!hasScopedSources) return; // Preserve legacy descriptive concepts and their recorded review status.
-    const claimText = publicCopy
-      .replace(/\b(?:ask|check|confirm|inquire|enquire)\b[^.!?]{0,100}\b(?:whether|if|what|which)\b[^.!?]*/gi, "")
-      .replace(/(?:^|[.!?]\s+)(?:is|are|can|do|does|will)\b[^.!?]*\?/gi, "");
+    // "Ask/check whether…" points the reader to confirm; "Check out what's available today" still advertises.
+    const askedText = withoutInquiries(publicCopy, voice)
+      .replace(/\b(?:ask|check(?!\s+out\b)|confirm|inquire|enquire)\b[^.!?]{0,100}\b(?:whether|if|what|which)\b[^.!?]*/gi, "");
+    const claimText = voice === "customer" ? askedText.replace(CUSTOMER_YES_NO_QUESTION, "") : askedText;
     const references = evidenceIds.map((id) => sources.find((source) => source.id === ownFacts.get(id)?.sourceId)).filter((source): source is CollectedSource => Boolean(source));
     const currentOffer = references.some((source) => isCurrentOfferSource(source));
     const commercialPromise = offers(claimText).length > 0 || /\b(?:discount(?:s|ed)?|on sale|limited[- ]time offer|special offer|free (?:trial|consultation|delivery|shipping|sample|session))\b/i.test(claimText);
-    const availabilityPromise = /\b(?:available (?:now|today|here|at|for|this)|in stock|on sale|open (?:now|today)|(?:bookings?|appointments?|slots?) (?:are )?(?:open|available)|(?:same|next)[- ]day delivery)\b/i.test(claimText);
+    const availabilityPromise = /\b(?:available (?:now|today|here|at|for|this)|now available|in stock|on sale|open (?:now|today)|(?:bookings?|appointments?|slots?) (?:are )?(?:open|available)|(?:same|next)[- ]day delivery)\b/i.test(claimText);
     if ((commercialPromise || availabilityPromise) && !currentOffer) throw new Error("Current offers and availability need dated, original evidence for this exact location.");
     if (enrichment?.branch && enrichment.branch.status !== "matched" && /\b(?:visit us|visit (?:our|the|this) (?!website\b|page\b|profile\b|menu\b)|we(?:'re| are) (?:located|based)|at (?:our|this|the) [^.!?]{0,50}\b(?:branch|store|shop|clinic|studio|location)|our (?:local|nearby) (?:branch|store|shop|clinic|studio))\b/i.test(claimText)) throw new Error("An unresolved branch cannot be presented as a confirmed local destination.");
   };
@@ -233,7 +257,9 @@ export function validateCampaignCopy(input: unknown, report: ResearchReport, opp
   }
   validateSensitiveCopy(`${copy.name} ${copy.objective} ${copy.audienceHypothesis} ${copy.coreMessage} ${copy.primaryCta} ${JSON.stringify(copy.conversation)}`, copy.evidenceIds);
   // Questions are consumer strings, not JSON syntax or text joined across field boundaries.
-  for (const text of [copy.name, copy.coreMessage, copy.primaryCta, copy.conversation.opener, copy.conversation.qualificationQuestion, copy.conversation.nextAction, ...copy.conversation.commonReplies.flatMap((reply) => [reply.question, reply.answer])]) validateCurrentClaims(text, copy.evidenceIds);
+  for (const text of [copy.name, copy.coreMessage, copy.primaryCta, copy.conversation.qualificationQuestion, copy.conversation.nextAction, ...copy.conversation.commonReplies.map((reply) => reply.answer)]) validateCurrentClaims(text, copy.evidenceIds);
+  // The opener and suggested customer questions are what a customer sends (a click-to-WhatsApp prefilled message).
+  for (const text of [copy.conversation.opener, ...copy.conversation.commonReplies.map((reply) => reply.question)]) validateCurrentClaims(text, copy.evidenceIds, "customer");
   for (const channel of copy.channels) {
     const fields = [channel.title, channel.headline, channel.body, channel.caption, channel.cta];
     // Each field is its own numbered list (a carousel caption's "1/ 2/ 3/"), never a sequence joined across fields.
@@ -333,7 +359,7 @@ Return only the requested structured JSON. All seven channel IDs exactly once: $
     const copy = validateCompletedCampaignCopy(JSON.parse(text || ""), input.report, input.opportunity, input.sources, input.enrichment);
     return { copy, usage };
   } catch (error) {
-    if (input.onCompletedResponse) throw new CampaignCopyValidationError();
+    if (input.onCompletedResponse) throw new CampaignCopyValidationError(usage);
     throw error;
   }
 }

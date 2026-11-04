@@ -24,7 +24,7 @@ import { applyDeterministicFixes, applyRecheckFixes, ARCHIVE_FILE, combinedVerdi
 import { planProduction } from "./director";
 import { defaultHarvestDependencies, harvestMedia, harvestThumbnail, officialWebsiteFor, openRunLibrary, type HarvestDependencies, type HarvestRecord } from "./harvest";
 import {
-  illustrationStill, prebuiltReel, produceReel, renderImageFor, savedReel, segmentStill, workingStill,
+  illustrationStill, prebuiltReel, produceReel, renderImageFor, savedReel, segmentIllustration, segmentStill, workingStill,
   ILLUSTRATION_ASSET_ID, MAX_SEGMENTED_STILLS, type ReelDependencies, type ReelRecord, type ReelVariant, type StillLayer, type StillSource,
 } from "./produce";
 import { AutopilotPaidStepError, AutopilotResumableError, type AutopilotProductionInput, type AutopilotProductionResult, type AutopilotQuality } from "./production-types";
@@ -354,22 +354,26 @@ async function produce(input: AutopilotProductionInput, dependencies: AutopilotD
       notes.push("The illustration budget for this run was used up; the campaign uses typography instead.");
     }
     if (reelMode === "illustration" && heroImage) {
-      // SAM 3.1 selects the illustration's own central subject (concept prompt, sam_image budget), so
-      // the Reel is a labelled depth Reel instead of a flat slideshow; no usable layer keeps the legacy Reel.
-      await room.save("render", "SAM 3.1 is selecting the illustration's subject for the Reel.");
+      // Spark points, SAM cuts: Muse Spark locates the illustration's own subject (spark_media), SAM 3.1
+      // selects it with a box prompt, then concept phrases (sam_image), so the Reel is a labelled depth
+      // Reel instead of a flat slideshow; no usable layer keeps the legacy Reel.
+      await room.save("render", "Muse Spark and SAM 3.1 are selecting the illustration's subject for the Reel.");
       const source = await illustrationStill(heroImage.bytes, directory);
-      const phrase = bounded(illustrationSubjectPhrase({ copy, enrichment: input.enrichment }), 120) || "main subject";
-      const outcome = await segmentStill({ directory, still: source, asset: { width: source.width, height: source.height }, pick: { segmentation: { kind: "concept", phrase, label: phrase } }, gate, segment: dependencies.segment });
-      if (outcome.usage) additionalUsage.push(outcome.usage);
-      if (outcome.record.note && outcome.record.status !== "segmented") notes.push(outcome.record.note.replace("composed crops are used", "the Reel uses composed crops of the illustration"));
-      const record = { ...outcome.record };
-      if (outcome.preview) {
-        record.preview = await room.publish(`mask-${ILLUSTRATION_ASSET_ID}.png`, outcome.preview, "image/png");
+      const outcome = await segmentIllustration({
+        directory, still: source, subjectPhrase: illustrationSubjectPhrase({ copy, enrichment: input.enrichment, business: input.business }),
+        analysis: { goal: bounded(input.goal, 600) || "Grow the business", business: { name: bounded(input.business.name, 200) || "Local business", category }, offerings },
+        gate, analyzeMedia: dependencies.analyzeMedia, segment: dependencies.segment,
+      });
+      additionalUsage.push(...outcome.usage);
+      notes.push(...outcome.notes);
+      const records = outcome.records.map((record) => ({ ...record }));
+      if (outcome.preview && records.length) {
+        records[records.length - 1].preview = await room.publish(`mask-${ILLUSTRATION_ASSET_ID}.png`, outcome.preview, "image/png");
         const filename = `sam-mask-${ILLUSTRATION_ASSET_ID}.png`;
         await writeFile(join(outputDir, filename), outcome.preview);
         maskExtras.push({ filename, mediaType: "image", channel: null });
       }
-      samRecords.push(record);
+      samRecords.push(...records);
       room.state.sam = samRecords.map(publicSam);
       if (outcome.layer) {
         illustration = { still: source, layer: outcome.layer };

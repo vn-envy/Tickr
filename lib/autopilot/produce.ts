@@ -16,11 +16,12 @@ import { MaskletStoreError } from "../media/masklets";
 import { composeObjectLayers, type ObjectLayer } from "../media/object-layers";
 import { MetaClientError } from "../meta/config";
 import { scaleSamBox, type SamObjectPrompt } from "../meta/sam-prompts";
+import type { analyzeMediaAssets, MediaAnalysisOffering, MediaAssetAnalysis } from "../meta/media-analysis";
 import type { segmentMetaImage } from "../meta/segmentation";
 import type { trackMetaVideo } from "../meta/sam-video";
 import type { ModelUsage } from "../research/contracts";
-import { clipConsent, type PaidGate } from "./analyze";
-import type { AnalyzedAsset, ProductionPlan, ReelPlan, StillPick } from "./contracts";
+import { clipConsent, sparkModelUsage, type PaidGate } from "./analyze";
+import type { AnalyzedAsset, ProductionPlan, ReelPlan, SegmentationPlan, StillPick } from "./contracts";
 import type { HarvestedAsset } from "./harvest";
 import { AutopilotCheckpointError, bounded, readCheckpoint, sha256Hex, writeCheckpoint, type SamRecord } from "./report";
 
@@ -111,6 +112,9 @@ export function stillProvenanceLabel(provenance: HarvestedAsset["provenance"], c
   return cutout && provenance !== "meta_illustration" ? `${base} · SAM CUTOUT` : base;
 }
 
+/** Attempt keys of segmentStill (checkpoint- and path-safe). */
+const ATTEMPT_KEY = /^[a-z0-9][a-z0-9-]{0,23}$/;
+
 export interface StillLayer { assetId: string; cutoutPath: string; maskPath: string; cutoutSha256: string; maskSha256: string; coverage: number; objectId: string }
 export interface SegmentOutcome { layer: StillLayer | null; record: SamRecord; usage: ModelUsage | null; preview: Buffer | null }
 
@@ -149,16 +153,24 @@ export async function maskPreview(still: Pick<StillSource, "bytes" | "width" | "
  */
 export async function segmentStill(input: {
   directory: string; still: StillSource; asset: Pick<AnalyzedAsset, "width" | "height">; pick: Pick<StillPick, "segmentation">; gate: PaidGate; segment: typeof segmentMetaImage;
+  /**
+   * Distinguishes several selections of the same still (the illustration's fallback chain): each
+   * attempt has its own checkpoint, response store and layer files, so none is ever repeated.
+   */
+  attempt?: string;
 }): Promise<SegmentOutcome> {
   const { still, pick } = input;
   const plan = pick.segmentation;
+  if (input.attempt !== undefined && !ATTEMPT_KEY.test(input.attempt)) throw new AutopilotCheckpointError();
+  const key = `${still.assetId.replace(/_/g, "-")}${input.attempt ? `-${input.attempt}` : ""}`;
+  const fileKey = `${still.assetId}${input.attempt ? `-${input.attempt}` : ""}`;
   const label = plan.kind === "none" ? "main subject" : plan.label;
   const base: SamRecord = {
     assetId: still.assetId, media: "image", promptKind: plan.kind === "concept" ? "concept" : "geometry", label, origin: plan.kind === "concept" ? "concept_prompt" : plan.kind === "geometry" ? "spark_grounding" : "local_layout",
     status: "skipped", preview: null, overlayVideo: null, coverage: null, framesTracked: null, elapsedMs: null, responseId: null, objectCount: null, note: null,
   };
   if (plan.kind === "none") return { layer: null, record: { ...base, note: "Spark located no single subject; composed crops are used." }, usage: null, preview: null };
-  const saved = await readCheckpoint<{ layer: StillLayer | null; record: SamRecord; usage: ModelUsage | null }>(input.directory, `sam-${still.assetId.replace(/_/g, "-")}`, still.sha256);
+  const saved = await readCheckpoint<{ layer: StillLayer | null; record: SamRecord; usage: ModelUsage | null }>(input.directory, `sam-${key}`, still.sha256);
   if (saved) {
     if (saved.layer) {
       const mask = await readFile(saved.layer.maskPath).catch(() => null);
@@ -168,7 +180,7 @@ export async function segmentStill(input: {
     }
     return { ...saved, preview: null };
   }
-  const directory = join(input.directory, "sam-image", still.assetId);
+  const directory = join(input.directory, "sam-image", fileKey);
   const gate = await input.gate("sam_image", directory, "sam");
   if (gate === "exhausted") return { layer: null, record: { ...base, note: "The SAM budget for this run was used up; composed crops are used." }, usage: null, preview: null };
   const geometry: SamObjectPrompt[] | undefined = plan.kind === "geometry"
@@ -194,7 +206,7 @@ export async function segmentStill(input: {
     if (chosen) {
       const layerDir = join(input.directory, "layers");
       await mkdir(layerDir, { recursive: true, mode: 0o700 });
-      const cutoutPath = join(layerDir, `${still.assetId}.cutout.png`), maskPath = join(layerDir, `${still.assetId}.mask.png`);
+      const cutoutPath = join(layerDir, `${fileKey}.cutout.png`), maskPath = join(layerDir, `${fileKey}.mask.png`);
       await writeFile(cutoutPath, chosen.cutoutPng, { mode: 0o600 });
       await writeFile(maskPath, chosen.maskPng, { mode: 0o600 });
       layer = { assetId: still.assetId, cutoutPath, maskPath, cutoutSha256: chosen.sha256s.cutout, maskSha256: chosen.sha256s.mask, coverage: chosen.coverage, objectId: chosen.objectId };
@@ -204,9 +216,79 @@ export async function segmentStill(input: {
     if (!(error instanceof MetaClientError)) throw error;
     outcome = { layer: null, record: { ...base, status: "failed", note: "The SAM selection did not complete; composed crops are used and the request was not repeated." }, usage: null };
   }
-  await writeCheckpoint(input.directory, `sam-${still.assetId.replace(/_/g, "-")}`, still.sha256, outcome);
+  await writeCheckpoint(input.directory, `sam-${key}`, still.sha256, outcome);
   const preview = outcome.layer ? await maskPreview(still, await readFile(outcome.layer.maskPath), `SAM 3.1 selection · ${stillProvenanceLabel(still.provenance, false)}`) : null;
   return { ...outcome, preview };
+}
+
+export interface IllustrationSegmentOutcome {
+  layer: StillLayer | null;
+  /** Every SAM attempt in order (no-match attempts stay on record), for the director's report. */
+  records: SamRecord[];
+  usage: ModelUsage[];
+  preview: Buffer | null;
+  notes: string[];
+}
+
+const subjectText = (value: string) => value.replace(/[<>\r\n\u0000-\u001f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 120);
+
+/**
+ * "Spark points, SAM cuts" for the labelled illustration: one Spark media analysis of the
+ * illustration's working image (spark_media budget) locates its primary subject; SAM 3.1 then
+ * tries, in order and only while the previous attempt found no match, (1) a box prompt from
+ * Spark's located subject, (2) a concept prompt with Spark's label, (3) a concept prompt with
+ * the deterministic subject phrase of the illustration prompt. Each attempt is one paid request
+ * at most (its own checkpoint and response store), never repeated; an exhausted budget or a
+ * failed request ends the chain, and no layer keeps the legacy Reel of the illustration. The
+ * analysis is an observation of generated pixels and never verifies what they depict.
+ */
+export async function segmentIllustration(input: {
+  directory: string; still: StillSource; subjectPhrase: string;
+  analysis: { goal: string; business: { name: string; category: string }; offerings: readonly MediaAnalysisOffering[] };
+  gate: PaidGate; analyzeMedia: typeof analyzeMediaAssets; segment: typeof segmentMetaImage;
+}): Promise<IllustrationSegmentOutcome> {
+  const { still } = input;
+  if (still.provenance !== "meta_illustration") throw new AutopilotCheckpointError();
+  const usage: ModelUsage[] = [];
+  const notes: string[] = [];
+  let located: MediaAssetAnalysis | null = null;
+  const analysisDirectory = join(input.directory, "spark-media", `${ILLUSTRATION_ASSET_ID}-${still.sha256.slice(0, 16)}`);
+  if ((await input.gate("spark_media", analysisDirectory, "spark-media")) === "exhausted") {
+    notes.push("The media-analysis budget for this run was used up, so Muse Spark did not locate the illustration's subject; SAM 3.1 used concept phrases only.");
+  } else {
+    try {
+      const result = await input.analyzeMedia({
+        assets: [{ assetId: ILLUSTRATION_ASSET_ID, bytes: still.bytes, mimeType: still.mimeType, provenance: "meta_illustration" }],
+        goal: input.analysis.goal, business: input.analysis.business, offerings: input.analysis.offerings, detectRisks: true,
+      }, { responseDirectory: analysisDirectory });
+      usage.push(sparkModelUsage(result.model, result.usage, result.elapsedMs, 1));
+      located = result.assets.find((asset) => asset.assetId === ILLUSTRATION_ASSET_ID) ?? null;
+    } catch (error) {
+      // Optional: the chain falls back to concept phrases; the request is never repeated.
+      if (!(error instanceof MetaClientError)) throw error;
+      notes.push("Muse Spark could not locate the illustration's subject; SAM 3.1 used concept phrases only and the request was not repeated.");
+    }
+  }
+  const sparkLabel = located?.primarySubject ? subjectText(located.primarySubject.label) : "";
+  const phrase = subjectText(input.subjectPhrase);
+  const attempts: Array<{ key: string; plan: SegmentationPlan; size: { width: number; height: number } }> = [];
+  if (located?.primarySubject?.box) attempts.push({ key: "box", plan: { kind: "geometry", box: located.primarySubject.box, label: sparkLabel || phrase || "main subject" }, size: { width: located.width, height: located.height } });
+  if (sparkLabel) attempts.push({ key: "spark-concept", plan: { kind: "concept", phrase: sparkLabel, label: sparkLabel }, size: still });
+  if (phrase && phrase.toLowerCase() !== sparkLabel.toLowerCase()) attempts.push({ key: "concept", plan: { kind: "concept", phrase, label: phrase }, size: still });
+  const records: SamRecord[] = [];
+  let last: SegmentOutcome | null = null;
+  for (const attempt of attempts) {
+    last = await segmentStill({ directory: input.directory, still, asset: attempt.size, pick: { segmentation: attempt.plan }, gate: input.gate, segment: input.segment, attempt: attempt.key });
+    if (last.usage) usage.push(last.usage);
+    records.push(last.record);
+    // Only a clean no-match moves on: an exhausted budget or a failed request ends the chain.
+    if (last.layer || last.record.status !== "no_match") break;
+  }
+  if (!last?.layer) {
+    const reason = last?.record.note ?? "No subject phrase was available for the illustration; composed crops are used.";
+    notes.push(reason.replace("composed crops are used", "the Reel uses composed crops of the illustration"));
+  }
+  return { layer: last?.layer ?? null, records, usage, preview: last?.layer ? last.preview : null, notes };
 }
 
 /** The routed image for one placement: real pixels, plus the SAM cutout when one exists. */

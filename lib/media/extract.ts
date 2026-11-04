@@ -46,6 +46,97 @@ function imageReferences(value: unknown): Array<{ url: string; label: string | n
   });
 }
 
+/** Renditions wider than this add download cost without helping a 1600 px normalized frame. */
+const PREFERRED_RENDITION_WIDTH = 2000;
+const MAX_GALLERY_ALTERNATES = 2;
+const MAX_SRCSET_CHARS = 16 * 1024;
+const MAX_SRCSET_CANDIDATES = 16;
+/**
+ * Renditions of one <img srcset> recorded by the standard extractor (in rendition preference order):
+ * the gallery's preferred download plus its fallbacks, so each is an exact reader reference.
+ */
+const MAX_STANDARD_SRCSET_RENDITIONS = 1 + MAX_GALLERY_ALTERNATES;
+
+export interface Rendition { url: string; width: number; density: number }
+
+const SRCSET_SPACE = /[\t\n\f\r ]/;
+
+/**
+ * Parses a srcset attribute with the HTML Standard's "parse a srcset attribute" algorithm: a URL
+ * is a run of non-whitespace characters (so commas inside URLs, as in CDN image-resizing paths like
+ * /cdn-cgi/image/format=auto,w=375/x.jpg, stay part of the URL), trailing commas end a URL with no
+ * descriptors, and descriptors run until a comma outside parentheses. Candidates with invalid
+ * descriptors are dropped, as are inline data:/blob: URLs. Bounded in input and output size.
+ */
+export function parseSrcset(value: string | undefined): Rendition[] {
+  if (!value) return [];
+  const truncated = value.length > MAX_SRCSET_CHARS;
+  const input = value.slice(0, MAX_SRCSET_CHARS);
+  const candidates: Rendition[] = [];
+  let position = 0;
+  while (position < input.length && candidates.length < MAX_SRCSET_CANDIDATES) {
+    while (position < input.length && (SRCSET_SPACE.test(input[position]) || input[position] === ",")) position++;
+    if (position >= input.length) break;
+    const urlStart = position;
+    while (position < input.length && !SRCSET_SPACE.test(input[position])) position++;
+    let url = input.slice(urlStart, position);
+    const descriptors: string[] = [];
+    if (url.endsWith(",")) {
+      url = url.replace(/,+$/, "");
+    } else {
+      // Descriptor tokenizer: whitespace separates descriptors; a comma outside parentheses ends the candidate.
+      while (position < input.length && SRCSET_SPACE.test(input[position])) position++;
+      let current = "";
+      let state: "descriptor" | "parens" | "after" = "descriptor";
+      for (; ;) {
+        const c = position < input.length ? input[position] : null;
+        if (state === "descriptor") {
+          if (c === null) { if (current) descriptors.push(current); break; }
+          if (SRCSET_SPACE.test(c)) { if (current) descriptors.push(current); current = ""; state = "after"; }
+          else if (c === ",") { position++; if (current) descriptors.push(current); break; }
+          else { current += c; if (c === "(") state = "parens"; }
+        } else if (state === "parens") {
+          if (c === null) { if (current) descriptors.push(current); break; }
+          current += c;
+          if (c === ")") state = "descriptor";
+        } else {
+          if (c === null) break;
+          if (!SRCSET_SPACE.test(c)) { state = "descriptor"; continue; }
+        }
+        position++;
+        if (current.length > 256) return candidates;
+      }
+    }
+    let width: number | null = null, density: number | null = null, height: number | null = null, invalid = false;
+    for (const descriptor of descriptors) {
+      const number = descriptor.slice(0, -1);
+      const unit = descriptor.slice(-1);
+      if (unit === "w" && /^\d{1,6}$/.test(number) && width === null && density === null && Number(number) > 0) width = Number(number);
+      else if (unit === "x" && /^(?:\d{1,4}(?:\.\d{1,6})?|\.\d{1,6})$/.test(number) && width === null && density === null && height === null && Number(number) > 0) density = Number(number);
+      else if (unit === "h" && /^\d{1,6}$/.test(number) && height === null && density === null && Number(number) > 0) height = Number(number);
+      else invalid = true;
+    }
+    if (height !== null && width === null) invalid = true;
+    // A candidate cut off by the input bound may be a partial URL.
+    if (truncated && position >= input.length) break;
+    if (invalid || !url || /^(?:data|blob):/i.test(url)) continue;
+    candidates.push({ url, width: width ?? 0, density: density ?? 1 });
+  }
+  return candidates;
+}
+
+/**
+ * Orders the renditions of one picture: the widest at most 2000 px first, then narrower ones, then
+ * oversize ones from the smallest; density-only entries follow, highest density first.
+ */
+function orderRenditions(entries: Rendition[]): string[] {
+  const sized = entries.filter((entry) => entry.width > 0);
+  const fitting = sized.filter((entry) => entry.width <= PREFERRED_RENDITION_WIDTH).sort((a, b) => b.width - a.width);
+  const oversize = sized.filter((entry) => entry.width > PREFERRED_RENDITION_WIDTH).sort((a, b) => a.width - b.width);
+  const density = entries.filter((entry) => entry.width === 0).sort((a, b) => b.density - a.density);
+  return [...fitting, ...oversize, ...density].map((entry) => entry.url);
+}
+
 /** Parses inert metadata only. Does not execute HTML, infer unseen products or fetch images. */
 export function extractOfficialMediaCandidates(html: string, sourcePageUrl: string, options: { preferredProduct?: string } = {}): MediaCandidate[] {
   if (Buffer.byteLength(html) > MAX_MEDIA_HTML_BYTES) throw new MediaReadError("PAGE_TOO_LARGE", "Official page exceeds the media-discovery limit.");
@@ -56,7 +147,10 @@ export function extractOfficialMediaCandidates(html: string, sourcePageUrl: stri
   const preferred = options.preferredProduct ? normalize(options.preferredProduct) : "";
   const exactMatch = (candidate: Pick<MediaCandidate, "productName" | "label">) => preferred && [candidate.productName, candidate.label].some((label) => label && normalize(label) === preferred) ? 1 : 0;
   const ranks: Record<MediaCandidateKind, number> = { product: 0, logo: 1, social_preview: 2, page_image: 3 };
-  const add = (rawUrl: string, data: Omit<MediaCandidate, "id" | "imageUrl" | "sourcePageUrl" | "eligible" | "exclusionReason" | "rights">) => {
+  // Position of a URL among its picture's renditions (0 = preferred). Ordering by it keeps the
+  // capped output broad: every picture's preferred rendition before any picture's fallbacks.
+  const tiers = new Map<string, number>();
+  const add = (rawUrl: string, data: Omit<MediaCandidate, "id" | "imageUrl" | "sourcePageUrl" | "eligible" | "exclusionReason" | "rights">, tier = 0) => {
     if (!rawUrl || rawUrl.length > 2048 || found.size >= 80 && !exactMatch(data)) return;
     let url: URL;
     try { url = new URL(decode(rawUrl.trim()), page); } catch { return; }
@@ -82,8 +176,10 @@ export function extractOfficialMediaCandidates(html: string, sourcePageUrl: stri
       const replaceable = [...found.values()].reverse().find((item) => !exactMatch(item));
       if (!replaceable) return;
       found.delete(replaceable.imageUrl);
+      tiers.delete(replaceable.imageUrl);
     }
     if (!previous || ranks[candidate.kind] < ranks[previous.kind]) found.set(url.href, candidate);
+    tiers.set(url.href, Math.min(tier, tiers.get(url.href) ?? tier));
   };
 
   // JSON-LD is read as data. No eval, remote @context resolution or script execution.
@@ -150,14 +246,19 @@ export function extractOfficialMediaCandidates(html: string, sourcePageUrl: stri
       }
       continue;
     }
-    const paths = [attrs.src, attrs["data-src"]];
-    const responsive = (attrs.srcset ?? "").split(",").slice(0, 6).map((item) => item.trim().split(/\s+/)[0]);
-    for (const rawUrl of [...paths, ...responsive]) if (rawUrl) add(rawUrl, {
+    // The same preference order as the gallery (responsive renditions, then lazy and plain sources),
+    // so the gallery's preferred download and fallbacks for each picture are exact references here.
+    const responsive = orderRenditions([...parseSrcset(attrs["data-srcset"]), ...parseSrcset(attrs.srcset)]).slice(0, MAX_STANDARD_SRCSET_RENDITIONS);
+    const label = text(attrs.alt) ?? text(attrs.title);
+    // Recorded in page-attribute order (src first); the tier follows the preference order.
+    const preference = [...responsive, attrs["data-src"], attrs.src].filter((url): url is string => Boolean(url));
+    for (const rawUrl of [attrs.src, attrs["data-src"], ...responsive]) if (rawUrl) add(rawUrl, {
       kind: "page_image", discoveredVia: "html_image", productName: null,
-      label: text(attrs.alt) ?? text(attrs.title), declaredWidth: dimension(attrs.width), declaredHeight: dimension(attrs.height),
-    });
+      label, declaredWidth: dimension(attrs.width), declaredHeight: dimension(attrs.height),
+    }, preference.indexOf(rawUrl));
   }
-  return [...found.values()].sort((a, b) => exactMatch(b) - exactMatch(a) || Number(b.eligible) - Number(a.eligible) || ranks[a.kind] - ranks[b.kind]).slice(0, MAX_CANDIDATES);
+  return [...found.values()].sort((a, b) => exactMatch(b) - exactMatch(a) || Number(b.eligible) - Number(a.eligible) || ranks[a.kind] - ranks[b.kind]
+    || (tiers.get(a.imageUrl) ?? 0) - (tiers.get(b.imageUrl) ?? 0)).slice(0, MAX_CANDIDATES);
 }
 
 const MAX_GALLERY_CANDIDATES = 64;
@@ -186,35 +287,6 @@ function visibleTags(html: string, pattern: RegExp): RegExpMatchArray[] {
     const hidden = ranges[index];
     return !(hidden && match.index! >= hidden.start && match.index! < hidden.end);
   });
-}
-
-/** Renditions wider than this add download cost without helping a 1600 px normalized frame. */
-const PREFERRED_RENDITION_WIDTH = 2000;
-const MAX_GALLERY_ALTERNATES = 2;
-
-interface Rendition { url: string; width: number; density: number }
-
-function srcsetEntries(value: string | undefined): Rendition[] {
-  if (!value) return [];
-  return value.split(/,\s+|,(?=[^\s,]+\s+\d)/).slice(0, 16).flatMap((item) => {
-    const [url, descriptor = ""] = item.trim().split(/\s+/);
-    if (!url || /^(?:data|blob):/i.test(url)) return [];
-    const width = /^(\d{1,5})w$/i.exec(descriptor);
-    const density = /^(\d{1,2}(?:\.\d{1,3})?)x$/i.exec(descriptor);
-    return [{ url, width: width ? Number(width[1]) : 0, density: density ? Number(density[1]) : 1 }];
-  });
-}
-
-/**
- * Orders the renditions of one picture: the widest at most 2000 px first, then narrower ones, then
- * oversize ones from the smallest; density-only entries follow, highest density first.
- */
-function orderRenditions(entries: Rendition[]): string[] {
-  const sized = entries.filter((entry) => entry.width > 0);
-  const fitting = sized.filter((entry) => entry.width <= PREFERRED_RENDITION_WIDTH).sort((a, b) => b.width - a.width);
-  const oversize = sized.filter((entry) => entry.width > PREFERRED_RENDITION_WIDTH).sort((a, b) => a.width - b.width);
-  const density = entries.filter((entry) => entry.width === 0).sort((a, b) => b.density - a.density);
-  return [...fitting, ...oversize, ...density].map((entry) => entry.url);
 }
 
 /** One displayed picture: the reference to download first and same-picture fallbacks for fetch/decode failures. */
@@ -296,12 +368,12 @@ export function extractOfficialGalleryReferences(html: string, sourcePageUrl: st
     if (tag === "picture") pictureSources = [];
     else if (tag === "source") {
       if (!attrs.type || /^image\/(?:png|jpeg|webp)$/i.test(attrs.type)) {
-        const entries = srcsetEntries(attrs.srcset ?? attrs["data-srcset"]);
+        const entries = parseSrcset(attrs.srcset ?? attrs["data-srcset"]);
         if (pictureSources) pictureSources.push(...entries);
         else addPicture(orderRenditions(entries), label);
       }
     } else if (tag === "img") {
-      const responsive = orderRenditions([...(pictureSources ?? []), ...srcsetEntries(attrs["data-srcset"]), ...srcsetEntries(attrs.srcset)]);
+      const responsive = orderRenditions([...(pictureSources ?? []), ...parseSrcset(attrs["data-srcset"]), ...parseSrcset(attrs.srcset)]);
       addPicture([...responsive, anchor?.href, attrs["data-lazy-src"], attrs["data-src"], attrs["data-original"], attrs.src], label, dimension(attrs.width), dimension(attrs.height));
       pictureSources = null;
       anchor = null;

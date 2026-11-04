@@ -331,12 +331,27 @@ export class JobStore {
     });
   }
 
+  /** A completed copy response that failed validation was still paid for: record its metering once per run. */
+  async recordCompletedCopyUsage(id: string, owner: string, raw: ModelUsage) {
+    const usage = ModelUsageSchema.parse(raw);
+    await this.client.$transaction(async (tx) => {
+      const run = await this.owned(tx, id, owner);
+      const previous = await tx.stageArtifact.findUnique({ where: { runId_stage_version: { runId: id, stage: "copy_usage", version: 1 } } });
+      if (previous) return;
+      await artifact(tx, id, "copy_usage", { usage });
+      await tx.run.update({ where: { id }, data: { usage: json([...(Array.isArray(run.usage) ? run.usage : []), usage]) } });
+    });
+  }
+
   async completeCampaign(id: string, owner: string, raw: CampaignKit, usage: ModelUsage, additionalUsage: ModelUsage[] = [], options: { quality?: AutopilotQuality } = {}) {
     const campaign = CampaignKitSchema.parse(raw);
-    const usages = [usage, ...additionalUsage].map((item) => ModelUsageSchema.parse(item));
+    const copyUsage = ModelUsageSchema.parse(usage);
     const quality = options.quality ? AutopilotQualitySchema.parse(options.quality) : null;
     await this.client.$transaction(async (tx) => {
       const run = await this.owned(tx, id, owner);
+      // The same stored copy response, revalidated locally after a failure, was already metered once.
+      const recorded = await tx.stageArtifact.findUnique({ where: { runId_stage_version: { runId: id, stage: "copy_usage", version: 1 } } });
+      const usages = [...(recorded?.contentHash === contentHash({ usage: copyUsage }) ? [] : [copyUsage]), ...additionalUsage.map((item) => ModelUsageSchema.parse(item))];
       await artifact(tx, id, "campaign", campaign);
       if (quality) await artifact(tx, id, "quality", quality);
       await tx.run.update({ where: { id }, data: {

@@ -60,6 +60,49 @@ describe("campaign concepts retain provenance and review boundaries", () => {
     expect(() => validateCampaignCopy(localPromise, report, opportunity, [{ ...productSource, context }], candidate)).toThrow("dated, original evidence");
   });
 
+  test("customer inquiries about availability are questions, not availability claims", () => {
+    const context: NonNullable<CollectedSource["context"]> = { scope: "brand", location: null, locationEvidence: null, publishedAt: null, validFrom: null, validThrough: null, temporalStatus: "unknown", dateEvidence: null };
+    const sources = [{ ...productSource, context }];
+    const candidate: BusinessEnrichment = { ...enrichment, branch: { status: "candidate", label: "Fixture branch", locality: "Fixture", address: null, sourceIds: ["s1"], rationale: "Likely match from a reported description." } };
+    const ctwa = (copy: CampaignCopy) => copy.channels.find((channel) => channel.id === "click_to_whatsapp")!;
+    // The hosted live run's click-to-WhatsApp prefilled message shape.
+    for (const opener of ["Could you share what is available this weekend…?", "Hi! Could you share what is available this weekend at the Fixture branch?", "Hello team, could you share what's available this weekend? 🎂", "Hi there — may I know which treats are available this weekend?", "What's available this weekend?", "I'd like to know what is available this weekend for a birthday?"]) {
+      const copy = productDraft(); copy.conversation.opener = opener;
+      expect(() => validateCampaignCopy(copy, report, opportunity, sources, candidate), opener).not.toThrow();
+    }
+    const replies = productDraft(); replies.conversation.commonReplies[0].question = "Which cakes are available this weekend?";
+    expect(() => validateCampaignCopy(replies, report, opportunity, sources, candidate)).not.toThrow();
+    const customerYesNo = productDraft(); customerYesNo.conversation.opener = "Hi! Can you deliver the weekend loaf today? Is it available this weekend?";
+    expect(() => validateCampaignCopy(customerYesNo, report, opportunity, sources, candidate)).not.toThrow();
+    // A business question that asks about the customer, not the offer, carries no claim.
+    const ad = productDraft(); ctwa(ad).caption = "Planning a weekend treat? Could you tell us what you're celebrating?";
+    expect(() => validateCampaignCopy(ad, report, opportunity, sources, candidate)).not.toThrow();
+    // Business-voice assertions, rhetorical questions and an assertion after an inquiry stay availability claims.
+    for (const caption of ["Available this weekend!", "The weekend loaf: now available.", "Weekend loaf in stock today.", "Could you resist a weekend loaf available today?", "Would you like the weekend loaf, available this weekend?", "What's better than a weekend loaf available this weekend?", "Could you share what is available this weekend? The weekend loaf is in stock today.", "Check out what's available today!"]) {
+      const copy = productDraft(); ctwa(copy).caption = caption;
+      expect(() => validateCampaignCopy(copy, report, opportunity, sources, candidate), caption).toThrow("dated, original evidence");
+    }
+    // Polite or yes/no questions in business copy still assert an offer or availability (ordinary ad phrasings), in every business field.
+    const businessQuestions = ["Could you use a free delivery today?", "May I suggest our new weekend loaf, now available?", "Could I tempt you with our special offer this weekend?", "Share the joy with free delivery today?", "Could you share what is available this weekend…?", "Do you want free delivery today?", "Are bookings open today? Yes, message us.", "Can you believe the weekend loaf is available today?"];
+    for (const question of businessQuestions) {
+      const caption = productDraft(); ctwa(caption).caption = question;
+      expect(() => validateCampaignCopy(caption, report, opportunity, sources, candidate), `caption: ${question}`).toThrow("dated, original evidence");
+      const headline = productDraft(); headline.channels[0].headline = question;
+      expect(() => validateCampaignCopy(headline, report, opportunity, sources, candidate), `headline: ${question}`).toThrow("dated, original evidence");
+      const core = productDraft(); core.coreMessage = question;
+      expect(() => validateCampaignCopy(core, report, opportunity, sources, candidate), `coreMessage: ${question}`).toThrow("dated, original evidence");
+      const qualification = productDraft(); qualification.conversation.qualificationQuestion = question;
+      expect(() => validateCampaignCopy(qualification, report, opportunity, sources, candidate), `qualificationQuestion: ${question}`).toThrow("dated, original evidence");
+    }
+    for (const opener of ["Hi! The weekend loaf is available this weekend.", "Could you share what is available? The weekend loaf is in stock today.", "Could you believe the weekend loaf is available today?", "Can you believe the weekend loaf is available today?", "Could I tempt you with our special offer this weekend?"]) {
+      const copy = productDraft(); copy.conversation.opener = opener;
+      expect(() => validateCampaignCopy(copy, report, opportunity, sources, candidate), opener).toThrow("dated, original evidence");
+    }
+    // Plain questions are only inquiries when the customer sends them.
+    const answer = productDraft(); answer.conversation.commonReplies[0].answer = "What's available this weekend? The weekend loaf, available this weekend.";
+    expect(() => validateCampaignCopy(answer, report, opportunity, sources, candidate)).toThrow("dated, original evidence");
+  });
+
   test("seasonal proposals use selected insights without claiming a current branch offer", () => {
     const scoped = { ...productSource, context: { scope: "brand" as const, location: null, locationEvidence: null, publishedAt: null, validFrom: null, validThrough: null, temporalStatus: "unknown" as const, dateEvidence: null } };
     const enriched: BusinessEnrichment = { ...enrichment, insights: [{ id: "insight-1", kind: "content", claim: "The product description can explain the offering.", implication: "Introduce its named product.", sourceIds: ["s1"] }] };
@@ -372,6 +415,8 @@ describe("local export inventory", () => {
       await writeCompletedCopyRecord(directory, campaignInputHash(input), response);
       expect(await hasBoundCompletedCopy(input)).toBe(true);
       for (let attempt = 0; attempt < 2; attempt++) await expect(createCampaign(input)).rejects.toBeInstanceOf(CampaignCopyValidationError);
+      // The failed replay still carries the stored response's metering so the run can account for it.
+      await expect(createCampaign(input)).rejects.toMatchObject({ usage: response.usage });
       expect((await readCompletedCopyRecord(directory, campaignInputHash(input)))?.outputText).toBe(response.outputText);
     } finally { vi.unstubAllEnvs(); await rm(directory, { recursive: true, force: true }); }
   });
@@ -399,6 +444,29 @@ describe("local export inventory", () => {
       }
       expect((await readCompletedCopyRecord(directory, campaignInputHash(input)))?.outputText).toBe(response.outputText);
     } finally { vi.unstubAllEnvs(); await rm(directory, { recursive: true, force: true }); }
+  });
+
+  test("a stored live response whose WhatsApp opener asks what is available revalidates locally on retry, without another paid request", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "tickr-inquiry-response-"));
+    const context: NonNullable<CollectedSource["context"]> = { scope: "brand", location: null, locationEvidence: null, publishedAt: null, validFrom: null, validThrough: null, temporalStatus: "unknown", dateEvidence: null };
+    const candidate: BusinessEnrichment = { ...enrichment, branch: { status: "candidate", label: "Fixture branch", locality: "Fixture", address: null, sourceIds: ["s1"], rationale: "Likely match from a reported description." } };
+    const input: CreateCampaignInput = { business: { id: "b1", name: "Fixture bakery", locality: "Fixture", vertical: "bakery", goal: "Test customer inquiry", website: null }, report, opportunityId: opportunity.id, sources: [{ ...productSource, context }], enrichment: candidate, mode: "synthetic", outputDir: directory, requireCompletedCopy: true };
+    const copy = productDraft(); copy.creativeBrief!.context = { insightIds: [], whyNow: "Explain the offering.", seasonalTheme: { name: null, status: "none", sourceIds: [] } };
+    copy.conversation.opener = "Hi! Could you share what is available this weekend…?";
+    const response: CompletedCopyResponse = { version: 1, status: "completed", responseId: "response-inquiry", model: "muse-spark-1.3", requestHash: hashBytes(Buffer.from("fixture request")), receivedAt: new Date().toISOString(), usage: { model: "muse-spark-1.3", inputTokens: 17, outputTokens: 29, elapsedMs: 43 }, outputText: JSON.stringify(copy) };
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Unexpected network request in an offline test."));
+    vi.stubEnv("META_API_KEY", "");
+    try {
+      await writeCompletedCopyRecord(directory, campaignInputHash(input), response);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const replayed = await readCopyCheckpoint(input, opportunity);
+        expect(replayed?.origin).toBe("completed_response");
+        expect(replayed?.usage).toEqual(response.usage);
+        expect(replayed?.copy.conversation.opener).toBe(copy.conversation.opener);
+      }
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect((await readCompletedCopyRecord(directory, campaignInputHash(input)))?.outputText).toBe(response.outputText);
+    } finally { fetchSpy.mockRestore(); vi.unstubAllEnvs(); await rm(directory, { recursive: true, force: true }); }
   });
 
   test("a pending completed response fails closed before any replacement request", async () => {

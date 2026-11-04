@@ -37,13 +37,20 @@ function illustrationCategory(business: Pick<BusinessContext, "vertical">): stri
   return (business.vertical ?? "").normalize("NFKC").replace(/[\u0000-\u001f\u007f]/gu, " ").replace(/\s+/g, " ").trim().slice(0, 100);
 }
 
+/** Subject phrase of the symbolic illustration (no offering, no category): see buildGroundedImagePrompt. */
+const SYMBOLIC_SUBJECT_PHRASE = "botanical forms";
+
 /**
- * The SAM 3.1 concept phrase for the illustration's central subject: the illustrated offering's
- * name when one is depicted, otherwise a generic phrase (the category item is deliberately unnamed).
+ * The deterministic SAM 3.1 concept phrase for the illustration's central subject, mirroring the
+ * subject buildGroundedImagePrompt asks for: the illustrated offering's name when one is depicted,
+ * otherwise the generic category item ("<category> item"), otherwise the symbolic botanical forms.
+ * Descriptive data only; it never verifies what the generated pixels show.
  */
-export function illustrationSubjectPhrase(input: Pick<PrepareCampaignVisualInput, "copy" | "enrichment">): string {
+export function illustrationSubjectPhrase(input: Pick<PrepareCampaignVisualInput, "copy" | "enrichment"> & { business: Pick<BusinessContext, "vertical"> }): string {
   const name = illustratedOffering(input)?.name.normalize("NFKC").replace(/[\u0000-\u001f\u007f]/gu, " ").replace(/\s+/g, " ").trim().slice(0, 80);
-  return name || "main subject";
+  if (name) return name;
+  const category = illustrationCategory(input.business);
+  return category ? `${category} item` : SYMBOLIC_SUBJECT_PHRASE;
 }
 
 export function buildGroundedImagePrompt(input: PrepareCampaignVisualInput): string {
