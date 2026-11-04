@@ -6,6 +6,20 @@ Tickr helps local businesses that cannot afford a photographer, videographer or 
 
 Built for the Meta Global AI Hackathon. All runtime AI uses Meta-hosted APIs.
 
+## Autopilot: one link, one goal, a finished campaign
+
+The default experience is **Autopilot**. Paste a Google Maps listing or website link and pick a goal. Optionally drop in phone photos and videos, or connect Instagram/Facebook with Meta login.
+
+Tickr then works without further input until there is a review-ready kit:
+
+1. It researches the business and chooses the best-supported campaign.
+2. Muse Spark studies **every** photo and clip against the goal.
+3. SAM 3.1 cuts out the real products, using Spark's grounded boxes as prompts, and **tracks them through the owner's footage**.
+4. It renders a cinematic Reel from real pixels, plus a multi-photo carousel and every channel asset.
+5. Spark watches and critiques the result, and fixes that need no new copy are applied.
+
+The owner then approves once; the approval is bound to the exact file hashes. Nothing is published. See [Autopilot](docs/AUTOPILOT.md) for the pipeline, safety rules and verification status.
+
 ## What it does
 
 1. **Discover** the business, its category and the likely shop location from one link.
