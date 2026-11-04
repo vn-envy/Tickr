@@ -39,7 +39,7 @@ from pathlib import Path
 import modal
 
 APP_NAME = "tickr"
-WEB_LABEL = "tickr"  # public URL: https://<workspace>--tickr.modal.run (plus -<env> outside "main")
+WEB_LABEL = "tickr"  # public URL: as `modal deploy` prints it, https://<workspace>--tickr[.<region>].modal.run (plus -<env> outside "main")
 APP_DIR = "/app"
 PORT = 3000
 REPO_ROOT = Path(__file__).resolve().parent.parent

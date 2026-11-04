@@ -69,6 +69,7 @@ elif [[ -e .data ]]; then
   rmdir .data 2>/dev/null || { log ".data already holds files in the image; refusing to replace it."; exit 1; }
 fi
 if probe_volume; then
+  log "volume hard-link probe ok"
   [[ -L .data ]] || ln -s "$DATA_ROOT/state" .data
 elif [[ "${TICKR_ALLOW_EPHEMERAL_DATA:-}" == "1" ]]; then
   log "WARNING: TICKR_ALLOW_EPHEMERAL_DATA=1; run files and uploads stay on container disk and are lost on restart."

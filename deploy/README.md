@@ -16,7 +16,7 @@ Files: `deploy/modal_app.py` (image, container and single-writer lease), `deploy
 | --- | --- |
 | Image | Debian slim with apt FFmpeg (the build fails if the `zscale`/`tonemap` filters are missing), DejaVu fonts, `sqlite3` and Node.js **24.22.1** from nodejs.org (SHA-256 pinned). It then runs `npm ci`, `npm run build` (including `prisma generate`) and a trial `prisma migrate deploy` at build time. `.data`, `.cache`, `.next`, `node_modules`, `.git` and `.env*` are never copied in. |
 | Container | Class `Tickr`, `min_containers=1`, `max_containers=1`, 8 CPU, 16 GiB, `@modal.concurrent(max_inputs=500)`, 3600 s per-request timeout. Preemptible (the SDK default); see "Preemption" below. |
-| Web | `@modal.web_server(3000, startup_timeout=600, label="tickr")` → `https://<workspace>--tickr.modal.run` (outside the default environment, Modal adds the environment name; use the URL `modal deploy` prints) |
+| Web | `@modal.web_server(3000, startup_timeout=600, label="tickr")` → `https://<workspace>--tickr[.<region>].modal.run`. Modal may insert a region (the hosted deploy on 4 Nov 2026 printed `https://<workspace>--tickr.us-east.modal.run`), and outside the default environment it adds the environment name. **Always use the URL `modal deploy` prints**, never a host assembled by hand. |
 | Volume | `tickr-data` (VolumeFS v2) at `/data`: `/data/state` holds everything under `.data` (run outputs, uploads, encrypted connections, research records); `/data/db` holds SQLite snapshots |
 | Secrets | `tickr-runtime` (rotatable settings) and `tickr-keys` (create-once `TICKR_SECRET_KEY`); required keys are checked at deploy time |
 | Writer lease | Modal Dict `tickr-writer-lease` holding one record: a container id and a heartbeat time (no secrets, no owner data) |
@@ -41,6 +41,9 @@ If the Dict is briefly unreachable, a running holder keeps serving and logs the 
 
 ```bash
 python3 -m pip install 'modal==1.6.3'   # the SDK version these files were checked against
+# Behind an HTTPS proxy (HTTPS_PROXY set, e.g. a managed or corporate network), install the proxy extra instead;
+# without it the modal client cannot reach Modal's API:
+#   python3 -m pip install 'modal[api-proxy-support]==1.6.3'
 modal setup                              # browser login; stores the Modal token in ~/.modal.toml
 ```
 
@@ -56,11 +59,11 @@ There are two Secrets:
 | `tickr-keys` | `TICKR_SECRET_KEY` | yes | See above. Generate it inside the create command so it is never displayed. |
 | `tickr-runtime` | `META_API_KEY` | yes | Meta-hosted inference |
 | `tickr-runtime` | `TICKR_ACCESS_CODE` | yes | Owner access code, **16–256 characters** (for example `openssl rand -base64 24`). A shorter code counts as misconfigured and the app fails closed. |
-| `tickr-runtime` | `TICKR_ALLOWED_HOSTS` | yes | The public host, for example `<workspace>--tickr.modal.run`. Without it, every browser write is rejected as cross-origin. |
+| `tickr-runtime` | `TICKR_ALLOWED_HOSTS` | yes | The public host exactly as `modal deploy` printed it, without `https://`: `<workspace>--tickr[.<region>].modal.run`, for example `<workspace>--tickr.us-east.modal.run`. Without it, or with a host that differs from the printed one, every browser write is rejected as cross-origin. |
 | `tickr-runtime` | `META_APP_ID`, `META_APP_SECRET`, `META_OAUTH_REDIRECT_URI` | optional | Owner Instagram/Facebook connection |
 | `tickr-runtime` | `META_CRITIC_MODEL` | optional | `muse-spark-1.3` (default) or `muse-wonder-1.0` |
 
-Find the workspace name with `modal profile current`; the host is then `<workspace>--tickr.modal.run`. If you are unsure, deploy once, read the printed URL, then recreate `tickr-runtime` and redeploy.
+Do not guess the host from `modal profile current`: Modal may add a region (for example `.us-east`) or an environment name to it. Deploy once, read the URL `modal deploy` prints, set `TICKR_ALLOWED_HOSTS` to that host, then recreate `tickr-runtime` and redeploy (with `--strategy recreate`).
 
 ```bash
 # Once only. Skip if `modal secret list` already shows tickr-keys.
@@ -111,7 +114,7 @@ The first build installs dependencies and runs `next build`, so it takes several
 ## 4. Verify
 
 ```bash
-HOST=<workspace>--tickr.modal.run
+HOST=<host printed by modal deploy>   # e.g. <workspace>--tickr.us-east.modal.run; must equal TICKR_ALLOWED_HOSTS
 
 curl -fsS "https://$HOST/api/health"
 # Expect {"status":"ok",...,"database":"ready"}; credentialPresent should be true.
@@ -155,6 +158,7 @@ modal volume ls tickr-data /db  # snapshot files
 
 1. **Link `.data` to the Volume.** The script first probes the Volume for exclusive create, fsync, hard link and atomic rename. It then links the whole `.data` to `/data/state`.
    - Linking only `.data/businesses` would break the media store's `realpath(.data)` integrity check.
+   - On success the log shows `modal-start: volume hard-link probe ok`.
    - If the probe fails, the container refuses to start. Setting `TICKR_ALLOW_EPHEMERAL_DATA=1` in the Secret overrides this with non-durable local files.
 2. **Restore the database.** The newest snapshot (`tickr.db`, then `.1`, then `.2`) that passes `PRAGMA integrity_check` is copied to `/var/lib/tickr/tickr.db`.
    - An existing local database is never overwritten.
@@ -258,7 +262,7 @@ The image pins Node.js 24.22.1 (the runtime these checks ran on). The repository
 
 - `App.cls(...)` accepts `image`, `secrets`, `volumes`, `env`, `cpu`, `memory` (MiB), `min_containers`, `max_containers`, `scaledown_window` (2–3600), `timeout` and `startup_timeout`.
 - `modal.concurrent(max_inputs=..., target_inputs=...)` is applied at class level.
-- `modal.web_server(port, startup_timeout=..., label=...)` produces the subdomain `<workspace>--<label>.modal.run`.
+- `modal.web_server(port, startup_timeout=..., label=...)` produces the subdomain `<workspace>--<label>.modal.run`; the live deployment additionally showed a region segment (`<workspace>--<label>.<region>.modal.run`), so always use the printed URL.
 - `Volume.from_name(name, create_if_missing=True, version=2)` creates a v2 Volume.
 - `Secret.from_name(name, required_keys=[...])` checks the required keys.
 - Exit handlers (`@modal.exit`) run before the final Volume commit.
