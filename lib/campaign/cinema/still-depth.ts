@@ -24,6 +24,11 @@ import { cleanText, pill, svgDocument, textBlock, type Bounds, type FontFace, ty
  * generated Muse plate that always sits underneath the subject. Typography is local
  * SVG. Every frame is replayed at reduced resolution into a CompositionLedger.
  *
+ * Framing is bounded: outside transitions the subject's whole bounding box stays inside
+ * STILL_DEPTH_SAFE_AREA, spans at least MIN_SUBJECT_FILL of it and stays horizontally centred;
+ * scene text sits in the region the subject does not occupy (the hook's depth headline excepted,
+ * which is checked for legibility behind the subject).
+ *
  * Output contract matches the existing Reel: 1080×1920, 30 fps, H.264, 360 frames,
  * 12.0 s, no audio, plus a 1080×1920 PNG cover. Nothing here calls a network service.
  */
@@ -62,6 +67,23 @@ const HOOK_ZOOM = 1.06;
 const HOOK_HEADLINE_RISE = 44;
 /** Ledger rows the hook headline still sits below its final place once it is visible (HEADLINE_VISIBLE_OPACITY). */
 const HOOK_HEADLINE_VISIBLE_RISE_CELLS = Math.ceil((1 - HEADLINE_VISIBLE_OPACITY) * HOOK_HEADLINE_RISE / LEDGER_FACTOR);
+/**
+ * Safe area: outside transitions, every scene keeps the subject's whole bounding box inside this
+ * rectangle (a 6% margin on each side of the 1080×1920 frame). Edges cut by the photo's own border
+ * are the one exception in the hook, where they stay pinned out of view.
+ */
+export const STILL_DEPTH_SAFE_AREA: Bounds = { left: Math.round(W * 0.06), top: Math.round(H * 0.06), right: W - Math.round(W * 0.06), bottom: H - Math.round(H * 0.06) };
+/** The subject spans at least this share of the safe area's width or height in every scene (no tiny subject). */
+export const MIN_SUBJECT_FILL = 0.4;
+/** The subject's bounding-box centre stays within this share of the frame width of the centre line. */
+export const MAX_SUBJECT_OFFCENTRE = 0.08;
+/** A tiny subject is enlarged toward this fill in the hook (within the safe area and the resolution cap). */
+const HOOK_TARGET_FILL = 0.5;
+/**
+ * Magnification of source pixels the subject may be enlarged to for framing; a smaller subject is enlarged
+ * further only as far as MIN_SUBJECT_FILL needs (a plain resample of the real cutout, never generated).
+ */
+const MAX_SOURCE_MAGNIFICATION = 1.5;
 /** Rows occupied by the concept (top) and provenance (bottom) chips in every frame. */
 export const STILL_DEPTH_LABEL_BANDS = { top: { top: 44, bottom: 96 }, bottom: { top: H - 96, bottom: H - 44 } } as const;
 /** Transition windows [start, end) in frames. */
@@ -136,7 +158,14 @@ export interface StillDepthLayoutReport {
   };
   /** Worst-case subject share hidden by foreground graphics, per scene (layout-time estimate). */
   foregroundOcclusion: [number, number, number, number];
-  valueSubjectSide: "left" | "right";
+  /** The value scene centres the subject below its story text (legacy field; always "centre"). */
+  valueSubjectSide: "left" | "right" | "centre";
+  /**
+   * Subject framing: the safe area every scene keeps the whole subject inside, whether the proof push-in
+   * stays registered with the photo or the subject is fitted above the proof text, and the smallest share
+   * of the safe area the subject spans per scene (hook, proof, value, CTA).
+   */
+  subjectFraming: { safeArea: Bounds; proof: "registered" | "fitted"; minFill: [number, number, number, number] };
   truncatedText: string[];
   usesGeneratedBackdrop: boolean;
   /** The provenance chip text as rendered (before upper-casing) on every frame. */
@@ -381,7 +410,7 @@ function chooseLevel(levels: readonly AlphaRaster[], k: number, factor: number):
 
 const SHADOW_OFFSET = 22;
 /** Horizontal parallax amplitude of the subject in the value scene (output px). */
-const VALUE_DRIFT = 36;
+const VALUE_DRIFT = 24;
 
 class PixelSurface implements Surface {
   readonly rgb = new Float32Array(W * H * 3);
@@ -639,6 +668,8 @@ async function prepareAssets(input: StillDepthInput) {
   };
   const plateB = await treated(11, 0.22, 0.5, 0.14);
   const plateC = await treated(22, 0.6, 0.62, 0.12);
+  // The proof backdrop when the subject is fitted above its text instead of registered with the photo.
+  const plateP = await treated(7, 0.8, 0.72, 0.08);
 
   let backdrop: RgbRaster | null = null;
   if (input.backdrop) {
@@ -657,7 +688,10 @@ async function prepareAssets(input: StillDepthInput) {
     cutout[o] = source.data[s * 3]; cutout[o + 1] = source.data[s * 3 + 1]; cutout[o + 2] = source.data[s * 3 + 2]; cutout[o + 3] = mask[s];
   }
   const levels: AlphaRaster[] = [];
-  for (const level of [1.3, 1, 0.72, 0.52, 0.37, 0.26]) {
+  /** Largest subject scale (base-space k): the photo framing ×1.3, 1.5× source pixels, or what the minimum fill needs. */
+  const baseFill = Math.max(subject.width / (STILL_DEPTH_SAFE_AREA.right - STILL_DEPTH_SAFE_AREA.left), subject.height / (STILL_DEPTH_SAFE_AREA.bottom - STILL_DEPTH_SAFE_AREA.top));
+  const maxK = Math.max(1.3, MAX_SOURCE_MAGNIFICATION / s0, (MIN_SUBJECT_FILL + 0.1) / Math.max(1e-6, baseFill));
+  for (const level of [...(maxK > 1.3 ? [maxK] : []), 1.3, 1, 0.72, 0.52, 0.37, 0.26]) {
     // Upscaled levels (tiny sources) are still plain resamples of the cutout, bounded in size.
     const r = Math.min(level * s0, Math.max(1, 2600 / Math.max(crop.width, crop.height)));
     const width = Math.max(1, Math.round(crop.width * r)), height = Math.max(1, Math.round(crop.height * r));
@@ -685,7 +719,7 @@ async function prepareAssets(input: StillDepthInput) {
   const shadow = derived(0, 16 * smallest.scaleX, 0.62);
   const silhouette = derived(Math.max(1, 14 * smallest.scaleX), 1.2, 1);
 
-  return { theme, subjectLevels: levels, shadow, silhouette, plateA, plateB, plateC, backdrop, subject, touches, pole, maskRefinement: refined.report };
+  return { theme, subjectLevels: levels, shadow, silhouette, plateA, plateB, plateC, plateP, backdrop, subject, touches, pole, maxK, maskRefinement: refined.report };
 }
 
 // ---------------------------------------------------------------------------
@@ -695,6 +729,36 @@ async function prepareAssets(input: StillDepthInput) {
 function subjectMap(assets: Prepared, p: Placement): Float32Array {
   const level = chooseLevel(assets.subjectLevels, p.k, LEDGER_FACTOR);
   return alphaMap(level, xform(level, p), FULL, LEDGER_FACTOR, LW, LH);
+}
+
+/** Output-space bounding box of the subject under a placement. */
+function subjectBoundsAt(subject: Prepared["subject"], p: Placement): Bounds {
+  const [left, top] = apply(p, subject.left, subject.top), [right, bottom] = apply(p, subject.right, subject.bottom);
+  return { left, top, right, bottom };
+}
+
+const SAFE = STILL_DEPTH_SAFE_AREA;
+const SAFE_WIDTH = SAFE.right - SAFE.left, SAFE_HEIGHT = SAFE.bottom - SAFE.top;
+
+/** Share of the safe area the subject spans (its larger axis). */
+function subjectFill(bounds: Bounds): number {
+  return Math.max((bounds.right - bounds.left) / SAFE_WIDTH, (bounds.bottom - bounds.top) / SAFE_HEIGHT);
+}
+
+/** The scale that contains the subject's bounding box in a region (capped at the resolution limit). */
+function containK(assets: Prepared, region: Bounds): number {
+  const { subject } = assets;
+  return Math.max(0.05, Math.min(assets.maxK, (region.right - region.left) / Math.max(1, subject.width), (region.bottom - region.top) / Math.max(1, subject.height)));
+}
+
+/** The subject's bounding box centred on a point at scale k. */
+function centredPlacement(subject: Prepared["subject"], k: number, center: readonly [number, number]): Placement {
+  const ax = (subject.left + subject.right) / 2, ay = (subject.top + subject.bottom) / 2;
+  return { k, ax, ay, dx: center[0] - ax, dy: center[1] - ay };
+}
+
+function insideRegion(bounds: Bounds, region: Bounds, slack = 0.5): boolean {
+  return bounds.left >= region.left - slack && bounds.top >= region.top - slack && bounds.right <= region.right + slack && bounds.bottom <= region.bottom + slack;
 }
 
 /** Share of the subject hidden by the union of foreground alpha maps. */
@@ -811,14 +875,45 @@ async function prepareLayout(input: StillDepthInput, assets: Prepared) {
     ax: assets.touches.left && !assets.touches.right ? subject.left : assets.touches.right && !assets.touches.left ? subject.right : subject.cx,
     ay: assets.touches.bottom ? subject.bottom : subject.bottom - subject.height * 0.15,
   };
-  const away: "left" | "right" = subject.cx >= W / 2 ? "left" : "right";
+  // Hook framing: the photo's own framing (k = 1) unless that, at the end of the hook zoom, would carry a
+  // free (not photo-cut) edge outside the safe area; a tiny subject is enlarged toward HOOK_TARGET_FILL.
+  const hookFill = (k: number) => k * subjectFill({ left: 0, top: 0, right: subject.width, bottom: subject.height });
+  const hookKSafe = (() => {
+    const t = assets.touches, { ax, ay } = hookAnchor, Z = HOOK_ZOOM;
+    const limits = [Infinity];
+    if (!t.left && !t.right) limits.push(SAFE_WIDTH / (subject.width * Z));
+    else if (t.left && !t.right && subject.right > ax) limits.push((SAFE.right - ax) / (Z * (subject.right - ax)));
+    else if (t.right && !t.left && ax > subject.left) limits.push((ax - SAFE.left) / (Z * (ax - subject.left)));
+    if (!t.top && !t.bottom) limits.push(SAFE_HEIGHT / (subject.height * Z));
+    else if (t.bottom && !t.top && ay > subject.top) limits.push((ay - SAFE.top) / (Z * (ay - subject.top)));
+    else if (t.top && !t.bottom && subject.bottom > ay) limits.push((SAFE.bottom - ay) / (Z * (subject.bottom - ay)));
+    return Math.max(0.05, Math.min(...limits));
+  })();
+  const hookBaseK = Math.min(hookKSafe, Math.max(Math.min(1, hookKSafe), Math.min(assets.maxK, HOOK_TARGET_FILL / Math.max(1e-6, hookFill(1)))));
+  /** Hook start placement at scale k: free axes are centred within tolerance and kept inside the safe area over the whole zoom. */
+  const hookPlacementAt = (k: number): Placement => {
+    const { ax, ay } = hookAnchor, t = assets.touches, kz = k * HOOK_ZOOM;
+    let dx = 0, dy = 0;
+    if (!t.left && !t.right) {
+      const left = ax + kz * (subject.left - ax), right = ax + kz * (subject.right - ax);
+      const centre = ax + k * ((subject.left + subject.right) / 2 - ax), tolerance = W * MAX_SUBJECT_OFFCENTRE * 0.9;
+      dx = Math.max(0, W / 2 - tolerance - centre) + Math.min(0, W / 2 + tolerance - centre);
+      dx = Math.max(SAFE.left - left, Math.min(SAFE.right - right, dx));
+    }
+    if (!t.top && !t.bottom) {
+      const top = ay + kz * (subject.top - ay), bottom = ay + kz * (subject.bottom - ay);
+      dy = Math.max(SAFE.top - top, Math.min(SAFE.bottom - bottom, 0));
+    }
+    return { k, ax, ay, dx: Math.round(dx), dy: Math.round(dy) };
+  };
+  const away: "left" | "right" = subject.cx + hookPlacementAt(hookBaseK).dx >= W / 2 ? "left" : "right";
   const columnFor = (column: "full" | "left" | "right") => column === "full" ? { column, x: SIDE - 4, width: textWidth, anchor: "start" as const }
     : column === "left" ? { column, x: SIDE - 4, width: HOOK_SIDE_COLUMN, anchor: "start" as const } : { column, x: W - SIDE + 4, width: HOOK_SIDE_COLUMN, anchor: "end" as const };
   const columns = [columnFor("full"), columnFor(away), columnFor(away === "left" ? "right" : "left")];
   // The subject's extent over the whole hook (its slow zoom), widened upwards by the rows the headline
   // still has to rise once it is visible: the headline is then checked against every visible frame at once.
   const coverageAt = (k: number) => {
-    const start = { k, ...hookAnchor, dx: 0, dy: 0 };
+    const start = hookPlacementAt(k);
     const [a, b] = [subjectMap(assets, start), subjectMap(assets, { ...start, k: k * HOOK_ZOOM })];
     for (let i = 0; i < a.length; i++) a[i] = Math.max(a[i], b[i]);
     const swept = new Float32Array(a.length);
@@ -838,14 +933,17 @@ async function prepareLayout(input: StillDepthInput, assets: Prepared) {
     }
     return headlines.get(key) ?? null;
   };
-  let hookStart: Placement = { k: 1, ...hookAnchor, dx: 0, dy: 0 };
+  let hookStart: Placement = hookPlacementAt(hookBaseK);
   let hookCoverage: Float32Array = new Float32Array(LW * LH);
   let hookHeadline: Graphic | null = null, hookKicker: Graphic | null = null;
   let hookReport: StillDepthLayoutReport["hookHeadline"] = { placement: "behind_subject", occlusion: 0, lineOcclusion: 0, foregroundOcclusion: 0, fontSize: 0, top: 0, column: "full", subjectScale: 1 };
   let hookFront = false;
   const kickerSpec = (color: string): TextSpec => ({ text: hookScene.kicker, face: "sansBold", size: 26, maxLines: 1, color, letterSpacing: 5, uppercase: true });
   // First pass never truncates the headline; only if nothing fits does the smallest size accept an ellipsis.
-  search: for (const allowTruncation of [false, true]) for (const k of HOOK_PULLBACK) {
+  search: for (const allowTruncation of [false, true]) for (const [pullIndex, pull] of HOOK_PULLBACK.entries()) {
+    const k = hookBaseK * pull;
+    // Pulling back for headline room never leaves a tiny subject.
+    if (pullIndex > 0 && hookFill(k) < MIN_SUBJECT_FILL) continue;
     const { start, coverage, swept } = coverageAt(k);
     for (const column of columns) for (const size of allowTruncation ? HOOK_SIZES.slice(-1) : HOOK_SIZES) {
       const headline = await headlineFor(column, size);
@@ -865,7 +963,7 @@ async function prepareLayout(input: StillDepthInput, assets: Prepared) {
       if (!chosen) continue;
       hookStart = start; hookCoverage = coverage;
       hookHeadline = shiftGraphic(base, chosen.dy);
-      hookReport = { placement: "behind_subject", occlusion: Number(chosen.occlusion.toFixed(4)), lineOcclusion: Number(chosen.line.toFixed(4)), foregroundOcclusion: 0, fontSize: headline.laid.size, top: chosen.dy, column: column.column, subjectScale: k };
+      hookReport = { placement: "behind_subject", occlusion: Number(chosen.occlusion.toFixed(4)), lineOcclusion: Number(chosen.line.toFixed(4)), foregroundOcclusion: 0, fontSize: headline.laid.size, top: chosen.dy, column: column.column, subjectScale: Number(k.toFixed(4)) };
       if (headline.laid.truncated) truncated.push("hook.headline");
       const kicker = hookScene.kicker.trim() ? block(kickerSpec(theme.kickerOnDark), column.anchor === "end" ? W - SIDE : SIDE, chosen.dy - 64, column.width, column.anchor) : null;
       hookKicker = kicker ? await renderGraphic(kicker.svg) : null;
@@ -875,7 +973,7 @@ async function prepareLayout(input: StillDepthInput, assets: Prepared) {
   if (!hookHeadline) {
     // The subject fills the frame at every scale: the headline moves in front, in the band the subject covers least.
     hookFront = true;
-    hookCoverage = coverageAt(1).coverage;
+    hookCoverage = coverageAt(hookBaseK).coverage;
     const headline = block({ text: hookScene.headline, face: "serif", size: 96, minSize: 72, maxLines: 3, color: theme.light, lineHeight: 1.04 }, SIDE - 4, 0, textWidth);
     const base = await renderGraphic(headline.svg);
     if (base) {
@@ -886,7 +984,7 @@ async function prepareLayout(input: StillDepthInput, assets: Prepared) {
       }
       hookHeadline = shiftGraphic(base, best.dy);
       if (headline.truncated) truncated.push("hook.headline");
-      hookReport = { placement: "in_front", occlusion: 0, lineOcclusion: 0, foregroundOcclusion: Number(foregroundOcclusion(hookCoverage, [hookHeadline]).toFixed(4)), fontSize: headline.size, top: best.dy, column: "full", subjectScale: 1 };
+      hookReport = { placement: "in_front", occlusion: 0, lineOcclusion: 0, foregroundOcclusion: Number(foregroundOcclusion(hookCoverage, [hookHeadline]).toFixed(4)), fontSize: headline.size, top: best.dy, column: "full", subjectScale: Number(hookBaseK.toFixed(4)) };
     }
   }
   const headlineBottom = hookHeadline ? hookHeadline.y + hookHeadline.height : 0;
@@ -909,66 +1007,77 @@ async function prepareLayout(input: StillDepthInput, assets: Prepared) {
   }
   const hookOcclusion = foregroundOcclusion(hookCoverage, [hookBody, chrome, hookFront ? hookHeadline : null]);
 
-  // PROOF — slow push-in on the real photo, text stack in front in the lower third.
+  // PROOF — slow push-in, text stack in the lower third. The subject stays whole above the text: the push-in
+  // stays registered with the photo when the photo's framing allows it, otherwise the subject is fitted
+  // (contained, centred) in the safe area above the text over a softened plate, with a bounded push-in.
   const proofSpecs = (bodyLines: number): TextSpec[] => [
     { text: proofScene.kicker, face: "sansBold", size: 24, maxLines: 1, color: theme.kickerOnDark, letterSpacing: 4.5, uppercase: true },
     { text: proofScene.headline, face: "serif", size: 80, minSize: 58, maxLines: 3, color: theme.light, lineHeight: 1.06 },
     { text: proofScene.body, face: "sans", size: 34, minSize: 28, maxLines: bodyLines, color: theme.light, lineHeight: 1.32, opacity: 0.94 },
   ];
   const proofGaps = [22, 26, 0];
-  let proof: { kEnd: number; target: [number, number]; graphics: (Graphic | null)[]; gradient: Graphic | null; occlusion: number } | null = null;
-  for (const [kEnd, bodyLines] of [[1.22, 3], [1.14, 3], [1.08, 2], [1, 2], [0.94, 2]] as const) {
+  const proofCandidates = [3, 2].map((bodyLines) => {
     const specs = proofSpecs(bodyLines);
-    const height = stackHeight(specs, textWidth, proofGaps);
-    const top = H - 150 - height;
-    const camera = { k: kEnd, ax: subject.cx, ay: subject.cy, dx: (W / 2 - subject.cx) * 0.6, dy: Math.min(0, top - 40 - (subject.cy + kEnd * (subject.bottom - subject.cy))) };
-    const fitted = fitPlacement(camera, assets.plateA);
-    const laid = stack(specs, SIDE, top, textWidth, proofGaps);
-    const graphics = await graphicsFor(laid, true);
-    const occlusion = foregroundOcclusion(subjectMap(assets, fitted), [...graphics, chrome]);
-    if (!proof || occlusion < proof.occlusion) {
-      const gradientTop = Math.max(0, top - 300);
-      const gradient = await renderGraphic(`<rect x="0" y="${gradientTop}" width="${W}" height="${H - gradientTop}" fill="url(#proofShade)"/>`, `<linearGradient id="proofShade" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${theme.dark}" stop-opacity="0"/><stop offset="0.55" stop-color="${theme.dark}" stop-opacity="0.62"/><stop offset="1" stop-color="${theme.dark}" stop-opacity="0.86"/></linearGradient>`);
-      proof = { kEnd: fitted.k, target: [camera.dx, camera.dy], graphics, gradient, occlusion };
-      note("proof", laid);
-    }
-    if (occlusion <= MAX_FOREGROUND_OCCLUSION) break;
+    const top = H - 150 - stackHeight(specs, textWidth, proofGaps);
+    const region: Bounds = { left: SAFE.left, top: SAFE.top, right: SAFE.right, bottom: Math.min(SAFE.bottom, top - 40) };
+    return { bodyLines, specs, top, region, k: containK(assets, region) };
+  });
+  const proofChoice = proofCandidates.find((candidate) => subjectFill(subjectBoundsAt(subject, centredPlacement(subject, candidate.k, [0, 0]))) >= MIN_SUBJECT_FILL + 0.15)
+    ?? proofCandidates.reduce((best, candidate) => candidate.k > best.k ? candidate : best);
+  const proofCameraFor = (kEnd: number, target: readonly [number, number], t: number): Placement => {
+    const e = easeInOut((t + 0.2) / 3.4);
+    return fitPlacement({ k: 1.06 + (kEnd - 1.06) * e, ax: subject.cx, ay: subject.cy, dx: target[0] * e, dy: target[1] * e }, assets.plateA);
+  };
+  const proofSamples = Array.from({ length: 15 }, (_, index) => -0.2 + index * 3.4 / 14);
+  let registered: { kEnd: number; target: [number, number] } | null = null;
+  for (const kEnd of [1.22, 1.14, 1.08, 1]) {
+    const target: [number, number] = [(W / 2 - subject.cx) * 0.6, Math.min(0, proofChoice.region.bottom - (subject.cy + kEnd * (subject.bottom - subject.cy)))];
+    const ok = proofSamples.every((t) => {
+      const bounds = subjectBoundsAt(subject, proofCameraFor(kEnd, target, t));
+      return insideRegion(bounds, proofChoice.region) && subjectFill(bounds) >= MIN_SUBJECT_FILL && Math.abs((bounds.left + bounds.right) / 2 - W / 2) <= W * MAX_SUBJECT_OFFCENTRE;
+    });
+    if (ok) { registered = { kEnd, target }; break; }
   }
+  const proofFitK = proofChoice.k;
+  const proofCenter: [number, number] = [(proofChoice.region.left + proofChoice.region.right) / 2, (proofChoice.region.top + proofChoice.region.bottom) / 2];
+  const proofLaid = stack(proofChoice.specs, SIDE, proofChoice.top, textWidth, proofGaps);
+  note("proof", proofLaid);
+  const proofGraphics = await graphicsFor(proofLaid, true);
+  const gradientTop = Math.max(0, proofChoice.top - 300);
+  const proofGradient = await renderGraphic(`<rect x="0" y="${gradientTop}" width="${W}" height="${H - gradientTop}" fill="url(#proofShade)"/>`, `<linearGradient id="proofShade" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${theme.dark}" stop-opacity="0"/><stop offset="0.55" stop-color="${theme.dark}" stop-opacity="0.62"/><stop offset="1" stop-color="${theme.dark}" stop-opacity="0.86"/></linearGradient>`);
+  const proofEnd = registered ? proofCameraFor(registered.kEnd, registered.target, 3.2) : centredPlacement(subject, proofFitK, proofCenter);
+  const proof = {
+    registered, fitK: proofFitK, center: proofCenter, graphics: proofGraphics, gradient: proofGradient,
+    occlusion: foregroundOcclusion(subjectMap(assets, proofEnd), [...proofGraphics, chrome]),
+  };
 
-  // VALUE — parallax: background drifts one way, the real subject the other; story text on the free side.
-  const side: "left" | "right" = subject.cx >= W / 2 ? "right" : "left";
-  const columnWidth = Math.round(W * 0.46);
-  const columnX = side === "right" ? SIDE : W - SIDE - columnWidth;
-  const valueSpecs: TextSpec[] = [
+  // VALUE — parallax: the background drifts one way, the real subject (centred below the story text) gently the other.
+  const valueSpecs = (bodyLines: number): TextSpec[] => [
     { text: valueScene.kicker, face: "sansBold", size: 23, maxLines: 2, color: theme.kickerOnDark, letterSpacing: 4, uppercase: true },
-    { text: valueScene.headline, face: "serif", size: 68, minSize: 46, maxLines: 5, color: theme.light, lineHeight: 1.08 },
-    { text: valueScene.body, face: "sans", size: 31, minSize: 26, maxLines: 6, color: theme.light, lineHeight: 1.34, opacity: 0.94 },
+    { text: valueScene.headline, face: "serif", size: 68, minSize: 46, maxLines: 3, color: theme.light, lineHeight: 1.08 },
+    { text: valueScene.body, face: "sans", size: 31, minSize: 26, maxLines: bodyLines, color: theme.light, lineHeight: 1.34, opacity: 0.94 },
   ];
   const valueGaps = [20, 28, 0];
-  const valueHeight = stackHeight(valueSpecs, columnWidth, valueGaps);
-  const valueTop = Math.round(Math.max(170, Math.min(H * 0.5 - valueHeight / 2, H - 170 - valueHeight)));
-  const valueLaid = stack(valueSpecs, columnX, valueTop, columnWidth, valueGaps);
+  const valueTop = 160;
+  const valueCandidates = [3, 2, 1].map((bodyLines) => {
+    const specs = valueSpecs(bodyLines);
+    const bottom = valueTop + stackHeight(specs, textWidth, valueGaps);
+    const region: Bounds = { left: SAFE.left + VALUE_DRIFT, top: Math.max(SAFE.top, bottom + 56), right: SAFE.right - VALUE_DRIFT, bottom: SAFE.bottom };
+    // The scene settles 3% larger at the end of its drift; the end state is what must fit.
+    return { specs, bottom, region, k: containK(assets, region) / 1.03 };
+  });
+  const valueChoice = valueCandidates.find((candidate) => subjectFill(subjectBoundsAt(subject, centredPlacement(subject, candidate.k, [0, 0]))) >= MIN_SUBJECT_FILL + 0.15)
+    ?? valueCandidates.reduce((best, candidate) => candidate.k > best.k ? candidate : best);
+  const valueLaid = stack(valueChoice.specs, SIDE, valueTop, textWidth, valueGaps);
   note("value", valueLaid);
   const valueGraphics = await graphicsFor(valueLaid, true);
-  const sideGradient = await renderGraphic(`<rect width="${W}" height="${H}" fill="url(#sideShade)"/>`, `<linearGradient id="sideShade" x1="${side === "right" ? 0 : 1}" y1="0" x2="${side === "right" ? 1 : 0}" y2="0"><stop offset="0" stop-color="${theme.dark}" stop-opacity="0.78"/><stop offset="0.5" stop-color="${theme.dark}" stop-opacity="0.42"/><stop offset="0.8" stop-color="${theme.dark}" stop-opacity="0"/></linearGradient>`);
-  const textBounds = valueLaid.reduce<Bounds | null>((bounds, item) => !item ? bounds : !bounds ? { ...item.bounds } : { left: Math.min(bounds.left, item.bounds.left), top: Math.min(bounds.top, item.bounds.top), right: Math.max(bounds.right, item.bounds.right), bottom: Math.max(bounds.bottom, item.bounds.bottom) }, null);
-  const fitK = Math.min(1.15, (H * 0.56) / subject.height, (W * 0.5) / subject.width);
-  let value = { k: fitK, center: [W / 2, H * 0.53] as [number, number], occlusion: Infinity, score: Infinity };
-  for (const factor of [1, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4]) {
-    const k = fitK * factor, halfWidth = subject.width * k * 1.03 / 2;
-    // Keep a clear gutter between the story column and the subject at the end of its drift.
-    const gutter = 40 + VALUE_DRIFT;
-    const preferred = side === "right" ? W * 0.71 : W * 0.29;
-    const center: [number, number] = [
-      side === "right" ? Math.max(preferred, (textBounds?.right ?? W / 2) + gutter + halfWidth) : Math.min(preferred, (textBounds?.left ?? W / 2) - gutter - halfWidth),
-      H * 0.53,
-    ];
-    const overflow = side === "right" ? center[0] + halfWidth + VALUE_DRIFT - (W - 12) : 12 - (center[0] - halfWidth - VALUE_DRIFT);
-    const worst = Math.max(...[-1, 1].map((drift) => foregroundOcclusion(subjectMap(assets, valuePlacement(subject, k * 1.03, center, side, drift)), [...valueGraphics, chrome])));
-    const score = worst + Math.max(0, overflow) / W;
-    if (score < value.score) value = { k, center, occlusion: worst, score };
-    if (worst <= MAX_FOREGROUND_OCCLUSION && overflow <= 0) break;
-  }
+  const shadeEnd = Math.min(H, valueChoice.bottom + 220);
+  const valueGradient = await renderGraphic(`<rect width="${W}" height="${shadeEnd}" fill="url(#topShade)"/>`, `<linearGradient id="topShade" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${theme.dark}" stop-opacity="0.8"/><stop offset="0.7" stop-color="${theme.dark}" stop-opacity="0.5"/><stop offset="1" stop-color="${theme.dark}" stop-opacity="0"/></linearGradient>`);
+  const valueCenter: [number, number] = [(valueChoice.region.left + valueChoice.region.right) / 2, (valueChoice.region.top + valueChoice.region.bottom) / 2];
+  const value = {
+    k: valueChoice.k, center: valueCenter,
+    occlusion: Math.max(...[-1, 1].map((drift) => foregroundOcclusion(subjectMap(assets, valuePlacement(subject, valueChoice.k * (1 + 0.03 * (drift + 1) / 2), valueCenter, drift)), [...valueGraphics, chrome]))),
+  };
 
   // CTA — end card on paper: brand line, headline, real subject centred smaller, CTA pill.
   const brand = block({ text: input.businessName, face: "sansBold", size: 28, minSize: 20, maxLines: 1, color: theme.dark, letterSpacing: 5, uppercase: true }, W / 2, 150, textWidth, "middle");
@@ -979,7 +1088,7 @@ async function prepareLayout(input: StillDepthInput, assets: Prepared) {
   const bottomStack = pillHeight + (bodyHeight ? 34 + bodyHeight : 0);
   const boxTop = ctaHeadline.bounds.bottom + 56;
   const boxBottom = H - 150 - bottomStack - 56;
-  const fitCtaK = Math.max(0.2, Math.min(1.3, (W * 0.7) / subject.width, Math.max(120, boxBottom - boxTop) / subject.height));
+  const fitCtaK = containK(assets, { left: SAFE.left, right: SAFE.right, top: Math.max(SAFE.top, boxTop), bottom: Math.min(SAFE.bottom, Math.max(boxTop + 120, boxBottom)) });
   const ctaCenter: [number, number] = [W / 2, boxTop + Math.max(120, boxBottom - boxTop) / 2];
   const [ctaBrandG, ctaHeadlineG] = await Promise.all([renderGraphic(brand.svg), renderGraphic(ctaHeadline.svg)]);
   // The end card shrinks the subject until the brand line, headline, pill and body hide at most 10% of it.
@@ -1009,27 +1118,27 @@ async function prepareLayout(input: StillDepthInput, assets: Prepared) {
 
   const layout: StillDepthLayoutReport = {
     hookHeadline: hookReport,
-    foregroundOcclusion: [hookOcclusion, proof?.occlusion ?? 0, value.occlusion, ctaOcclusion].map((value) => Number(value.toFixed(4))) as [number, number, number, number],
-    valueSubjectSide: side,
+    foregroundOcclusion: [hookOcclusion, proof.occlusion, value.occlusion, ctaOcclusion].map((value) => Number(value.toFixed(4))) as [number, number, number, number],
+    valueSubjectSide: "centre",
     truncatedText: truncated,
     usesGeneratedBackdrop: Boolean(assets.backdrop),
     provenanceLabel,
     conceptLabel: concept,
     subjectMask: assets.maskRefinement,
+    // Measured over every non-transition frame once the Director exists (prepareStillDepth).
+    subjectFraming: { safeArea: { ...SAFE }, proof: registered ? "registered" : "fitted", minFill: [0, 0, 0, 0] },
   };
   return {
     chrome, chromeOnly, layout,
     hook: { start: hookStart, headline: hookHeadline, kicker: hookKicker, body: hookBody, headlineInFront: hookFront },
-    proof: proof!,
-    value: { ...value, side, graphics: valueGraphics, gradient: sideGradient },
+    proof,
+    value: { ...value, graphics: valueGraphics, gradient: valueGradient },
     cta: { placement: ctaPlacement, background: ctaBackground, brand: ctaBrandG, headline: ctaHeadlineG, pill: ctaLayout!.pill, body: ctaLayout!.body },
   };
 }
 
-function valuePlacement(subject: Prepared["subject"], k: number, center: readonly [number, number], side: "left" | "right", drift: number): Placement {
-  const ax = (subject.left + subject.right) / 2, ay = (subject.top + subject.bottom) / 2;
-  const sign = side === "right" ? 1 : -1;
-  return { k, ax, ay, dx: center[0] - ax - sign * drift * VALUE_DRIFT, dy: center[1] - ay };
+function valuePlacement(subject: Prepared["subject"], k: number, center: readonly [number, number], drift: number): Placement {
+  return shifted(centredPlacement(subject, k, center), -drift * VALUE_DRIFT);
 }
 
 // ---------------------------------------------------------------------------
@@ -1067,29 +1176,44 @@ class Director {
   proofCamera(t: number): Placement {
     const { proof } = this.layout, subject = this.assets.subject;
     const e = easeInOut((t + 0.2) / 3.4);
-    return fitPlacement({ k: 1.06 + (proof.kEnd - 1.06) * e, ax: subject.cx, ay: subject.cy, dx: proof.target[0] * e, dy: proof.target[1] * e }, this.assets.plateA);
+    if (proof.registered) return fitPlacement({ k: 1.06 + (proof.registered.kEnd - 1.06) * e, ax: subject.cx, ay: subject.cy, dx: proof.registered.target[0] * e, dy: proof.registered.target[1] * e }, this.assets.plateA);
+    return fitPlacement({ k: 1.04 + 0.08 * e, ax: subject.cx, ay: subject.cy, dx: 0, dy: 0 }, this.assets.plateP);
+  }
+
+  /** Registered: the subject rides the photo's push-in. Fitted: a bounded push-in (94% → 100% of the fit) above the text. */
+  proofSubject(t: number): Placement {
+    const { proof } = this.layout;
+    if (proof.registered) return this.proofCamera(t);
+    return centredPlacement(this.assets.subject, proof.fitK * (0.94 + 0.06 * easeInOut((t + 0.2) / 3.4)), proof.center);
   }
 
   private proof(s: Surface, t: number, phase: Phase, shift: number, clip: Clip) {
     const camera = shifted(this.proofCamera(t), shift);
+    const subject = shifted(this.proofSubject(t), shift);
     const { proof } = this.layout;
     if (phase === "below") {
-      s.plate(this.assets.plateA, camera, 1, "treated_source", clip);
+      s.plate(proof.registered ? this.assets.plateA : this.assets.plateP, camera, 1, "treated_source", clip);
       s.graphic(proof.gradient, shift, 0, easeOut((t + 0.2) / 0.8), "background_graphics", clip);
+      if (!proof.registered) s.shadow(subject, 0.45, clip);
       return;
     }
-    s.subject(camera, 1, clip);
+    s.subject(subject, 1, clip);
     proof.graphics.forEach((graphic, index) => { const a = appear(t, 0.15 + index * 0.12); s.graphic(graphic, shift, a.dy, a.opacity, "foreground_graphics", clip) });
+  }
+
+  valueSubject(t: number): Placement {
+    const { value } = this.layout;
+    const drift = easeInOut((t + 0.2) / 3.4) * 2 - 1;
+    return valuePlacement(this.assets.subject, value.k * (1 + 0.03 * (drift + 1) / 2), value.center, drift);
   }
 
   private value(s: Surface, t: number, phase: Phase, shift: number, clip: Clip) {
     const { value } = this.layout, assets = this.assets;
     const drift = easeInOut((t + 0.2) / 3.4) * 2 - 1;
-    const subject = shifted(valuePlacement(assets.subject, value.k * (1 + 0.03 * (drift + 1) / 2), value.center, value.side, drift), shift);
+    const subject = shifted(this.valueSubject(t), shift);
     if (phase === "below") {
       const plate = assets.backdrop ?? assets.plateC;
-      const sign = value.side === "right" ? 1 : -1;
-      const camera = shifted(fitPlacement({ k: 1.14, ax: W / 2, ay: H / 2, dx: sign * drift * 46, dy: 0 }, plate), shift);
+      const camera = shifted(fitPlacement({ k: 1.14, ax: W / 2, ay: H / 2, dx: drift * 46, dy: 0 }, plate), shift);
       s.plate(plate, camera, 1, assets.backdrop ? "generated" : "treated_source", clip);
       s.graphic(value.gradient, shift, 0, 1, "background_graphics", clip);
       s.shadow(subject, 0.5, clip);
@@ -1124,6 +1248,14 @@ class Director {
   private full(index: number, s: Surface, frame: number) {
     const t = (frame - index * SCENE_FRAMES) / FPS;
     this.scene(index, s, t, "below"); this.scene(index, s, t, "top");
+  }
+
+  /** The subject's placement in a frame outside the transition windows (null inside one). */
+  subjectPlacement(frame: number): Placement | null {
+    const { silhouetteWipe: wipe, motionSlide: slide, accentFade: fade } = STILL_DEPTH_TRANSITIONS;
+    if ([wipe, slide, fade].some(([start, end]) => frame >= start && frame < end)) return null;
+    const index = Math.min(3, Math.floor(frame / SCENE_FRAMES)), t = (frame - index * SCENE_FRAMES) / FPS;
+    return index === 0 ? this.hookSubject(t) : index === 1 ? this.proofSubject(t) : index === 2 ? this.valueSubject(t) : this.ctaSubject(t);
   }
 
   /** Draws one complete frame onto `main` (using `aux` for the silhouette wipe). */
@@ -1170,6 +1302,8 @@ export interface StillDepthComposer {
   renderFrame(frameIndex: number): Buffer;
   /** Reduced-resolution provenance replay of the same frame. */
   analyzeFrame(frameIndex: number): LedgerCanvas;
+  /** Output-space bounding box of the whole subject in a frame (null inside a transition window). */
+  subjectBounds(frameIndex: number): Bounds | null;
 }
 
 function parseInput(input: StillDepthInput): StillDepthInput {
@@ -1189,11 +1323,20 @@ export async function prepareStillDepth(input: StillDepthInput): Promise<StillDe
   const layout = await prepareLayout(parsed, assets);
   const director = new Director(assets, layout);
   const main = new PixelSurface(assets), aux = new PixelSurface(assets);
+  const minFill: [number, number, number, number] = [Infinity, Infinity, Infinity, Infinity];
+  for (let frame = 0; frame < STILL_DEPTH_FRAMES; frame++) {
+    const placement = director.subjectPlacement(frame);
+    if (!placement) continue;
+    const scene = Math.min(3, Math.floor(frame / SCENE_FRAMES));
+    minFill[scene] = Math.min(minFill[scene], subjectFill(subjectBoundsAt(assets.subject, placement)));
+  }
+  layout.layout.subjectFraming.minFill = minFill.map((value) => Number((Number.isFinite(value) ? value : 0).toFixed(4))) as [number, number, number, number];
   return {
     frames: STILL_DEPTH_FRAMES,
     layout: layout.layout,
     renderFrame(frameIndex) { assertFrame(frameIndex); director.draw(frameIndex, main, aux); return main.toRgba() },
     analyzeFrame(frameIndex) { assertFrame(frameIndex); const a = new LedgerSurface(assets), b = new LedgerSurface(assets); director.draw(frameIndex, a, b); return a.canvas },
+    subjectBounds(frameIndex) { assertFrame(frameIndex); const placement = director.subjectPlacement(frameIndex); return placement ? subjectBoundsAt(assets.subject, placement) : null },
   };
 }
 

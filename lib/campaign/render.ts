@@ -182,6 +182,91 @@ type Layout = { width: number; height: number; headline: string; body: string; c
 const ART_ROLES: ArtRole[] = ["hero", "detail", "story", "action"];
 const hasArtDirection = (input: RenderInput) => Boolean(input.image?.foregroundBytes || input.image?.backgroundBytes || input.image?.backgroundStyle);
 
+/** A pixel rectangle on the canvas; `radius` rounds the image box's clip. */
+export interface ImageBox { x: number; y: number; width: number; height: number; radius: number }
+
+/** Clear space kept around a contained cutout inside its image box (share of the box's shorter side). */
+export const CUTOUT_BOX_MARGIN = 0.06;
+/** Alpha components smaller than this share of the largest one are SAM fragments, not the subject. */
+export const CUTOUT_FRAGMENT_SHARE = 0.04;
+
+/**
+ * The image box an art-directed role draws its photo, backdrop or cutout into. Every layer is clipped
+ * to this box: no subject pixel lands outside it, and the box keeps the page margin on both sides.
+ */
+export function artDirectedImageBox(layout: Pick<Layout, "width" | "height" | "variant" | "role">): ImageBox {
+  const { width: w, height: h } = layout;
+  const role = layout.role ?? ART_ROLES[layout.variant % 4];
+  const square = h === w, tall = h > 1500, margin = 64;
+  if (role === "story") return { x: 500, y: square ? 300 : tall ? 560 : 360, width: w - 500 - margin, height: square ? 470 : tall ? 920 : 620, radius: 120 };
+  if (role === "action") return { x: 180, y: square ? 164 : tall ? 190 : 170, width: w - 360, height: square ? 385 : tall ? 800 : 580, radius: 32 };
+  return { x: margin, y: square ? 358 : tall ? 550 : 445, width: w - margin * 2, height: square ? 390 : tall ? 810 : 525, radius: role === "detail" ? 24 : 32 };
+}
+
+/**
+ * The subject's alpha bounding box in a cutout: the bounds of its significant alpha components, so stray
+ * SAM fragments far from the subject do not widen the box. Null when nothing is visible.
+ */
+export async function cutoutSubjectBounds(foreground: Buffer): Promise<{ left: number; top: number; width: number; height: number } | null> {
+  const { width: fw, height: fh } = await sharp(foreground).metadata();
+  if (!fw || !fh) return null;
+  const scale = Math.min(1, 512 / Math.max(fw, fh));
+  const sw = Math.max(1, Math.round(fw * scale)), sh = Math.max(1, Math.round(fh * scale));
+  const alpha = await sharp(foreground).ensureAlpha().extractChannel(3).resize(sw, sh, { fit: "fill", kernel: "linear" }).raw().toBuffer();
+  const labels = new Int32Array(sw * sh).fill(-1);
+  const components: { area: number; left: number; top: number; right: number; bottom: number }[] = [];
+  const stack: number[] = [];
+  for (let start = 0; start < alpha.length; start++) {
+    if (alpha[start] < 64 || labels[start] >= 0) continue;
+    const id = components.length, component = { area: 0, left: sw, top: sh, right: -1, bottom: -1 };
+    labels[start] = id; stack.push(start);
+    while (stack.length) {
+      const i = stack.pop()!, x = i % sw, y = (i - x) / sw;
+      component.area++;
+      if (x < component.left) component.left = x; if (x > component.right) component.right = x;
+      if (y < component.top) component.top = y; if (y > component.bottom) component.bottom = y;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const nx = x + dx, ny = y + dy;
+        if ((dx || dy) && nx >= 0 && ny >= 0 && nx < sw && ny < sh) {
+          const n = ny * sw + nx;
+          if (alpha[n] >= 64 && labels[n] < 0) { labels[n] = id; stack.push(n); }
+        }
+      }
+    }
+    components.push(component);
+  }
+  const largest = Math.max(0, ...components.map((component) => component.area));
+  const kept = components.filter((component) => component.area >= largest * CUTOUT_FRAGMENT_SHARE);
+  if (!kept.length) return null;
+  const left = Math.max(0, Math.floor((Math.min(...kept.map((c) => c.left)) - 1) / scale));
+  const top = Math.max(0, Math.floor((Math.min(...kept.map((c) => c.top)) - 1) / scale));
+  const right = Math.min(fw, Math.ceil((Math.max(...kept.map((c) => c.right)) + 2) / scale));
+  const bottom = Math.min(fh, Math.ceil((Math.max(...kept.map((c) => c.bottom)) + 2) / scale));
+  return right > left && bottom > top ? { left, top, width: right - left, height: bottom - top } : null;
+}
+
+function roundedMask(box: ImageBox): Buffer {
+  return Buffer.from(`<svg width="${box.width}" height="${box.height}"><rect width="${box.width}" height="${box.height}" rx="${box.radius}" fill="white"/></svg>`);
+}
+
+/**
+ * The cutout contained by its subject bounding box (never cover-cropped through its middle), centred in the
+ * image box with a margin, on a transparent box-sized layer clipped to the box's rounded shape. Only alpha
+ * changes (the clip and the dropped fragments); the subject's RGB is resampled, never altered.
+ */
+export async function containedCutoutLayer(foreground: Buffer, box: ImageBox): Promise<Buffer> {
+  const empty = () => sharp({ create: { width: box.width, height: box.height, channels: 4, background: "#00000000" } });
+  const bounds = await cutoutSubjectBounds(foreground);
+  if (!bounds) return empty().png().toBuffer();
+  const margin = Math.max(16, Math.round(Math.min(box.width, box.height) * CUTOUT_BOX_MARGIN));
+  const innerWidth = Math.max(1, box.width - margin * 2), innerHeight = Math.max(1, box.height - margin * 2);
+  const k = Math.min(innerWidth / bounds.width, innerHeight / bounds.height);
+  const width = Math.max(1, Math.min(innerWidth, Math.round(bounds.width * k))), height = Math.max(1, Math.min(innerHeight, Math.round(bounds.height * k)));
+  const subject = await sharp(foreground).extract(bounds).resize(width, height, { fit: "fill", kernel: "lanczos3" }).png().toBuffer();
+  const placed = await empty().composite([{ input: subject, left: Math.round((box.width - width) / 2), top: Math.round((box.height - height) / 2) }]).png().toBuffer();
+  return sharp(placed).composite([{ input: roundedMask(box), blend: "dest-in" }]).png().toBuffer();
+}
+
 /** Four visual roles share one truthful subject, rather than repeating one poster layout. */
 async function artDirectedFrame(input: RenderInput, layout: Layout, original: Buffer, foreground?: Buffer, background?: Buffer): Promise<Buffer> {
   const { width: w, height: h } = layout;
@@ -195,34 +280,32 @@ async function artDirectedFrame(input: RenderInput, layout: Layout, original: Bu
   const titleY = square ? 210 : tall ? 272 : 244;
   const story = role === "story";
   const action = role === "action";
-  const stage = story
-    ? { x: 500, y: square ? 300 : tall ? 560 : 360, width: w - 500, height: square ? 470 : tall ? 920 : 620 }
-    : action
-      ? { x: 180, y: square ? 164 : tall ? 190 : 170, width: w - 360, height: square ? 385 : tall ? 800 : 580 }
-      : { x: role === "detail" ? 0 : 64, y: square ? 358 : tall ? 550 : 445, width: role === "detail" ? w : w - 128, height: square ? 390 : tall ? 810 : 525 };
+  const stage = artDirectedImageBox({ width: w, height: h, variant: layout.variant, role });
   const bodyY = story ? square ? 560 : tall ? 1060 : 710 : action ? square ? 790 : tall ? 1480 : 1060 : square ? 812 : tall ? 1470 : 1040;
   const ctaY = square ? 910 : tall ? 1738 : 1178;
   const focus = cleanText(input.creativeBrief?.focus.name || layout.kicker, 62);
   const concept = input.mode === "synthetic" ? "SYNTHETIC DEMO · CONCEPT" : "CONCEPT · REVIEW REQUIRED";
   const provenance = campaignProvenanceLabel(input.image!, { cutout: Boolean(foreground), backdrop: Boolean(background) });
-  const circleX = story ? w - 20 : role === "detail" ? w / 2 : w * .56;
+  const circleX = story ? stage.x + stage.width / 2 : role === "detail" ? w / 2 : w * .56;
   const circleY = stage.y + stage.height * .54;
+  // A cutout without a backdrop still sits in a visible image box, so its frame reads as deliberate.
+  const panel = foreground && !background ? `<rect x="${stage.x}" y="${stage.y}" width="${stage.width}" height="${stage.height}" rx="${stage.radius}" fill="${dark ? theme.paper : theme.soft}" opacity="${dark ? .08 : .38}"/>` : "";
   const backgroundSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}">
 <defs><linearGradient id="wash" x1="0" y1="0" x2="1" y2="1"><stop stop-color="${paper}"/><stop offset="1" stop-color="${dark ? theme.ink : theme.soft}"/></linearGradient><radialGradient id="halo"><stop stop-color="${theme.accent}" stop-opacity=".24"/><stop offset="1" stop-color="${theme.accent}" stop-opacity="0"/></radialGradient></defs>
 <rect width="${w}" height="${h}" fill="${paper}"/>
 <rect y="${stage.y - 50}" width="${w}" height="${stage.height + 130}" fill="url(#wash)" opacity="${dark ? .6 : .55}"/>
 <ellipse cx="${circleX}" cy="${circleY}" rx="${story ? 520 : 620}" ry="${stage.height * .62}" fill="url(#halo)"/>
 ${story ? `<circle cx="${circleX}" cy="${circleY}" r="${Math.min(420, stage.height * .49)}" fill="${theme.soft}" opacity=".45"/>` : `<ellipse cx="${w / 2}" cy="${stage.y + stage.height - 10}" rx="${action ? 250 : 350}" ry="20" fill="${theme.ink}" opacity=".10"/>`}
+${panel}
 <path d="M ${margin} ${h - 150} H ${w - margin}" stroke="${ink}" opacity=".16"/>
 </svg>`;
   const layers: OverlayOptions[] = [];
   if (background && foreground) {
-    const backdrop = await sharp(background).resize(stage.width, stage.height, { fit: "cover", position: "centre" }).png().toBuffer();
+    const backdrop = await sharp(background).resize(stage.width, stage.height, { fit: "cover", position: "centre" }).composite([{ input: roundedMask(stage), blend: "dest-in" }]).png().toBuffer();
     layers.push({ input: backdrop, left: stage.x, top: stage.y });
   }
   if (foreground) {
-    const subject = await sharp(foreground).resize(stage.width, stage.height, { fit: role === "detail" ? "cover" : "contain", position: "centre", background: "#00000000" }).png().toBuffer();
-    layers.push({ input: subject, left: stage.x, top: stage.y });
+    layers.push({ input: await containedCutoutLayer(foreground, stage), left: stage.x, top: stage.y });
   } else {
     let photo = sharp(original);
     if (role === "detail") {
@@ -230,8 +313,7 @@ ${story ? `<circle cx="${circleX}" cy="${circleY}" r="${Math.min(420, stage.heig
       const width = Math.max(1, Math.round(metadata.width! * .76)), height = Math.max(1, Math.round(metadata.height! * .76));
       photo = photo.extract({ left: Math.floor((metadata.width! - width) / 2), top: Math.floor((metadata.height! - height) / 2), width, height });
     }
-    const mask = Buffer.from(`<svg width="${stage.width}" height="${stage.height}"><rect width="${stage.width}" height="${stage.height}" rx="${role === "detail" ? 0 : story ? 120 : 32}" fill="white"/></svg>`);
-    const photoBytes = await photo.resize(stage.width, stage.height, { fit: "cover", position: role === "hero" ? sharp.strategy.attention : "centre" }).composite([{ input: mask, blend: "dest-in" }]).png().toBuffer();
+    const photoBytes = await photo.resize(stage.width, stage.height, { fit: "cover", position: role === "hero" ? sharp.strategy.attention : "centre" }).composite([{ input: roundedMask(stage), blend: "dest-in" }]).png().toBuffer();
     layers.push({ input: photoBytes, left: stage.x, top: stage.y });
   }
   const headingX = margin;

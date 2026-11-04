@@ -9,8 +9,8 @@ import { dilateMask, erodeMask, fillBehindSubject } from "../../lib/campaign/cin
 import { assertLedger, CompositionLedgerAccumulator, LedgerCanvas, LedgerInvariantError, measureLedgerFrame } from "../../lib/campaign/cinema/ledger";
 import { measureText, svgDocument, textBlock, wrapText } from "../../lib/campaign/cinema/typography";
 import {
-  GENERATED_BACKDROP_LABEL, MAX_FOREGROUND_OCCLUSION, MAX_HEADLINE_LINE_OCCLUSION, MAX_HEADLINE_OCCLUSION, prepareStillDepth, renderStillDepthFrame, renderStillDepthReel,
-  STILL_DEPTH_COVER_FRAME, STILL_DEPTH_FRAMES, STILL_DEPTH_LABEL_BANDS, type StillDepthComposer, type StillDepthInput,
+  GENERATED_BACKDROP_LABEL, MAX_FOREGROUND_OCCLUSION, MAX_HEADLINE_LINE_OCCLUSION, MAX_HEADLINE_OCCLUSION, MAX_SUBJECT_OFFCENTRE, MIN_SUBJECT_FILL, prepareStillDepth, renderStillDepthFrame, renderStillDepthReel,
+  STILL_DEPTH_COVER_FRAME, STILL_DEPTH_FRAMES, STILL_DEPTH_LABEL_BANDS, STILL_DEPTH_SAFE_AREA, STILL_DEPTH_TRANSITIONS, type StillDepthComposer, type StillDepthInput,
 } from "../../lib/campaign/cinema/still-depth";
 
 const W = 1080, H = 1920;
@@ -359,4 +359,110 @@ describe("still-depth Reel", () => {
     expect(result.qa.framesSubjectHiddenByTransition).toBeLessThanOrEqual(4);
     expect(result.layout.hookHeadline.placement).toBe("behind_subject");
   }, 300_000);
+});
+
+/**
+ * Regression (hosted live run, 4 Nov 2026, a tall can filling a 4:5 photo): at 4.5 s the proof push-in cropped
+ * the can's top and right and its headline sat on the cutout; at 7.5 s the value scene shrank the can off-centre
+ * right. Every non-transition frame must keep the whole subject inside the safe area, sizeable and centred.
+ */
+describe("still-depth subject framing", () => {
+  let dir = "";
+  beforeAll(async () => { dir = await mkdtemp(join(tmpdir(), "tickr-still-framing-")); });
+  afterAll(async () => { await rm(dir, { recursive: true, force: true }); });
+
+  /** A synthetic red/orange "can" (rounded body and rim) on a textured green wall. Not a business photo. */
+  async function syntheticCan(width: number, height: number, box: { cx: number; cy: number; w: number; h: number }) {
+    const x = Math.round(width * (box.cx - box.w / 2)), y = Math.round(height * (box.cy - box.h / 2)), cw = Math.round(width * box.w), ch = Math.round(height * box.h);
+    const shape = (fill: string, rim: string) => `<rect x="${x}" y="${y}" width="${cw}" height="${ch}" rx="${Math.round(cw * 0.12)}" fill="${fill}"/><ellipse cx="${x + cw / 2}" cy="${y + cw * 0.08}" rx="${cw / 2}" ry="${cw * 0.08}" fill="${rim}"/>`;
+    const unit = Math.max(8, Math.round(Math.min(width, height) / 40));
+    const scene = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"><defs>
+<linearGradient id="wall" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6b8f71"/><stop offset="1" stop-color="#2f4858"/></linearGradient>
+<pattern id="tex" width="${unit * 2}" height="${unit * 2}" patternUnits="userSpaceOnUse"><circle cx="${unit / 2}" cy="${unit / 2}" r="${unit / 3}" fill="#ffffff" fill-opacity="0.12"/></pattern>
+<linearGradient id="can" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#e8452c"/><stop offset="0.6" stop-color="#f29e38"/><stop offset="1" stop-color="#b8231a"/></linearGradient></defs>
+<rect width="${width}" height="${height}" fill="url(#wall)"/><rect width="${width}" height="${height}" fill="url(#tex)"/>${shape("url(#can)", "#b8231a")}</svg>`;
+    const mask = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"><rect width="${width}" height="${height}" fill="#000"/>${shape("#fff", "#fff")}</svg>`;
+    return { source: await sharp(Buffer.from(scene)).png().toBuffer(), subjectMask: await sharp(Buffer.from(mask)).greyscale().threshold(128).png().toBuffer() };
+  }
+  // A teal accent keeps the CTA pill and the accent wash out of the red "product" pixel test.
+  const theme = { paper: "#F5EEDF", ink: "#263A30", accent: "#247C79", soft: "#B7D3CC" };
+  const fixtures = async () => ({
+    "tall can filling a 4:5 photo": await syntheticCan(1080, 1350, { cx: 0.5, cy: 0.5, w: 0.6, h: 0.85 }),
+    "small can near a landscape photo's edge": await syntheticCan(1600, 1200, { cx: 0.9, cy: 0.6, w: 0.08, h: 0.22 }),
+    "centred mug in a 9:16 photo": await syntheticStill(720, 1280),
+    "large mug in a landscape photo": await syntheticStill(1600, 1200, 1.35),
+  });
+  const SAFE = STILL_DEPTH_SAFE_AREA;
+  const inTransition = (frame: number) => Object.values(STILL_DEPTH_TRANSITIONS).some(([start, end]) => frame >= start && frame < end);
+
+  test("every non-transition frame keeps the whole subject inside the safe area, sizeable and horizontally centred", async () => {
+    expect(SAFE.left).toBeGreaterThanOrEqual(W * 0.06 - 1);
+    expect(SAFE.top).toBeGreaterThanOrEqual(H * 0.06 - 1);
+    for (const [name, still] of Object.entries(await fixtures())) {
+      const reel = await prepareStillDepth(input(still, dir, { theme }));
+      let checked = 0;
+      for (let frame = 0; frame < STILL_DEPTH_FRAMES; frame++) {
+        const bounds = reel.subjectBounds(frame);
+        if (inTransition(frame)) { expect(bounds, `${name} frame ${frame}`).toBeNull(); continue; }
+        expect(bounds, `${name} frame ${frame}`).not.toBeNull();
+        const b = bounds!, label = `${name} frame ${frame} ${JSON.stringify(b)}`;
+        expect(b.left, label).toBeGreaterThanOrEqual(SAFE.left - 1);
+        expect(b.top, label).toBeGreaterThanOrEqual(SAFE.top - 1);
+        expect(b.right, label).toBeLessThanOrEqual(SAFE.right + 1);
+        expect(b.bottom, label).toBeLessThanOrEqual(SAFE.bottom + 1);
+        const fill = Math.max((b.right - b.left) / (SAFE.right - SAFE.left), (b.bottom - b.top) / (SAFE.bottom - SAFE.top));
+        expect(fill, label).toBeGreaterThanOrEqual(MIN_SUBJECT_FILL);
+        expect(Math.abs((b.left + b.right) / 2 - W / 2), label).toBeLessThanOrEqual(W * MAX_SUBJECT_OFFCENTRE);
+        checked++;
+      }
+      expect(checked).toBeGreaterThan(300);
+      expect(Math.min(...reel.layout.subjectFraming.minFill), name).toBeGreaterThanOrEqual(MIN_SUBJECT_FILL);
+      expect(reel.layout.valueSubjectSide).toBe("centre");
+    }
+  }, 240_000);
+
+  test("rendered keyframes show the whole can inside the safe area, with the proof text clear of it (4.5 s) and no tiny off-centre can (7.5 s)", async () => {
+    const still = (await fixtures())["tall can filling a 4:5 photo"];
+    const reel = await prepareStillDepth(input(still, dir, { theme }));
+    expect(reel.layout.subjectFraming.proof).toBe("fitted");
+    for (const frame of [0, 30, 60, 83, 100, 120, 135, 160, 170, 190, 210, 225, 250, 260, 280, 300, 330, 359]) {
+      const rgba = reel.renderFrame(frame);
+      let left = W, right = -1, top = H, bottom = -1;
+      for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+        const o = (y * W + x) * 4;
+        if (rgba[o] > 120 && rgba[o] - rgba[o + 2] > 90) { left = Math.min(left, x); right = Math.max(right, x); top = Math.min(top, y); bottom = Math.max(bottom, y); }
+      }
+      const label = `frame ${frame} (${(frame / 30).toFixed(1)} s): ${left},${top} → ${right},${bottom}`;
+      expect(right, label).toBeGreaterThan(left);
+      // The real pixels are inside the safe area (anti-aliased edge tolerance) and match the reported bounds.
+      expect(left, label).toBeGreaterThanOrEqual(SAFE.left - 3);
+      expect(top, label).toBeGreaterThanOrEqual(SAFE.top - 3);
+      expect(right, label).toBeLessThanOrEqual(SAFE.right + 3);
+      expect(bottom, label).toBeLessThanOrEqual(SAFE.bottom + 3);
+      const reported = reel.subjectBounds(frame)!;
+      for (const [measured, expected] of [[left, reported.left], [right, reported.right], [top, reported.top], [bottom, reported.bottom]]) expect(Math.abs(measured - expected), label).toBeLessThanOrEqual(8);
+      // Whole, not cropped: the can keeps its proportions (0.6·1080 : 0.85·1350).
+      expect(Math.abs((right - left + 1) / (bottom - top + 1) / (0.6 * 1080 / (0.85 * 1350)) - 1), label).toBeLessThan(0.04);
+      expect(Math.max((right - left) / (SAFE.right - SAFE.left), (bottom - top) / (SAFE.bottom - SAFE.top)), label).toBeGreaterThanOrEqual(MIN_SUBJECT_FILL);
+      expect(Math.abs((left + right) / 2 - W / 2), label).toBeLessThanOrEqual(W * MAX_SUBJECT_OFFCENTRE);
+      if (frame >= 90 && frame < 270) {
+        // Proof and value text never sits on the can: no near-white lettering inside its box.
+        let lettering = 0;
+        for (let y = top; y <= bottom; y++) for (let x = left; x <= right; x++) {
+          const o = (y * W + x) * 4;
+          if (rgba[o] * 0.2126 + rgba[o + 1] * 0.7152 + rgba[o + 2] * 0.0722 > 215) lettering++;
+        }
+        expect(lettering, label).toBe(0);
+      }
+    }
+    // The fitted framing changes geometry only: the ledger still never places generated pixels on the subject.
+    const accumulator = new CompositionLedgerAccumulator();
+    for (let frame = 0; frame < STILL_DEPTH_FRAMES; frame++) accumulator.addFrame(reel.analyzeFrame(frame));
+    const ledger = accumulator.finish();
+    expect(ledger.generatedPixelsOnSubject).toBe(0);
+    expect(ledger.framesWithoutSubject).toBe(0);
+    // Only the deliberate transitions (the motion slide carries the subject across the frame edge) may crop it.
+    expect(ledger.framesSubjectCropped).toBeLessThanOrEqual(Object.values(STILL_DEPTH_TRANSITIONS).reduce((sum, [start, end]) => sum + end - start, 0));
+    expect(ledger.maxSubjectOcclusion).toBeLessThanOrEqual(MAX_FOREGROUND_OCCLUSION);
+  }, 240_000);
 });
