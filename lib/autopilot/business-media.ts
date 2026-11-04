@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import sharp from "sharp";
 import { z } from "zod";
 import { db } from "../db";
-import { RequestError } from "../http";
+import { assertSameOriginRequest, RequestError } from "../http";
 import { validRunId } from "../jobs/http";
 import type { OwnerMediaConsent } from "../media/cinema-types";
 import { MediaLibrary, MediaLibraryError, mediaLibraryIntegrityKey, type MediaAssetRecord } from "../media/library";
@@ -48,8 +48,7 @@ export type UploadMimeType = keyof typeof UPLOAD_MIME_TYPES;
 
 /** Same rule as readLocalJson for writes without a JSON body, plus Fetch Metadata when the browser sends it. */
 export function assertSameOriginWrite(request: Request): void {
-  const origin = request.headers.get("origin");
-  if (origin && origin !== new URL(request.url).origin) throw new RequestError("Cross-origin writes are not allowed.", 403);
+  assertSameOriginRequest(request);
   const site = request.headers.get("sec-fetch-site");
   if (site && site !== "same-origin" && site !== "none") throw new RequestError("Cross-origin writes are not allowed.", 403);
 }
