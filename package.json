@@ -1,0 +1,62 @@
+{
+  "name": "tickr",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Evidence-backed local growth campaigns powered by Meta-hosted AI.",
+  "engines": {
+    "node": ">=24.11.0 <25"
+  },
+  "packageManager": "npm@11.9.0",
+  "scripts": {
+    "dev": "NODE_USE_ENV_PROXY=1 NEXT_TELEMETRY_DISABLED=1 next dev",
+    "build": "prisma generate && NEXT_TELEMETRY_DISABLED=1 next build --webpack",
+    "start": "NODE_USE_ENV_PROXY=1 NEXT_TELEMETRY_DISABLED=1 next start",
+    "worker": "NODE_USE_ENV_PROXY=1 tsx scripts/worker.ts",
+    "dev:all": "bash scripts/start.sh",
+    "lint": "eslint .",
+    "typecheck": "NEXT_TELEMETRY_DISABLED=1 next typegen && tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run lint && npm run typecheck && npm test",
+    "db:generate": "prisma generate",
+    "db:setup": "npm run db:generate && RUST_LOG=info prisma migrate deploy",
+    "media:check": "tsx scripts/media-check.ts",
+    "meta:check": "NODE_USE_ENV_PROXY=1 tsx scripts/check-meta.ts",
+    "smoke": "tsx scripts/smoke.ts",
+    "research:smoke": "tsx scripts/research-smoke.ts",
+    "link:smoke": "tsx scripts/link-smoke.ts"
+  },
+  "dependencies": {
+    "@meta-sam/parser": "0.0.13",
+    "@prisma/adapter-better-sqlite3": "7.10.1",
+    "@prisma/client": "7.10.1",
+    "@remotion/bundler": "4.0.539",
+    "@remotion/player": "4.0.539",
+    "@remotion/renderer": "4.0.539",
+    "better-sqlite3": "13.0.3",
+    "clsx": "2.1.1",
+    "lucide-react": "1.66.0",
+    "next": "16.4.3",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "remotion": "4.0.539",
+    "sharp": "0.35.5",
+    "tailwind-merge": "3.7.0",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@remotion/cli": "4.0.539",
+    "@tailwindcss/postcss": "4.3.3",
+    "@types/better-sqlite3": "9.6.0",
+    "@types/node": "26.6.6",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "eslint": "9.39.5",
+    "eslint-config-next": "16.4.3",
+    "prisma": "7.10.1",
+    "tailwindcss": "4.3.3",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3",
+    "vitest": "5.0.5"
+  }
+}

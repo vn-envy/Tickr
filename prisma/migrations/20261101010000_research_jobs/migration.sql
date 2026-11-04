@@ -1,0 +1,13 @@
+ALTER TABLE "Run" ADD COLUMN "mode" TEXT NOT NULL DEFAULT 'live';
+ALTER TABLE "Run" ADD COLUMN "jobKind" TEXT NOT NULL DEFAULT 'research';
+ALTER TABLE "Run" ADD COLUMN "inputHash" TEXT;
+ALTER TABLE "Run" ADD COLUMN "leaseOwner" TEXT;
+ALTER TABLE "Run" ADD COLUMN "leaseUntil" DATETIME;
+ALTER TABLE "Run" ADD COLUMN "attempts" INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE "Run" ADD COLUMN "modelCalls" INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE "Run" ADD COLUMN "error" TEXT;
+ALTER TABLE "Run" ADD COLUMN "retrySafe" BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE "Run" ADD COLUMN "events" JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE "Run" ADD COLUMN "usage" JSONB NOT NULL DEFAULT '[]';
+CREATE INDEX "Run_status_createdAt_idx" ON "Run"("status", "createdAt");
+CREATE UNIQUE INDEX "Run_businessId_inputHash_key" ON "Run"("businessId", "inputHash");

@@ -1,0 +1,11 @@
+{
+  "kind": "user_selected_intake_not_researched",
+  "listingUrl": "https://maps.app.goo.gl/nNy6iYx9r4GaU7YY8",
+  "name": "Grandma Daphne's bakehouse",
+  "locality": null,
+  "vertical": "bakery",
+  "goal": "Tell the bakery's story to establish a credible differentiation from other bakeries.",
+  "source": "User instruction, 2026-11-01",
+  "sourceAccess": "On 2026-11-01 the short link returned HTTP 200 after redirecting to a Google Maps place URL bearing Grandma Daphne's Bakehouse. Static HTML did not establish locality or address; a separate browser attempt failed certificate verification. Story, offerings, locality and owner materials remain unverified.",
+  "requiresOwnerEvidence": ["origin or founding story", "craft and process", "signature products", "approved photos", "facts the campaign may publish"]
+}

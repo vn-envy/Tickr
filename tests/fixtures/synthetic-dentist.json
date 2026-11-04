@@ -1,0 +1,33 @@
+{
+  "business": {
+    "name": "Willow Desk Dental — fictional demo",
+    "website": "",
+    "locality": "Willow Quarter — fictional neighbourhood",
+    "vertical": "dentist",
+    "goal": "Explain the consultation booking process and invite practical appointment questions. Synthetic demonstration only."
+  },
+  "input": {
+    "mode": "synthetic",
+    "readWebsite": false,
+    "sources": [
+      {
+        "kind": "owner_statement",
+        "title": "Fictional reception coordinator interview — demonstration fixture",
+        "url": null,
+        "text": "Willow Desk Dental is a fictional clinic used for software testing. Our reception coordinator explains the consultation booking steps before someone schedules a visit. Visitors can ask reception which forms to bring and how appointment confirmation works. We provide a written appointment confirmation after booking. The entrance is step-free. Our reception team can answer additional booking-process inquiries this week. This statement describes appointment logistics only. No clinical outcome, treatment recommendation, professional credential, price, discount, patient story or opening date is approved for this fictional campaign."
+      },
+      {
+        "kind": "customer_review",
+        "title": "Two fictional appointment comments — not real patient reviews",
+        "url": null,
+        "text": "Fictional commenter A: I wanted to understand the consultation booking steps before choosing a time. Fictional commenter B: Knowing what forms to bring and receiving a written appointment confirmation would make planning my visit easier. These are two invented logistical comments for software testing, not patient outcomes or representative demand."
+      },
+      {
+        "kind": "competitor",
+        "title": "Fictional clinic homepage excerpt — demonstration fixture",
+        "url": null,
+        "text": "Fictional comparator Corner Dental lists a consultation booking button in this supplied homepage excerpt. This excerpt does not describe the booking steps, required forms or appointment confirmation process. No other pages, clinical services, credentials, patient reviews or appointment experiences were inspected."
+      }
+    ]
+  }
+}

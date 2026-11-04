@@ -1,0 +1,655 @@
+# Final Architecture & Build Plan
+
+Meta Global AI Developer Hackathon · Indie Developer · November 2026
+
+Architecture locked
+
+Meta-only external APIs
+
+4 business verticals
+
+## 1. The product we're building
+
+An autonomous growth studio for businesses that are better in real life than they appear online.
+
+A bakery, dentist, gym, or salon enters its website or business listing. Our AI investigates its actual strengths, customers, local competitors, and market opportunities, then builds a coordinated marketing campaign tailored to Facebook, Instagram, Reels, and WhatsApp.
+
+The difference from conventional AI marketing software is that the business doesn't need to know what to advertise, which audience to target, or how to write a creative brief.
+
+The intelligence engine makes those decisions and shows its evidence.
+
+Our product has three non-negotiable principles:
+
+1. Intelligence before generation. Research and diagnose the business before creating anything.
+2. One strategy, multiple native executions. A Reel, Instagram post, Facebook ad, and WhatsApp-directed ad must all advance the same campaign objective, but use different creatives, copy, and calls to action.
+3. Meta-only AI and platform APIs. No OpenAI, Google Places, external search service, video-generation provider, or third-party marketing intelligence API.
+
+Local rendering, storage, browser processing, and open-source software libraries are allowed. They are not external AI services.
+
+## 2. What the complete output kit contains
+
+## Local Growth Campaign Kit
+
+One business · One coordinated campaign
+
+[LA Bakery Walk combines a half marathon and eating tasty treats in bakery crawl - AOL](https://images.openai.com/static-rsc-4/wLKvDjeG_NE2BnojrP0mQtFVMdrI_fU1X6BUrn4vk949hmRmKfSlD4mGZs7gaITZR-VMwVGs28XEaEtXXHJbLAVktbB7w8J2ZMKTpgEgzp-RctoPVw6Fl08YwG88IvgqbWtwjGaGVOIxLz5WHmBdotVv1PqCPWZk2wShv_TcE40?purpose=inline)
+
+Instagram content
+
+Feed posts, carousel, captions, hashtags, post schedule.
+
+[Prompt for Gemini AI Photo at Cafe | Copy-Paste 25+](https://images.openai.com/static-rsc-4/Ri9Q1F2Q1v51OThMFI7TeRNqgJiuocuYV_nJFz8AKpcKG9RN2rkPv8f_OAFCs5GrYSq9iYAnVYEZmlIM6h4K20YDhGHdRhzXaDSOBS1KdLnRUls0TNgSRmYYmPNL8i7rDoi2eSMrfhOm-ZRzIqQ4cb5SWyjDLDFYopmzzljXoCU?purpose=inline)
+
+Instagram Reels
+
+Rendered MP4, hook, shot sequence, on-screen text, cover.
+
+[Beat the summer heat with Bartholomew's iced drinks](https://images.openai.com/static-rsc-4/wPcAtMydtH56eThqcXFGHRXHDgZmVdh-32NbOuEJgNCYiAN_4N66EaIyWLnDR74cw4eCfMmOD3erQXrbsrIWj3fCnmdT-ppRXSMGqWtAIsarTijn0-_NdC96FK4NhO_ZVs8NkEgIYgs5GFuhjG5_6QCNiIVJb5WyWuRD1V-WllU?purpose=inline)
+
+Meta paid ads
+
+Facebook and Instagram variants, audience strategy, copy, CTAs.
+
+[Unsupported client – Canva](https://images.openai.com/static-rsc-4/7b8189Svgq9o_GXLqzY1o21gpz-etsaEagqUmKwRu6Vx4E2hZ7W8y-zUMBEIyNe6HAKUkN-uvkI063FeY1Yym8IhHW1_akYndzuPsgkSIaTSWajV1NE299Epphcm6W9mCJJVXHSDsgns-yuR0a2pzkgAFinKffsO3YU2hQpFJuY?purpose=inline)
+
+WhatsApp campaigns
+
+Click-to-WhatsApp creative, conversation opener, response scripts, optional Status ad.
+
+Campaign strategy and evidence report
+
+Why this opportunity, why these creatives, what to measure, and what the business must approve.
+
+Images above illustrate the types of creative assets; they are not generated campaign results.
+
+We will support two distinct WhatsApp advertising formats, because they aren't interchangeable.
+
+- Click-to-WhatsApp ads: Ads displayed on Facebook or Instagram that open a conversation with the business on WhatsApp.
+- WhatsApp Status ads: Ads displayed within WhatsApp's Updates experience, where supported for the advertiser's region and account.
+
+Both are real Meta advertising products. WhatsApp Status placement is still subject to regional availability and rollout restrictions.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://whatsappbusiness.com\&sz=32)
+
+Get Discovered
+
++2
+
+
+
+For the hackathon, all these deliverables should be generated and exportable. Actual publishing or ad activation remains approval-based.
+
+## 3. Final system architecture
+
+The architecture will be a directed agent workflow with controlled autonomy. Agents can investigate, request more evidence, reconsider strategies and revise creatives, but cannot endlessly loop or make costly external actions without approval.
+
+Business onboarding
+
+Website / Google listing URL · Optional photos · Business location
+
+Evidence collection layer
+
+Meta-grounded web research, direct website reading, authorized Meta insights, uploaded customer materials
+
+Structured evidence ledger + business profile
+
+Intelligence engine
+
+Business analyst
+
+Customer insights
+
+Competitor analyst
+
+Content researcher
+
+Opportunity scorer
+
+Campaign strategist
+
+Muse Spark 1.3 · Muse Wonder for final strategy
+
+Unified Campaign Blueprint
+
+Audience · Opportunity · Message · Offer · Evidence · CTA
+
+Motion studio
+
+Local video renderer
+
+Creative critic + policy validator
+
+Fact checking · Visual fidelity · Platform constraints · Revision loop
+
+Channel-specific campaign kits
+
+Facebook Ads
+
+Instagram Feed
+
+Instagram Reels
+
+WhatsApp Ads
+
+Download ZIP · Preview · Human approval · Optional publishing
+
+### Model responsibilities
+
+| Component            | Meta technology             | Responsibility                                                |
+| -------------------- | --------------------------- | ------------------------------------------------------------- |
+| Orchestrator         | Muse Spark 1.3              | Route tasks, call tools, recover from incomplete evidence     |
+| Research agents      | Muse Spark 1.3 + web search | Discover and extract business and market information          |
+| Strategic reasoning  | Muse Wonder 1.0             | Compare opportunities and choose a campaign direction         |
+| Visual analysis      | Muse Spark 1.3              | Analyze uploaded product, premises, and portfolio photographs |
+| Image generation     | Muse Image 1.0              | Generate and edit the campaign visuals                        |
+| Product segmentation | SAM 3.1                     | Isolate real products or people with authorized photographs   |
+| Quality evaluator    | Muse Spark / Wonder         | Detect unsupported claims and weak creative alignment         |
+| Video output         | Local Remotion + FFmpeg     | Render MP4 Reels from still images, motion, text and footage  |
+
+These Meta models are available in the documented model family, although Muse Wonder remains a preview capability and actual access must be verified with our hackathon API key.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://dev.meta.ai\&sz=32)
+
+Meta Model API
+
++1
+
+
+
+Video-generation decision: We will not depend on Muse Video. The current public Meta Model API catalog does not list a hosted video-generation endpoint. Instead, we build genuine MP4 Reels using local animation and compositing. This keeps the project fully Meta-only for model inference while still delivering usable videos.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://ai.meta.com\&sz=32)
+
+Meta AI
+
++1
+
+
+
+## 4. The most important subsystem: the intelligence engine
+
+This is where most of our engineering effort should go.
+
+### A. Collect evidence, never invent it
+
+Every extracted claim becomes a structured evidence object.
+
+```
+
+{
+  "claim_id": "ev_001",
+  "business_id": "bakery_01",
+  "claim": "The bakery offers sourdough bread",
+  "source_type": "official_website",
+  "source_url": "https://example.com/menu",
+  "confidence": 0.96,
+  "verification": "source_supported",
+  "advertising_allowed": true
+}
+
+```
+
+The URL above is illustrative. In execution, the evidence object stores the real source, retrieval time and supporting excerpt.
+
+The key isn't just storing facts. We must distinguish:
+
+- Verified fact: A treatment, price, service, location, product or opening hour supported by a source.
+- Observed signal: A recurring theme in genuine reviews or a competitor's public advertising.
+- Inference: A plausible business opportunity or audience hypothesis.
+- Proposal: A new offer, discount or campaign idea requiring owner approval.
+
+A campaign can recommend a new ₹299 combination offer. It cannot announce that offer as already available without approval.
+
+### B. A single URL is an entry point, not guaranteed complete data
+
+To satisfy the Meta-only restriction:
+
+| Input source          | Collection method                                                                        |
+| --------------------- | ---------------------------------------------------------------------------------------- |
+| Business website      | Direct HTTP/HTML retrieval, with domain restrictions and safe crawling                   |
+| Google listing URL    | Business identifier + Meta-grounded research; optional user-supplied listing screenshots |
+| Competitors           | Meta Model API web-search grounding                                                      |
+| Public reviews        | Only content legitimately accessible through the permitted research methods              |
+| Instagram performance | Authorized Meta Instagram API, when connected                                            |
+| Ad performance        | Authorized Meta Marketing API, when connected                                            |
+| Business photographs  | Owner upload or authorized media                                                         |
+| Offer details         | Extracted evidence or one targeted owner confirmation                                    |
+
+Directly reading a business's public website isn't calling a third-party API. But we will not scrape Google Maps behind access restrictions or pretend we have full Google review coverage.
+
+Meta's Model API includes built-in web search with source citations. Importantly, the model decides whether a search is performed, and coverage is not exhaustive. We'll inspect actual search calls and citations rather than assuming a research request succeeded.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://dev.meta.ai\&sz=32)
+
+Meta Model API
+
++1
+
+
+
+For weak-footprint businesses, a minimal fallback is essential: business name, locality, core service, and three uploaded photos. We still preserve the one-link happy path.
+
+### C. The Digital Opportunity Gap
+
+I would make this the central intelligence feature.
+
+We calculate three independent dimensions rather than manufacturing a single mysterious score.
+
+Reputation
+
+Review quality, trust signals, strengths
+
+Visibility
+
+Discoverability, content, clarity
+
+Conversion
+
+Offers, CTAs, booking friction
+
+Evidence-backed opportunities
+
+The engine converts gaps and verified differentiators into ranked marketing hypotheses.
+
+Our internal ranking model:
+
+\\[ O = 0.30I + 0.25E + 0.20D + 0.15F + 0.10C \\]
+
+Where each input is scored on a consistent 0–100 scale:
+
+- \\(I\\): estimated business impact
+- \\(E\\): strength of supporting evidence
+- \\(D\\): competitive differentiation
+- \\(F\\): feasibility with current business assets
+- \\(C\\): confidence in the diagnosis
+
+These are proposed engineering weights, not scientifically calibrated business performance predictions. We'll display data coverage separately so poor evidence cannot masquerade as certainty.
+
+The output must explain the top three opportunities and why the selected one is superior.
+
+### D. Strategy before creative
+
+Every selected opportunity produces a structured campaign blueprint:
+
+```
+
+{
+  "campaign": "The 4 PM Ritual",
+  "vertical": "cafe_bakery",
+  "objective": "increase_afternoon_visits",
+  "audience": "local afternoon coffee customers",
+  "differentiator": "verified_signature_pastry",
+  "core_message": "Make the afternoon worth a visit",
+  "offer_status": "no_discount_required",
+  "primary_cta": "Visit us this afternoon",
+  "alternate_cta": "Ask us on WhatsApp",
+  "channels": [
+    "facebook_ads",
+    "instagram_feed",
+    "instagram_reels",
+    "click_to_whatsapp"
+  ],
+  "approved_claim_ids": ["ev_001"],
+  "requires_owner_approval": true
+}
+
+```
+
+Each platform renderer receives the same blueprint and transforms it into a channel-appropriate execution.
+
+This prevents the four channels from drifting into unrelated content.
+
+## 5. Channel-specific production architecture
+
+The generator should know the conventions and business objectives of each Meta surface.
+
+| Channel                 | Asset specification                  | Optimization goal            |
+| ----------------------- | ------------------------------------ | ---------------------------- |
+| Instagram feed          | 1080 × 1350 image, 4:5               | Discovery, saves, engagement |
+| Instagram carousel      | 4–5 coordinated slides               | Education, consideration     |
+| Instagram Reels         | 1080 × 1920 MP4, 9:16                | Attention, interest, action  |
+| Facebook feed ads       | 4:5 and 1:1 image variants           | Local reach and action       |
+| Facebook/IG Stories ads | 9:16 image or MP4                    | Immediate response           |
+| Click-to-WhatsApp ads   | Placement-specific visual + chat CTA | Qualified conversations      |
+| WhatsApp Status ads     | Vertical creative, where eligible    | Discovery and chats          |
+
+These are our production targets, not an exhaustive list of Meta's accepted specifications. Final publishing must validate each placement's current requirements.
+
+The Instagram publishing API supports Reels via a media container workflow, with compatible MP4/MOV formats and a recommended 9:16 aspect ratio. A professional account and applicable permissions are required for API publishing.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://www.postman.com\&sz=32)
+
+Postman API Network
+
++1
+
+
+
+### The Reel engine
+
+A Reel should be generated from a storyboard, not by animating one image with a slow zoom.
+
+Example: bakery Reel storyboard
+
+12-second target
+
+[Freshly Baked Golden French Croissants with Flaky Crust](https://images.openai.com/static-rsc-4/kYFuOvmCuqQaTaZ-RAmHDgYrGbMMD05y9-Z4_GHJUfkzTTpkClF-Q4YW2ZmI3IJ0zGwrSSwF8vnxK4PVJEmCVrhYMnlhhbj3juTR0WVxNYKakp__dzpZbC61gCquYF32XwHU45Zpr1BYSMsCMJlW66c-CVyTB2b5ehSt2v1QH3z1gLjWqq_D_viA2J4REcZY?purpose=inline)
+
+0–2s
+
+Visual hook
+
+[AI Generated Food Images: Real vs Fake (What Restaurants Need) | FoodShot AI](https://images.openai.com/static-rsc-4/IO6Z0UkEAPL1Ul58gTfZkKvcTNSTe1CIKgCXUVO5zSM-p_PaygTeboNY2aNKsvYl8SdXAdQR-HEwiiyddNiBNNwOzBiiUjI4HNVfaxG0erwyQA8ebWC4ZeKSJOHSCbngenbn1_JgNvLNga-Axq8mX1f1fBKSleHs6crI1OkYuUM?purpose=inline)
+
+2–5s
+
+Product proof
+
+[Morning Light Café | Coffee & Breakfast in Mawson Lakes](https://images.openai.com/static-rsc-4/SnZi2hPFdZGKpvHfVs1m3eGlC3dX_actUUJnA8f9-9m4QPi_VofY7XVKz0Un-ug_qWlBr-2Eg6vw8aV_RNofkFHbK4bEeiCmaA-9vZOtCuzlMC_PCEwawXnaQYF4umglsxkiz9GkhV8l6Zp0_j7h7TPF4iHtwwLyk7lsTTlQqY8?purpose=inline)
+
+5–9s
+
+Desire and occasion
+
+[Pin by Som Thongjittipong on Cafe shop design | Cafe interior design, Bakery shop design, Cafe shop design](https://images.openai.com/static-rsc-4/dLofdXP1jFxW70ou6q5PnrL1mnNKsoRG43FJMBqC4CHwzWADFwWF98r9sLQk6KflzfAwm1gZU5za_uMlb11_12te65NDQ9IuwIFJOhnntuqvZVqrhw9UzFTegjat9dl8zg-ITpey8l5G0-xwUkF9MdW_6XejsH4nWq6NequLfYE?purpose=inline)
+
+9–12s
+
+Brand and CTA
+
+Illustrative storyboard, not actual frames from a verified business.
+
+The motion renderer will support masked product reveals, parallax, animated titles, kinetic typography, cuts, branded transitions and optional licensed audio.
+
+We will not claim that these are AI-generated live-action videos. They are AI-directed, locally rendered motion creatives. Any footage of staff, patients, clients or facilities must be authentic or clearly synthetic.
+
+### WhatsApp needs a conversion experience, not just an ad
+
+For Click-to-WhatsApp campaigns, our kit should generate:
+
+- An ad creative and primary copy.
+- A conversation-opening prompt matched to the campaign.
+- Three suggested business replies for common enquiries.
+- A lead qualification question.
+- A suggested conversion action, such as making a reservation or booking a consultation.
+
+For example, the bakery's conversation prompt could be: "Hi, I'd like to know what's fresh this afternoon."
+
+For the dentist, it might be: "Hi, I'd like to ask about booking a consultation."
+
+This creates a more credible connection between creative strategy and business outcome.
+
+WhatsApp Cloud API templates are a separate messaging mechanism that can require approval; we won't confuse them with ad creatives or silently initiate marketing messages.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://www.postman.com\&sz=32)
+
+Postman API Network
+
++1
+
+
+
+## 6. The four vertical intelligence packs
+
+All four businesses share the same engine, but each uses a distinct diagnostic framework.
+
+| Vertical      | Intelligence focus                                         | Campaign objective              | Special QA                                                 |
+| ------------- | ---------------------------------------------------------- | ------------------------------- | ---------------------------------------------------------- |
+| Café / Bakery | Product desirability, locality, occasions, menu visibility | More in-store visits            | Real product fidelity, valid prices                        |
+| Dentist       | Credentials, reassurance, education, convenience           | Qualified consultations         | Healthcare claims, privacy, professional advertising rules |
+| Gym           | Coaching, facilities, membership value, community          | Trial enquiries and memberships | No unrealistic body transformations                        |
+| Salon         | Portfolio, services, trends, stylist differentiation       | Appointments and repeat visits  | Consent, genuine work, accurate results                    |
+
+Our demo will deliberately show different strategic decisions. A dentist should not sound like a bakery with the nouns changed.
+
+We will maintain a small vertical rules file for each category, while keeping research, planning, creative generation, quality control and exporting completely shared.
+
+## 7. Actual implementation stack
+
+To move quickly as an individual developer, I recommend a TypeScript-first application with a small Python media service.
+
+| Layer                | Technology                                         | Reason                                                               |
+| -------------------- | -------------------------------------------------- | -------------------------------------------------------------------- |
+| Frontend             | Next.js + Tailwind + shadcn/ui                     | Fast, polished, responsive application                               |
+| Backend              | Next.js API routes / Node.js                       | One straightforward application                                      |
+| Agent orchestration  | TypeScript state machine                           | Explicit control and resumable runs                                  |
+| Validation           | Zod + JSON Schema                                  | Typed model outputs and safe handoffs                                |
+| Database             | SQLite + Prisma                                    | Simple local persistence for demo                                    |
+| Evidence index       | SQLite FTS                                         | Local retrieval without external vector APIs                         |
+| Media assets         | Local filesystem                                   | No dependency on a storage provider API                              |
+| Image composition    | Sharp + SVG                                        | Text, branding, masks, positioning                                   |
+| Motion rendering     | Remotion + FFmpeg                                  | Real MP4 output without external video inference                     |
+| AI inference         | Meta Model API                                     | All reasoning, visual understanding, image creation and segmentation |
+| Platform integration | Meta Graph / Marketing / Instagram / WhatsApp APIs | Optional authorized publishing and performance data                  |
+
+We don't need a separate vector database, distributed event bus, complex agent framework, or Kubernetes for this hackathon.
+
+The repository structure should be straightforward:
+
+```
+
+local-growth-studio/
+├── app/
+│   ├── page.tsx
+│   ├── business/[id]/
+│   ├── campaign/[id]/
+│   └── api/
+├── lib/
+│   ├── meta/
+│   │   ├── client.ts
+│   │   ├── research.ts
+│   │   ├── images.ts
+│   │   └── segment.ts
+│   ├── agents/
+│   │   ├── orchestrator.ts
+│   │   ├── business.ts
+│   │   ├── customers.ts
+│   │   ├── competitors.ts
+│   │   ├── opportunities.ts
+│   │   ├── strategist.ts
+│   │   └── critic.ts
+│   ├── verticals/
+│   │   ├── bakery.ts
+│   │   ├── dentist.ts
+│   │   ├── gym.ts
+│   │   └── salon.ts
+│   ├── schemas/
+│   └── rendering/
+├── remotion/
+│   ├── Reel.tsx
+│   └── templates/
+├── prisma/
+├── tests/
+│   ├── fixtures/
+│   ├── evaluation/
+│   └── integration/
+└── README.md
+
+```
+
+### Three engineering rules
+
+1\. Every API call is centrally routed. The application uses one Meta API client with rate limiting, retries, timeouts and usage logging. A model must never receive unrestricted network access.
+
+2\. Every major stage produces a validated artifact. Research outputs a `BusinessProfile`; diagnosis outputs `OpportunityReport`; planning outputs `CampaignBlueprint`; generation outputs `CreativeManifest`; evaluation outputs `QualityReport`.
+
+Meta supports schema-constrained structured outputs, so we can use strict JSON schemas rather than brittle parsing of free-form responses.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://dev.meta.ai\&sz=32)
+
+Meta Model API
+
+
+
+3\. We checkpoint after each stage. If image generation fails, the already completed research and campaign strategy must not have to run again.
+
+### Security and reliability boundaries
+
+We'll allow only approved domain retrieval, block private/local network destinations to prevent SSRF, restrict file sizes, store Meta credentials server-side, and sanitize all content used as model inputs.
+
+Information collected from websites will be treated as untrusted evidence, never instructions for the agents.
+
+For the demo, a run will have a fixed research budget, generation budget and revision limit. Missing evidence should produce an explicit unknown or clarification request, not a fabricated answer.
+
+## 8. Build schedule: November 1–4
+
+We now have just over three days before the submission deadline, not the original eight-day window. The event closes November 4 at 9:00 PM Eastern Time (November 5 at 7:30 AM IST).&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://events.cerebralvalley.ai\&sz=32)
+
+Cerebral Valley
+
+
+
+So we need a vertical slice first, then generalize it across the four categories.
+
+1. November 1 — Foundation and working intelligence engine
+
+   Build the app shell, Meta client, schema models, business ingestion, research orchestration, and evidence ledger.
+
+   Exit test: One real bakery URL produces a sourced business profile, competitor comparison and three ranked marketing opportunities.
+2. November 2 — End-to-end bakery campaign
+
+   Implement strategy selection, Muse Image, SAM integration, local creative composition, Reel renderer, cross-channel copy and export.
+
+   Exit test: One bakery generates a complete downloadable campaign kit, including a playable MP4.
+3. November 3 — Generalize and evaluate
+
+   Add dentist, gym and salon vertical constraints; execute four business tests; run factual and creative evaluation; fix the highest-impact failures.
+
+   Exit test: Four different businesses, four coherent campaigns, without hardcoded creative strategies.
+4. November 4 — Polish and submission
+
+   Improve dashboard, capture genuine research and generation traces, add comparison evidence, test exports, record the demo and complete the submission.
+
+   Exit test: Reproducible live demo, polished recording, working repository and documented setup.
+
+### Feature prioritization
+
+| Feature                                   | Priority       |
+| ----------------------------------------- | -------------- |
+| Meta-only research-to-campaign pipeline   | P0             |
+| Evidence ledger and opportunity diagnosis | P0             |
+| Four business verticals                   | P0             |
+| Instagram/Facebook/WhatsApp creative kits | P0             |
+| At least one rendered Reel per business   | P0             |
+| Export ZIP with all assets                | P0             |
+| Quality checks and automatic revisions    | P0             |
+| Visual research and decision trace        | P1             |
+| Authorized Meta Insights                  | P1             |
+| One-click Instagram publishing            | P2             |
+| Live Marketing API ad creation            | P2             |
+| Automatic budget optimization             | Post-hackathon |
+
+No Meta account integration or live ad publishing should block the primary demo. The official Marketing API supports campaign, ad set, creative and ad objects, but requires access to the relevant business assets and advertiser permissions. We can design a publishing adapter without making those permissions a critical-path dependency.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://www.postman.com\&sz=32)
+
+Postman API Network
+
++1
+
+
+
+## 9. How we demonstrate winning-level technical ambition
+
+Our central hypothesis is that an evidence-backed multi-stage intelligence engine produces more distinctive, accurate and useful campaigns than a direct instruction to generate marketing content.
+
+We need to test that hypothesis, not merely assert it.
+
+## Evaluation protocol
+
+BASELINE A
+
+Direct generation
+
+Business URL + generic campaign instruction → Muse Spark output
+
+SYSTEM B
+
+Our intelligence engine
+
+Research → evidence → opportunity ranking → strategy → creative → critique
+
+Both approaches use Meta models and the same permitted business inputs. Outputs are scored on groundedness, differentiation, platform suitability, authenticity and actionability.
+
+Our proposed acceptance criteria:
+
+| Metric                          | Target                                                              |
+| ------------------------------- | ------------------------------------------------------------------- |
+| End-to-end campaign generation  | 4/4 benchmark businesses                                            |
+| Critical fabricated claims      | 0                                                                   |
+| Channel completeness            | 100%                                                                |
+| Valid, playable Reel files      | 4/4                                                                 |
+| Verified product/brand fidelity | Pass all owner-supplied asset checks                                |
+| Creative quality                | At least 4/5 average in blind human review                          |
+| Baseline comparison             | Our pipeline scores higher on groundedness and business specificity |
+
+For a fair comparison, we must report the actual scores, even if our system doesn't outperform the baseline on every dimension.
+
+I also want to capture three technical signals for the judges: how the agent changes its research between verticals, how evidence affects campaign selection, and whether the critic catches and fixes a bad creative.
+
+A deliberate failure-and-recovery demonstration could be more impressive than a flawless-looking recording that hides the underlying intelligence.
+
+## 10. What the final interface should feel like
+
+There are only five screens:
+
+01 · Discover
+
+Paste the business URL, confirm location and optionally add original photos. One primary action: Analyze my business.
+
+02 · Investigate
+
+Live agent activity, evidence found, competitors identified and gaps detected. A transparent process, not a fake progress bar.
+
+03 · Opportunities
+
+Three ranked campaign opportunities with evidence, proposed audience, objective and differentiation. The agent recommends one.
+
+04 · Creative studio
+
+View the campaign kit in platform-native previews, watch the Reel, compare variants and revise individual assets.
+
+05 · Launch kit
+
+Download media, campaign copy, channel plan, recommended setup and evidence report. Publishing integrations appear only when authorized.
+
+## 11. Final architectural decisions
+
+| Decision            | Final choice                                                                       |
+| ------------------- | ---------------------------------------------------------------------------------- |
+| Hackathon track     | Indie Developer                                                                    |
+| Theme               | Build for Your World                                                               |
+| Core differentiator | Evidence-backed local growth intelligence                                          |
+| Benchmark           | Bakery, dentist, gym, salon                                                        |
+| Models              | Muse Spark, Wonder, Image, SAM 3.1                                                 |
+| External AI APIs    | Meta only                                                                          |
+| Web research        | Meta-grounded search + permitted direct website reading                            |
+| Video               | Locally rendered MP4 with Meta-generated assets                                    |
+| Platforms           | Facebook, Instagram, Reels, WhatsApp                                               |
+| Publishing          | Approval-based, optional                                                           |
+| MVP definition      | Complete autonomous research-to-campaign kit                                       |
+| Winning proof       | Cross-vertical generalization, authentic creatives, measurable quality improvement |
+
+### The pitch
+
+> Great local businesses deserve a great digital presence.
+>
+> Our autonomous growth studio uses Meta's AI models to understand what makes a business special, research its competitive environment, identify overlooked opportunities, and produce complete, platform-native campaigns for Facebook, Instagram, Reels and WhatsApp.
+>
+> No marketing agency. No prompt engineering. No creative team required.
+>
+> Just your business, understood.
+
+## We can begin building
+
+The first implementation milestone is deliberately small but critical:
+
+One real bakery URL → verified business profile → sourced competitor insights → three ranked campaign opportunities.
+
+Once that works, everything downstream has a reliable foundation. We will not start with a beautiful dashboard and mock intelligence.
+
+The first code work should establish the Next.js project, working Meta API integration, evidence schema, research tools, orchestrator and a reproducible bakery test fixture. That is the shortest route to validating the actual technical risk.
+
+The architecture and scope are now defined. The remaining uncertainty is operational—API credentials, real-world data coverage, image quality and rendering performance—which we will address through executable tests rather than more speculative design.

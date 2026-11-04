@@ -1,0 +1,33 @@
+{
+  "business": {
+    "name": "Studio Juniper — fictional demo",
+    "website": "",
+    "locality": "Willow Quarter — fictional neighbourhood",
+    "vertical": "salon",
+    "goal": "Explain the salon's consultation process and invite questions about planning an appointment. Synthetic demonstration only."
+  },
+  "input": {
+    "mode": "synthetic",
+    "readWebsite": false,
+    "sources": [
+      {
+        "kind": "owner_statement",
+        "title": "Fictional salon owner interview — demonstration fixture",
+        "url": null,
+        "text": "Studio Juniper is a fictional salon used for software testing. Before confirming a styling appointment, our team offers a conversation about the visitor's preferred style, maintenance routine and available appointment times. Visitors may bring reference pictures to discuss preferences; these are inspiration rather than a guaranteed result. The team can explain the consultation steps at reception. We can handle six additional consultation inquiries this week. We have not supplied an approved client portfolio or authorized client photographs. No before-and-after result, treatment claim, exact price, discount, stylist credential or promised appearance is approved for this fictional campaign."
+      },
+      {
+        "kind": "customer_review",
+        "title": "Two fictional planning comments — not real client reviews",
+        "url": null,
+        "text": "Fictional commenter A: I would like to discuss how much daily maintenance a style might involve before confirming an appointment. Fictional commenter B: Knowing that I can bring reference pictures and ask about available times would help me start the conversation. These are two invented comments for software testing, not actual testimonials or evidence of styling outcomes."
+      },
+      {
+        "kind": "competitor",
+        "title": "Fictional salon homepage excerpt — demonstration fixture",
+        "url": null,
+        "text": "Fictional comparator Central Style lists styling categories and an appointment inquiry button in this supplied homepage excerpt. The excerpt does not explain a consultation conversation or how reference pictures are discussed. No other pages, client portfolios, service results, prices or reviews were inspected."
+      }
+    ]
+  }
+}

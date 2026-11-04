@@ -1,0 +1,33 @@
+{
+  "business": {
+    "name": "First Step Studio — fictional demo",
+    "website": "",
+    "locality": "Willow Quarter — fictional neighbourhood",
+    "vertical": "gym",
+    "goal": "Explain what happens at the introductory gym orientation and invite inquiries from people planning their first visit. Synthetic demonstration only."
+  },
+  "input": {
+    "mode": "synthetic",
+    "readWebsite": false,
+    "sources": [
+      {
+        "kind": "owner_statement",
+        "title": "Fictional studio coordinator interview — demonstration fixture",
+        "url": null,
+        "text": "First Step Studio is a fictional gym used for software testing. We offer an introductory orientation that walks visitors through the training floor, equipment areas and class timetable. A staff member explains where to find changing rooms and how to ask about class bookings. Visitors can ask reception about an orientation appointment. We can accommodate four additional orientation inquiries this week. Orientation is a practical introduction, not a medical consultation or a promise of fitness results. No free trial, membership price, discount, body transformation, health claim or trainer credential is approved for this fictional campaign."
+      },
+      {
+        "kind": "customer_review",
+        "title": "Two fictional first-visit comments — not real member reviews",
+        "url": null,
+        "text": "Fictional commenter A: Before visiting a new gym I would like to know where to go and how to read the class timetable. Fictional commenter B: A walk through the equipment areas and an explanation of class bookings would help me plan a first visit. These are two invented comments for software testing, not evidence of measured demand or training results."
+      },
+      {
+        "kind": "competitor",
+        "title": "Fictional gym homepage excerpt — demonstration fixture",
+        "url": null,
+        "text": "Fictional comparator Metro Fitness lists its equipment categories and a membership inquiry button in this supplied homepage excerpt. The excerpt does not explain an introductory orientation or first-visit sequence. No other pages, classes, staff qualifications, prices or member reviews were inspected."
+      }
+    ]
+  }
+}

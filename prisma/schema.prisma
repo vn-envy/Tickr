@@ -1,0 +1,72 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../lib/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model Business {
+  id        String   @id @default(uuid())
+  name      String
+  website   String?
+  locality  String
+  vertical  String
+  goal      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  runs      Run[]
+}
+
+model Run {
+  id         String          @id @default(uuid())
+  businessId String
+  business   Business        @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  stage      String          @default("created")
+  status     String          @default("draft")
+  mode       String          @default("live")
+  jobKind    String          @default("research")
+  inputHash  String?
+  leaseOwner String?
+  leaseUntil DateTime?
+  attempts   Int             @default(0)
+  modelCalls Int             @default(0)
+  error      String?
+  retrySafe  Boolean         @default(false)
+  events     Json            @default("[]")
+  usage      Json            @default("[]")
+  createdAt  DateTime        @default(now())
+  updatedAt  DateTime        @updatedAt
+  evidence   Evidence[]
+  artifacts  StageArtifact[]
+  @@index([businessId])
+  @@index([status, createdAt])
+  @@unique([businessId, inputHash])
+}
+
+model Evidence {
+  id          String   @id @default(uuid())
+  runId       String
+  run         Run      @relation(fields: [runId], references: [id], onDelete: Cascade)
+  claim       String
+  excerpt     String
+  support     String
+  sourceType  String
+  sourceUrl   String?
+  metadata    Json
+  createdAt   DateTime @default(now())
+  @@index([runId])
+}
+
+model StageArtifact {
+  id          String   @id @default(uuid())
+  runId       String
+  run         Run      @relation(fields: [runId], references: [id], onDelete: Cascade)
+  stage       String
+  version     Int
+  contentHash String
+  payload     Json
+  createdAt   DateTime @default(now())
+  @@unique([runId, stage, version])
+}

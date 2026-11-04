@@ -1,0 +1,33 @@
+{
+  "business": {
+    "name": "Alder & Crumb — fictional demo",
+    "website": "",
+    "locality": "Willow Quarter — fictional neighbourhood",
+    "vertical": "bakery",
+    "goal": "Tell the baker's craft story and invite inquiries about the weekend bake. Synthetic demonstration only."
+  },
+  "input": {
+    "mode": "synthetic",
+    "readWebsite": false,
+    "sources": [
+      {
+        "kind": "owner_statement",
+        "title": "Fictional owner interview — demonstration fixture",
+        "url": null,
+        "text": "Alder & Crumb is a fictional neighbourhood bakery. Our baker Mina makes orange-cardamom buns every Saturday. She learned the shaping technique from her father and still shapes every bun by hand. We can accommodate ten additional weekend pickup orders. Customers can ask at the counter about the weekend bake. We have not approved a discount, dietary claim, price, phone number or founding date for this campaign."
+      },
+      {
+        "kind": "customer_review",
+        "title": "Two fictional customer comments — not real reviews",
+        "url": null,
+        "text": "Fictional customer A: The orange-cardamom bun was memorable, but I did not know it was only made on Saturdays. Fictional customer B: I enjoyed hearing how Mina learned to shape the buns from her father. I would like a reminder of what is baking at the weekend. These are two invented comments for software testing, not representative demand."
+      },
+      {
+        "kind": "competitor",
+        "title": "Fictional competitor page excerpt — demonstration fixture",
+        "url": null,
+        "text": "Fictional comparator City Crust describes a large daily pastry selection and convenient takeaway coffee on its supplied homepage excerpt. This excerpt does not describe the bakers or their shaping process. No other pages, offerings or customer reviews were inspected."
+      }
+    ]
+  }
+}
