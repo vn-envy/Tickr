@@ -115,6 +115,18 @@ export interface AppliedFixes {
   reelCopyChanged: boolean;
   fixesApplied: string[];
   withheldFiles: string[];
+  /**
+   * Withheld files whose problem is in the pixels they show (a person, a third-party mark, an
+   * unresolved critical finding): every other kit file rendered from the same source is withheld too.
+   */
+  contentWithheldFiles: string[];
+  /**
+   * The critic reported a critical problem it could not attribute to one file: nothing in the kit
+   * can be approved until it is critiqued again (fail closed).
+   */
+  withholdAll: boolean;
+  /** Critiqued files whose bytes an APPLIED fix re-renders (never recommendation-only remedies). */
+  rerenderedFiles: string[];
   recommendations: string[];
 }
 
@@ -130,23 +142,46 @@ const describeRemedy = (remedy: FixRemedy): string | null => {
   }
 };
 
-/** Applies only remedies that need no model: withholding and deleting listed internal wording from channel copy. */
+/** Withhold reasons about what the pixels show, so every export of the same source shares them. */
+const CONTENT_REASONS: ReadonlySet<string> = new Set(["person_without_consent", "third_party_branding", "unresolved_critical"]);
+/** Withhold reasons about the channel copy, so every file rendering that channel's copy shares them. */
+const COPY_REASONS: ReadonlySet<string> = new Set(["claim_not_supported", "unapproved_offer"]);
+/** Remedies the pipeline never applies: they stay owner recommendations. */
+const RECOMMENDATION_ONLY: ReadonlySet<FixRemedy["kind"]> = new Set(["relayout_text_away_from_subject", "recrop_to_subject", "increase_text_contrast", "restore_cta"]);
+
+/**
+ * Applies only remedies that need no model: withholding and deleting listed internal wording from
+ * channel copy. Fails closed: a critical finding whose remedy is only a recommendation withholds its
+ * file, and a critical finding the critic could not attribute to one file withholds the whole kit.
+ */
 export function applyDeterministicFixes(report: CritiqueReport | null, copy: CampaignCopy, snapshot: CritiqueSnapshot): AppliedFixes {
-  if (!report) return { plan: null, copy, copyChanged: false, reelCopyChanged: false, fixesApplied: [], withheldFiles: [], recommendations: [] };
+  if (!report) return { plan: null, copy, copyChanged: false, reelCopyChanged: false, fixesApplied: [], withheldFiles: [], contentWithheldFiles: [], withholdAll: false, rerenderedFiles: [], recommendations: [] };
   const plan = planDeterministicFixes(report, criticChannels(copy));
   const patched: CampaignCopy = { ...copy, channels: copy.channels.map((channel) => ({ ...channel })) };
   const fixesApplied: string[] = [];
   const recommendations: string[] = [];
   let reelCopyChanged = false, copyChanged = false;
-  const withheld = new Set<string>();
+  const withheld = new Set<string>(), contentWithheld = new Set<string>(), rerendered = new Set<string>();
+  const critical = new Set(report.findings.filter((finding) => finding.severity === "critical").map((finding) => finding.id));
+  const filesOf = (assetId: string): string[] => {
+    if (assetId === CRITIC_REEL_ASSET_ID) return [...REEL_FILES];
+    const still = snapshot.stills.find((item) => item.assetId === assetId);
+    if (!still) return [];
+    return still.filename === "instagram_reel_cover.png" ? [...REEL_FILES] : [still.filename];
+  };
+  const channelOf = (assetId: string) => assetId === CRITIC_REEL_ASSET_ID ? "instagram_reels" : snapshot.stills.find((item) => item.assetId === assetId)?.channel ?? null;
+  const withhold = (assetId: string, reasons: readonly string[]) => {
+    const files = filesOf(assetId);
+    // A claim or offer lives in the channel copy, which every file of that channel renders.
+    const channel = reasons.some((reason) => COPY_REASONS.has(reason)) ? channelOf(assetId) : null;
+    if (channel) for (const item of snapshot.stills) if (item.channel === channel) files.push(...filesOf(item.assetId));
+    files.forEach((file) => withheld.add(file));
+    if (reasons.some((reason) => CONTENT_REASONS.has(reason))) files.forEach((file) => contentWithheld.add(file));
+  };
+  const withholdAll = plan.remedies.some((remedy) => remedy.kind === "manual_review" && remedy.reason === "unattributed_critical");
   for (const remedy of plan.remedies) {
     if (remedy.kind === "withhold_asset") {
-      if (remedy.assetId === CRITIC_REEL_ASSET_ID) REEL_FILES.forEach((file) => withheld.add(file));
-      else {
-        const still = snapshot.stills.find((item) => item.assetId === remedy.assetId);
-        if (still) withheld.add(still.filename);
-        if (still?.filename === "instagram_reel_cover.png") REEL_FILES.forEach((file) => withheld.add(file));
-      }
+      withhold(remedy.assetId, remedy.reasons);
       fixesApplied.push(bounded(`Withheld ${remedy.assetId === CRITIC_REEL_ASSET_ID ? "the Reel" : remedy.assetId} from the ready kit (${remedy.reasons.map((reason) => reason.replaceAll("_", " ")).join(", ")}).`, 300));
       continue;
     }
@@ -156,13 +191,53 @@ export function applyDeterministicFixes(report: CritiqueReport | null, copy: Cam
       channel[remedy.field] = remedy.after;
       copyChanged = true;
       if (remedy.channelId === "instagram_reels") reelCopyChanged = true;
+      remedy.assetIds.forEach((assetId) => filesOf(assetId).forEach((file) => rerendered.add(file)));
       fixesApplied.push(bounded(`Removed internal review wording (${remedy.removedPhrases.slice(0, 3).map((phrase) => `“${bounded(phrase, 40)}”`).join(", ")}) from the ${remedy.channelId} ${remedy.field}; affected files were re-rendered locally and need a fresh look.`, 300));
       continue;
+    }
+    if (RECOMMENDATION_ONLY.has(remedy.kind) && "assetId" in remedy && remedy.assetId && remedy.findingIds.some((id) => critical.has(id))) {
+      // Nothing applies this remedy, so the critical finding stays unresolved: withhold the file.
+      withhold(remedy.assetId, ["unresolved_critical_layout"]);
+      fixesApplied.push(bounded(`Withheld ${remedy.assetId === CRITIC_REEL_ASSET_ID ? "the Reel" : remedy.assetId} from the ready kit (unresolved critical finding: ${remedy.kind.replaceAll("_", " ")} is only a recommendation).`, 300));
     }
     const text = describeRemedy(remedy);
     if (text) recommendations.push(bounded(text, 600));
   }
-  return { plan, copy: copyChanged ? patched : copy, copyChanged, reelCopyChanged, fixesApplied: fixesApplied.slice(0, 40), withheldFiles: [...withheld].sort(), recommendations: [...new Set(recommendations)] };
+  if (withholdAll) {
+    for (const item of [...snapshot.stills.map((still) => still.filename), ...(snapshot.reel ? [...REEL_FILES] : [])]) { withheld.add(item); contentWithheld.add(item); }
+    fixesApplied.push("Withheld the whole kit from approval: the critic reported a critical problem it could not attribute to one file.");
+  }
+  // A withheld file is never also reported as a re-rendered, approvable change.
+  for (const file of withheld) rerendered.delete(file);
+  return {
+    plan, copy: copyChanged ? patched : copy, copyChanged, reelCopyChanged, fixesApplied: fixesApplied.slice(0, 40),
+    withheldFiles: [...withheld].sort(), contentWithheldFiles: [...contentWithheld].sort(), withholdAll, rerenderedFiles: [...rerendered].sort(),
+    recommendations: [...new Set(recommendations)],
+  };
+}
+
+export const SAM_OVERLAY_FILE = "sam-tracking-overlay.mp4";
+export const ARCHIVE_FILE = "campaign-concept.zip";
+
+/**
+ * The final withheld set for the exported kit (fail closed):
+ * - withholdAll: every kit file.
+ * - a withheld Reel also withholds the SAM tracking overlay of the same footage;
+ * - a file withheld for its content withholds every other kit file rendered from the same source
+ *   (other placements, the hero source export, SAM mask previews, the tracking overlay);
+ * - the concept archive bundles every kit file, so it is withheld whenever anything is.
+ */
+export function withheldKitFiles(input: { files: readonly string[]; withheld: Iterable<string>; contentWithheld: Iterable<string>; withholdAll: boolean; sourcesOf: (filename: string) => readonly string[] }): string[] {
+  const present = new Set(input.files);
+  if (input.withholdAll) return [...present].sort();
+  const result = new Set([...input.withheld].filter((file) => present.has(file)));
+  const tainted = new Set<string>();
+  for (const file of input.contentWithheld) input.sourcesOf(file).forEach((source) => tainted.add(source));
+  if (tainted.size) for (const file of present) if (input.sourcesOf(file).some((source) => tainted.has(source))) result.add(file);
+  // After source propagation: a Reel withheld for any reason, directly or through its source, takes its overlay with it.
+  if (REEL_FILES.some((file) => result.has(file)) && present.has(SAM_OVERLAY_FILE)) result.add(SAM_OVERLAY_FILE);
+  if (result.size && present.has(ARCHIVE_FILE)) result.add(ARCHIVE_FILE);
+  return [...result].sort();
 }
 
 /** The director's-room critic panel. */

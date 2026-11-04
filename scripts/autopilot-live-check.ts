@@ -471,6 +471,8 @@ const SCENES = [
 ];
 const CTA = "Drop by for a cup";
 const REEL_CHANNEL = "instagram_reels";
+/** Provenance chip for the synthetic probe still (still-depth Reel and the tracked Reel's end card). */
+export const STILL_PROBE_PROVENANCE = "Synthetic probe image · SAM cutout";
 /** Copy shared by both Reels. mode "synthetic" makes the renderers draw "SYNTHETIC DEMO · CONCEPT" on every frame. */
 const RENDER_COPY = {
   scenes: SCENES, cta: CTA, businessName: BUSINESS.name, campaignName: "Synthetic live check", mode: "synthetic" as const,
@@ -691,7 +693,7 @@ export async function runAutopilotLiveCheck(options: LiveCheckOptions): Promise<
     // Still-depth: prefer the box-prompted cup; fall back to the concept-segmented jar.
     const picks = [{ result: geometry as MetaSegmentationResult | null, image: CUP }, { result: concept as MetaSegmentationResult | null, image: JAR }];
     const pick = picks.find((candidate) => candidate.result?.objects.length);
-    let endCard: { source: Buffer; subjectMask: Buffer } | undefined;
+    let endCard: { source: Buffer; subjectMask: Buffer; provenanceLabel: string } | undefined;
     if (!pick) { fail(dependency("a SAM image mask")); facts.stillDepth = { status: "skipped" }; }
     else {
       try {
@@ -699,9 +701,10 @@ export async function runAutopilotLiveCheck(options: LiveCheckOptions): Promise<
         const object = [...pick.result!.objects].sort((a, b) => b.foregroundPixels - a.foregroundPixels)[0];
         const layer = await composeObjectLayer(source, pick.result!, object.id, { minConfidence: 0 });
         if (!layer) throw new LiveCheckError("NO_USABLE_MASK", "The SAM image mask was not usable for a still-depth Reel.");
-        endCard = { source, subjectMask: layer.maskPng };
+        // The end card is the synthetic probe still, not owner media: it carries its own label.
+        endCard = { source, subjectMask: layer.maskPng, provenanceLabel: STILL_PROBE_PROVENANCE };
         const input: StillDepthInput = {
-          ...RENDER_COPY, source, subjectMask: layer.maskPng, provenanceLabel: "Synthetic probe image · SAM cutout",
+          ...RENDER_COPY, source, subjectMask: layer.maskPng, provenanceLabel: STILL_PROBE_PROVENANCE,
           outputPath: join(directory, "synthetic-still-depth-reel.mp4"), coverPath: join(directory, "synthetic-still-depth-cover.png"),
         };
         const result = await renderStillDepthReel(input);
@@ -729,6 +732,7 @@ export async function runAutopilotLiveCheck(options: LiveCheckOptions): Promise<
         facts.trackedReel = {
           status: "rendered", reel: result.reel, cover: result.cover, violations: result.qa.violations, footageFrames: result.timeline.footageFrames, endCard: result.timeline.endCard.kind,
           footageFramesWithoutMask: result.qa.footageFramesWithoutMask, provenanceLabel: result.layout.provenanceLabel, conceptLabel: result.layout.conceptLabel,
+          endCardProvenanceLabel: result.endCard.provenanceLabel,
           generatedPixelsOnSubject: result.ledger.generatedPixelsOnSubject, framesWithoutSubject: result.ledger.framesWithoutSubject, maxSubjectOcclusion: round6(result.ledger.maxSubjectOcclusion),
         };
       } catch (error) { fail(error); facts.trackedReel = { status: "failed" }; }

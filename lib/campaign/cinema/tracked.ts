@@ -4,22 +4,26 @@ import { basename, dirname, isAbsolute, join } from "node:path";
 import sharp from "sharp";
 import { z } from "zod";
 import type { ClipFrame, CompositionLedger, FrameMask, MaskletReader, MaskletSet, NormalizedClip, TrackPoint } from "../../media/cinema-types";
-import { readClipFrames } from "../../media/clip";
+import { readClipFrames, readRenderClipFrames, renderClipMatches, type OwnerRenderClip } from "../../media/clip";
 import { REEL_DURATION_SECONDS, REEL_FPS, REEL_HEIGHT, REEL_WIDTH } from "../../rendering/reel-contract";
 import { CinemaEncodeError, openH264Encoder } from "./encode";
 import { gaussianBlurZero } from "./fill";
 import { CompositionLedgerAccumulator, LedgerCanvas } from "./ledger";
-import { MAX_FOREGROUND_OCCLUSION, prepareStillDepth, STILL_DEPTH_LABEL_BANDS, type StillDepthComposer, type StillDepthLayoutReport, type StillDepthScene, type StillDepthTheme } from "./still-depth";
-import { cleanText, pill, svgDocument, textBlock, type FontFace, type TextBlock } from "./typography";
+import { refineMaskField } from "./mask-refine";
+import { MAX_FOREGROUND_OCCLUSION, MAX_HEADLINE_LINE_OCCLUSION, MAX_HEADLINE_OCCLUSION, prepareStillDepth, STILL_DEPTH_LABEL_BANDS, type StillDepthComposer, type StillDepthLayoutReport, type StillDepthScene, type StillDepthTheme } from "./still-depth";
+import { cleanText, pill, svgDocument, textBlock, type Bounds, type FontFace, type TextBlock } from "./typography";
 
 /**
  * Cinematic 12 s Reel driven by REAL owner footage and the hero object's SAM 3.1 masklets.
  *
  * Pixel provenance is structural. Every footage frame is the decoded clip frame reframed to 9:16
- * (one bilinear resample). The background is that same frame blurred, desaturated and darkened;
- * the hero subject is the untreated reframed frame selected by its upsampled SAM mask. The mask's
- * alpha is feathered only across the outermost 1–2 output pixels; inside the mask the output RGB
- * equals the reframed source RGB. Frames whose mask is missing (tracking lost) show the treated
+ * (one bilinear resample). Crops and masks live in tracking-clip pixels; output pixels come from the
+ * optional render-resolution clip of the same frames when one is supplied (the tracking clip is
+ * capped at 1280 px for SAM), and the source-to-output enlargement is reported in QA. The background is that same frame blurred, desaturated and darkened;
+ * the hero subject is the untreated reframed frame selected by its upsampled SAM mask. The mask is
+ * refined for compositing only (specks dropped, pin-holes filled, stair-stepped edges smoothed with a
+ * trackedMaskSigma Gaussian; see mask-refine.ts) and its alpha is feathered only across the
+ * outermost 1–2 output pixels; inside the mask the output RGB equals the reframed source RGB. Frames whose mask is missing (tracking lost) show the treated
  * frame without a pop-out and are counted in the ledger. Nothing is interpolated or invented:
  * when the footage window is shorter than 12 s, the remaining time is a CTA end card — the
  * still-depth CTA scene from an owner photo when one is supplied, else a freeze of the best
@@ -34,14 +38,22 @@ export const TRACKED_REEL_FRAMES = REEL_DURATION_SECONDS * REEL_FPS;
 export const TRACKED_COVER_FRAME = 60;
 /** Shortest footage window that can carry the hook, proof and value acts (matches the clip normalizer's half second). */
 export const MIN_TRACKED_FOOTAGE_FRAMES = 15;
-/** Provenance chip on a still-depth end card when the caller does not name the still's own source. */
-export const DEFAULT_END_CARD_PROVENANCE = "Owner photo";
 /** The CTA act starts here (or earlier, when the footage ends sooner). */
 export const TRACKED_CTA_START = TRACKED_REEL_FRAMES - 3 * FPS;
 /** Rows occupied by the concept (top) and provenance (bottom) chips in every frame. */
 export const TRACKED_LABEL_BANDS = STILL_DEPTH_LABEL_BANDS;
 /** Output pixels across which the subject alpha ramps from 0 to 1 at the mask edge. */
 export const SUBJECT_FEATHER_PX = 1.5;
+/**
+ * Edge smoothing of each SAM frame mask, in mask pixels, for a mask enlarged `scale`× into the
+ * output. A mask pixel spans several output pixels, so a hard binary edge shows as stair steps of
+ * about half a mask pixel; the smoothing grows with the enlargement to keep them sub-pixel, within
+ * bounds that keep thin parts (≥ ~2 mask px) and corners.
+ */
+export const TRACKED_MASK_SIGMA = { min: 0.85, max: 2, perScale: 0.25 } as const;
+export function trackedMaskSigma(scale: number): number {
+  return Math.min(TRACKED_MASK_SIGMA.max, Math.max(TRACKED_MASK_SIGMA.min, TRACKED_MASK_SIGMA.perScale * scale));
+}
 /** The tracked callout stays inside these output-pixel margins. */
 export const CALLOUT_SAFE = { left: 48, right: W - 48, top: TRACKED_LABEL_BANDS.top.bottom + 40, bottom: TRACKED_LABEL_BANDS.bottom.top - 40 } as const;
 const LEDGER_FACTOR = 4;
@@ -61,6 +73,15 @@ const BACKGROUND_SIGMA = 3.2;
 const CALLOUT_HEIGHT = 68, CALLOUT_POINTER = 16, CALLOUT_GAP = 22;
 /** Hook headline: mean share of its glyphs covered by the real subject above this is a review flag. */
 export const MAX_TRACKED_HEADLINE_OCCLUSION = 0.5;
+/** Contrast floor for kickers, body copy and labels over footage (WCAG AA normal text), even over white. */
+export const MIN_TEXT_CONTRAST = 4.5;
+/** Contrast floor for the large serif display headlines over footage (WCAG AA large text), even over white. */
+export const MIN_DISPLAY_CONTRAST = 3;
+/** Depth-headline sizes tried for the hook (largest first). */
+const HOOK_HEADLINE_SIZES = [150, 128, 110, 92] as const;
+const VALUE_HEADLINE_SIZES = [124, 108, 92, 84] as const;
+/** Footage enlarged by more than this (source pixels to output pixels) looks soft; see low_resolution_footage. */
+export const MAX_FOOTAGE_UPSCALE = 1.5;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -104,7 +125,13 @@ export interface TrackedReelPlan {
 }
 
 export interface TrackedReelInput {
+  /** Tracking clip: the masklets, crops and plan are in its pixels. */
   clip: NormalizedClip;
+  /**
+   * Optional render-resolution copy of the same clip frames (normalizeOwnerRenderClip). When given,
+   * output pixels are drawn from it instead of the 1280-px tracking clip; it must match `clip`.
+   */
+  renderClip?: OwnerRenderClip;
   reader: MaskletReader;
   heroObjectId: string;
   /** Inclusive clip frame range; defaults to the whole clip. At most 12 s of it is used. */
@@ -121,10 +148,11 @@ export interface TrackedReelInput {
   coverPath: string;
   /**
    * Owner photo (PNG) and its subject mask (PNG) for a still-depth CTA end card. The end card is a
-   * different source asset than the footage, so it carries its own provenance chip: pass a label
-   * that describes the still (default DEFAULT_END_CARD_PROVENANCE), never the footage label.
+   * different source asset than the footage, so it carries its own provenance chip: the caller must
+   * name the still's own source (e.g. "Owner photo · SAM cutout"), never the footage label. There is
+   * no default: an unlabelled end card is rejected rather than shown with a guessed provenance.
    */
-  endCard?: { source: Uint8Array; subjectMask: Uint8Array; provenanceLabel?: string };
+  endCard?: { source: Uint8Array; subjectMask: Uint8Array; provenanceLabel: string };
   /** Callout text attached to the tracked subject; defaults to the hero object's local label. Not a verified identity. */
   callout?: string;
 }
@@ -137,8 +165,53 @@ export interface TrackedReelInput {
  * - subject_cropped: more than 10% of frames crop the subject at the frame edge by over 5%.
  * - headline_hidden: the real subject covers most of the hook's depth headline on average.
  * - end_card_fallback: the supplied still-depth end card could not be used; a freeze was rendered.
+ * - low_resolution_footage: more than 10% of footage frames enlarge their source pixels by over MAX_FOOTAGE_UPSCALE.
  */
-export type TrackedReelViolation = "foreground_occlusion" | "subject_missing" | "tracking_lost" | "subject_cropped" | "headline_hidden" | "end_card_fallback";
+export type TrackedReelViolation = "foreground_occlusion" | "subject_missing" | "tracking_lost" | "subject_cropped" | "headline_hidden" | "end_card_fallback" | "low_resolution_footage";
+
+/** How much the drawn footage pixels are enlarged into the 1080×1920 output (1 = 1:1). */
+export interface TrackedFootageUpscale {
+  /** Which file supplied the footage pixels. */
+  source: "render_clip" | "tracking_clip";
+  sourceWidth: number;
+  sourceHeight: number;
+  max: number;
+  mean: number;
+  /** Footage and freeze frames enlarged by more than MAX_FOOTAGE_UPSCALE. */
+  framesOverLimit: number;
+}
+
+/** Where a depth headline was placed against the subject's motion over its whole act. */
+export interface TrackedHeadlinePlacement {
+  /** Behind the subject (depth typography) or, when no band keeps it readable, in front (on a backing that stays beneath the subject). */
+  placement: "behind_subject" | "in_front";
+  /** Planned mean share of the glyph area the tracked subject covers over the act (0 in front). */
+  occlusion: number;
+  /** Worst single line's planned mean share (0 in front). */
+  lineOcclusion: number;
+  /** Planned mean share of the subject hidden by the headline glyphs (0 behind; its backing sits beneath the subject). */
+  foregroundOcclusion: number;
+  fontSize: number;
+  top: number;
+}
+
+export interface TrackedLayoutReport {
+  conceptLabel: string;
+  provenanceLabel: string;
+  calloutLabel: string;
+  calloutSide: "above" | "below";
+  truncatedText: string[];
+  hookHeadline: TrackedHeadlinePlacement;
+  valueHeadline: TrackedHeadlinePlacement;
+  /**
+   * Every text block over footage sits on a soft dark backing sized so the text keeps its contrast
+   * floor even over a pure white backdrop: worst-case contrast ratios and the backing opacities.
+   * Backings are composited beneath the hero subject (`backingLayer`), so they never hide it: where
+   * front text crosses the subject, its glyphs (with their soft shade) are drawn over the real subject
+   * pixels without a backing, and that share is reported per Reel in qa.frontTextOverSubject.
+   */
+  textContrast: { body: number; kicker: number; display: number; backingOpacity: { body: number; kicker: number; display: number }; backingLayer: "beneath_subject" };
+}
 
 /** Where the frames after the footage come from. */
 export interface TrackedEndCardReport {
@@ -155,7 +228,7 @@ export interface TrackedReelResult {
   cover: { sha256: string; bytes: number; width: number; height: number; frame: number };
   ledger: CompositionLedger;
   timeline: { window: { fromFrame: number; toFrame: number }; footageFrames: number; acts: Record<TrackedAct, [number, number]>; endCard: TrackedReelPlan["endCard"]; bestFrame: number };
-  layout: { conceptLabel: string; provenanceLabel: string; calloutLabel: string; calloutSide: "above" | "below"; truncatedText: string[] };
+  layout: TrackedLayoutReport;
   endCard: TrackedEndCardReport;
   qa: {
     violations: TrackedReelViolation[];
@@ -164,6 +237,18 @@ export interface TrackedReelResult {
     footageFramesWithoutMask: number;
     /** Share of the hook depth headline's glyphs covered by the real subject (frames where it is fully shown). */
     headlineOcclusion: { mean: number; max: number };
+    /**
+     * Share of the in-front text glyphs (body copy, proof stack, in-front headlines, CTA brand/body)
+     * drawn over the real subject, where their backing is beneath the subject and only the glyph
+     * shade separates them from it (frames where such text is shown).
+     */
+    frontTextOverSubject: { mean: number; max: number };
+    footageUpscale: TrackedFootageUpscale;
+    /**
+     * Alpha-only compositing refinement of the hero's SAM frame masks (the stored masklets are
+     * unchanged): edge smoothing sigma and the speck/pin-hole pixels dropped or filled, summed over drawn frames.
+     */
+    maskRefinement: { edgeSigma: { min: number; max: number }; framesRefined: number; framesWithSpecksRemoved: number; framesWithHolesFilled: number; removedPixels: number; filledPixels: number };
   };
 }
 
@@ -189,8 +274,10 @@ const readerSchema = z.custom<MaskletReader>((value) => {
   const reader = value as MaskletReader | null;
   return Boolean(reader) && typeof reader === "object" && typeof reader!.frameMask === "function" && Boolean(reader!.set) && typeof reader!.set === "object";
 });
+const renderClipInputSchema = z.custom<OwnerRenderClip>((value) => Boolean(value) && typeof value === "object");
 const inputSchema = z.strictObject({
   clip: clipSchema,
+  renderClip: renderClipInputSchema.optional(),
   reader: readerSchema,
   heroObjectId: z.string().regex(/^\d{1,20}$/),
   window: z.strictObject({ fromFrame: frameIndex, toFrame: frameIndex }).optional(),
@@ -203,7 +290,7 @@ const inputSchema = z.strictObject({
   theme: z.strictObject({ paper: hex, ink: hex, accent: hex, soft: hex }),
   outputPath: z.string().max(4096).refine((value) => isAbsolute(value) && /\.mp4$/i.test(value)),
   coverPath: z.string().max(4096).refine((value) => isAbsolute(value) && /\.png$/i.test(value)),
-  endCard: z.strictObject({ source: bytes, subjectMask: bytes, provenanceLabel: line(64, 1).optional() }).optional(),
+  endCard: z.strictObject({ source: bytes, subjectMask: bytes, provenanceLabel: line(64, 1) }).optional(),
   callout: line(48, 1).optional(),
 });
 
@@ -218,6 +305,8 @@ function parseInput(input: TrackedReelInput): TrackedReelInput {
   }
   // Footage plays at its own speed: one clip frame per Reel frame.
   if (clip.fps !== FPS || bound.fps !== FPS) throw new TrackedCinemaError("The tracked Reel needs a 30 fps normalized clip.");
+  // A render source must repeat exactly these frames at a uniformly larger size; never guess a mapping.
+  if (value.renderClip && !renderClipMatches(value.renderClip, clip)) throw new TrackedCinemaError("The render-resolution footage does not match the tracking clip.");
   return value;
 }
 
@@ -430,6 +519,35 @@ function contrast(a: string, b: string): number {
   return (hi + 0.05) / (lo + 0.05);
 }
 
+function luminanceRgb(rgb: readonly number[]): number {
+  const [r, g, b] = rgb.map((channel) => channel / 255).map((c) => c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+  return r * 0.2126 + g * 0.7152 + b * 0.0722;
+}
+
+/** Lowest text opacity used over footage; the contrast floor is checked with the text this translucent. */
+const MIN_TEXT_OPACITY = 0.9;
+
+/**
+ * Worst-case contrast of `text` (drawn at MIN_TEXT_OPACITY) on a `dark` backing of `opacity` over a
+ * pure white backdrop — the brightest thing footage can put under it.
+ */
+export function backedContrast(text: string, dark: string, opacity: number): number {
+  const d = hexRgb(dark), t = hexRgb(text);
+  const backdrop = d.map((channel) => 255 * (1 - opacity) + channel * opacity);
+  const glyph = t.map((channel, i) => channel * MIN_TEXT_OPACITY + backdrop[i] * (1 - MIN_TEXT_OPACITY));
+  const [hi, lo] = [luminanceRgb(glyph), luminanceRgb(backdrop)].sort((x, y) => y - x);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+/**
+ * Smallest backing opacity (in 0.01 steps) that keeps `minimum` contrast for `text` over any
+ * footage; null when even an opaque `dark` backing cannot (the caller then changes the text colour).
+ */
+export function backingOpacity(text: string, dark: string, minimum: number): number | null {
+  for (let step = 0; step <= 100; step++) if (backedContrast(text, dark, step / 100) >= minimum) return step / 100;
+  return null;
+}
+
 /** Readable colour tokens from the proposed theme (same rules as the still-depth Reel). */
 function tokens(theme: StillDepthTheme) {
   let light = luminance(theme.paper) >= luminance(theme.ink) ? theme.paper : theme.ink;
@@ -444,6 +562,64 @@ function tokens(theme: StillDepthTheme) {
 }
 type Tokens = ReturnType<typeof tokens>;
 
+/** Text backings: padded around the text bounds and blurred; the padding keeps ≥ BACKING_COVERAGE of the opacity under the text. */
+const BACKING_PAD_X = 30, BACKING_PAD_Y = 24, BACKING_COVERAGE = 0.97;
+const BACKING_FILTER = `<filter id="soft" filterUnits="userSpaceOnUse" x="0" y="0" width="${W}" height="${H}"><feGaussianBlur stdDeviation="9"/></filter>`;
+
+function unionBounds(blocks: readonly (TextBlock | null | undefined)[]): Bounds | null {
+  return blocks.reduce<Bounds | null>((a, block) => !block ? a : !a ? { ...block.bounds }
+    : { left: Math.min(a.left, block.bounds.left), top: Math.min(a.top, block.bounds.top), right: Math.max(a.right, block.bounds.right), bottom: Math.max(a.bottom, block.bounds.bottom) }, null);
+}
+
+/** Adds the mask's coverage of every ledger cell (cell centres, nearest mask pixel) under a 9:16 crop. */
+function addMaskCoverage(map: Float32Array, mask: FrameMask, crop: TrackedCrop): void {
+  const s = W / crop.width, { left, top, right, bottom } = mask.bounds, mw = right - left, mh = bottom - top;
+  const cx0 = Math.max(0, Math.floor((left - crop.x) * s / LEDGER_FACTOR)), cx1 = Math.min(LW, Math.ceil((right - crop.x) * s / LEDGER_FACTOR));
+  const cy0 = Math.max(0, Math.floor((top - crop.y) * s / LEDGER_FACTOR)), cy1 = Math.min(LH, Math.ceil((bottom - crop.y) * s / LEDGER_FACTOR));
+  for (let cy = cy0; cy < cy1; cy++) {
+    const j = Math.floor(crop.y + (cy + 0.5) * LEDGER_FACTOR / s) - top;
+    if (j < 0 || j >= mh) continue;
+    for (let cx = cx0; cx < cx1; cx++) {
+      const i = Math.floor(crop.x + (cx + 0.5) * LEDGER_FACTOR / s) - left;
+      if (i >= 0 && i < mw && mask.raster[j * mw + i]) map[cy * LW + cx] += 1;
+    }
+  }
+}
+
+/**
+ * Share of a graphic's glyph area covered by `cover` with the graphic moved down by `dy` output
+ * pixels, optionally only on output rows [rows[0], rows[1]) after the move (one text line).
+ */
+function glyphCover(g: Graphic, cover: Float32Array, dy: number, rows?: readonly [number, number]): number {
+  const shift = Math.round(dy / LEDGER_FACTOR);
+  const x0 = Math.max(0, Math.floor(g.x / LEDGER_FACTOR)), x1 = Math.min(LW, Math.ceil((g.x + g.width) / LEDGER_FACTOR));
+  const y0 = Math.max(0, Math.floor(g.y / LEDGER_FACTOR)), y1 = Math.min(LH, Math.ceil((g.y + g.height) / LEDGER_FACTOR));
+  let total = 0, covered = 0;
+  for (let y = y0; y < y1; y++) {
+    const ty = y + shift, centre = ty * LEDGER_FACTOR + LEDGER_FACTOR / 2;
+    if (ty < 0 || ty >= LH || (rows && (centre < rows[0] || centre >= rows[1]))) continue;
+    for (let x = x0; x < x1; x++) {
+      const a = g.reduced[y * LW + x];
+      if (a <= 0) continue;
+      total += a; covered += a * Math.min(1, cover[ty * LW + x]);
+    }
+  }
+  return total > 0 ? covered / total : 0;
+}
+
+/** Share of the (mean) subject coverage hidden by the union of graphics moved down by `dy`. */
+function subjectHidden(cover: Float32Array, graphics: readonly (Graphic | null)[], dy: number): number {
+  const shifted = graphics.filter((g): g is Graphic => Boolean(g)).map((g) => shiftedReduced(g, 0, dy, new Float32Array(LW * LH)));
+  let total = 0, hidden = 0;
+  for (let i = 0; i < cover.length; i++) {
+    if (cover[i] <= 0) continue;
+    let clear = 1;
+    for (const map of shifted) clear *= 1 - Math.min(1, map[i]);
+    total += cover[i]; hidden += cover[i] * (1 - clear);
+  }
+  return total > 0 ? hidden / total : 0;
+}
+
 const SHADE_FILTER = `<filter id="shade" x="-10%" y="-30%" width="120%" height="160%"><feGaussianBlur in="SourceAlpha" stdDeviation="7"/><feComponentTransfer><feFuncA type="linear" slope="0.5"/></feComponentTransfer><feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge></filter>`;
 const shaded = (svg: string) => renderGraphic(svg ? `<g filter="url(#shade)">${svg}</g>` : "", SHADE_FILTER);
 
@@ -451,7 +627,8 @@ const shaded = (svg: string) => renderGraphic(svg ? `<g filter="url(#shade)">${s
 // Layout
 // ---------------------------------------------------------------------------
 
-interface ActItem { g: Graphic | null; layer: "behind" | "front"; start: number; rise: number; fadeOut: boolean; role?: "hook_headline" }
+type ItemRole = "hook_headline" | "front_text";
+interface ActItem { g: Graphic | null; layer: "behind" | "front"; start: number; rise: number; fadeOut: boolean; role?: ItemRole }
 interface SubjectStats { top: number; bottom: number; cy: number }
 
 function subjectStats(plan: TrackedReelPlan, act: TrackedAct): SubjectStats | null {
@@ -485,7 +662,7 @@ async function prepareLayout(input: TrackedReelInput, plan: TrackedReelPlan, cal
     `<rect x="0" y="${Math.round(top)}" width="${W}" height="${Math.round(height)}" fill="url(#${id})"/>`,
     `<linearGradient id="${id}" x1="0" y1="${fromTop ? 1 : 0}" x2="0" y2="${fromTop ? 0 : 1}"><stop offset="0" stop-color="${theme.dark}" stop-opacity="0"/><stop offset="0.55" stop-color="${theme.dark}" stop-opacity="0.6"/><stop offset="1" stop-color="${theme.dark}" stop-opacity="0.84"/></linearGradient>`,
   );
-  /** A large serif headline set behind the real subject, overlapping the top of its typical box. */
+  /** A large serif headline set behind the real subject, overlapping the top of its typical box (CTA). */
   const depthHeadline = (text: string, stats: SubjectStats, size: number, minSize: number, anchor: "start" | "middle", minTop: number) => {
     const spec: TextSpec = { text, face: "serif", size, minSize, maxLines: 3, color: theme.light, lineHeight: 1.02 };
     const x = anchor === "middle" ? W / 2 : SIDE - 4;
@@ -493,26 +670,119 @@ async function prepareLayout(input: TrackedReelInput, plan: TrackedReelPlan, cal
     const top = Math.round(clamp(stats.top - height * 0.62, minTop, H - 300 - height));
     return block(spec, x, top, textWidth, anchor);
   };
+
+  // Every text block over footage gets a soft dark backing that keeps its contrast floor over white.
+  const kickerColor = backingOpacity(theme.kickerOnDark, theme.dark, MIN_TEXT_CONTRAST) === null ? theme.light : theme.kickerOnDark;
+  const opacity = {
+    body: backingOpacity(theme.light, theme.dark, MIN_TEXT_CONTRAST) ?? 1,
+    kicker: backingOpacity(kickerColor, theme.dark, MIN_TEXT_CONTRAST) ?? 1,
+    display: backingOpacity(theme.light, theme.dark, MIN_DISPLAY_CONTRAST) ?? 1,
+  };
+  const textContrast = {
+    body: Number(backedContrast(theme.light, theme.dark, opacity.body).toFixed(2)),
+    kicker: Number(backedContrast(kickerColor, theme.dark, opacity.kicker).toFixed(2)),
+    display: Number(backedContrast(theme.light, theme.dark, opacity.display).toFixed(2)),
+    backingOpacity: opacity,
+    backingLayer: "beneath_subject" as const,
+  };
+  /** Soft-edged backing under text bounds; the blur falloff is compensated so the text area gets the full opacity. */
+  const backing = (boxes: readonly (Bounds | null | undefined)[], alpha: number) => {
+    const rects = boxes.filter((box): box is Bounds => Boolean(box)).map((box) => {
+      const x = Math.max(0, Math.floor(box.left - BACKING_PAD_X)), y = Math.floor(box.top - BACKING_PAD_Y);
+      const width = Math.min(W, Math.ceil(box.right + BACKING_PAD_X)) - x, height = Math.ceil(box.bottom + BACKING_PAD_Y) - y;
+      return `<rect x="${x}" y="${y}" width="${width}" height="${height}" rx="28" fill="${theme.dark}" fill-opacity="${Math.min(1, alpha / BACKING_COVERAGE).toFixed(3)}"/>`;
+    }).join("");
+    return renderGraphic(rects ? `<g filter="url(#soft)">${rects}</g>` : "", BACKING_FILTER);
+  };
+  /**
+   * Text on its backing. The backing is always composited beneath the hero subject (it never hides
+   * it); text set in front of the subject keeps its glyphs in front and is tagged front_text.
+   */
+  const backed = async (items: ActItem[], laid: readonly (TextBlock | null)[], alpha: number, item: Omit<ActItem, "g">, shade = true) => {
+    const present = laid.filter((value): value is TextBlock => Boolean(value));
+    if (!present.length) return;
+    items.push({ ...item, layer: "behind", role: undefined, g: await backing([unionBounds(present)], alpha) });
+    const role = item.layer === "front" ? "front_text" : item.role;
+    for (const value of present) items.push({ ...item, role, g: shade ? await shaded(value.svg) : await renderGraphic(value.svg) });
+  };
+
+  // Depth headlines are placed against the subject's mask over the whole act (it moves), never one frame.
+  const coverage = async (act: TrackedAct) => {
+    const [start, end] = plan.acts[act];
+    const map = new Float32Array(LW * LH);
+    let frames = 0;
+    for (let index = start; index < end; index += 2) {
+      const frame = plan.frames[index];
+      if (frame.kind !== "footage" || !frame.crop || frame.sourceFrame === null) continue;
+      const mask = await input.reader.frameMask(input.heroObjectId, frame.sourceFrame);
+      if (!mask) continue;
+      frames++;
+      addMaskCoverage(map, mask, frame.crop);
+    }
+    if (frames) for (let i = 0; i < map.length; i++) map[i] /= frames;
+    return map;
+  };
+  const placeHeadline = async (name: string, text: string, cover: Float32Array, sizes: readonly number[], minTop: number, maxBottom: number) => {
+    for (const [index, size] of sizes.entries()) {
+      const last = index === sizes.length - 1;
+      const spec: TextSpec = { text, face: "serif", size, minSize: last ? Math.round(size * 0.85) : size, maxLines: 3, color: theme.light, lineHeight: 1.02 };
+      const probe = block(spec, SIDE - 4, minTop, textWidth);
+      if ((probe.truncated || probe.brokenWords) && !last) continue;
+      const glyphs = await shaded(probe.svg);
+      if (!glyphs) continue;
+      let best: { top: number; occlusion: number; line: number; score: number } | null = null;
+      for (let top = minTop; top + probe.bounds.bottom - minTop <= maxBottom; top += LEDGER_FACTOR * 6) {
+        const occlusion = glyphCover(glyphs, cover, top - minTop);
+        if (occlusion > MAX_HEADLINE_OCCLUSION) continue;
+        const line = Math.max(0, ...probe.boxes.map((box) => glyphCover(glyphs, cover, top - minTop, [box.y + top - minTop, box.y + box.height + top - minTop])));
+        if (line > MAX_HEADLINE_LINE_OCCLUSION) continue;
+        const score = Math.abs(occlusion - 0.16) + 0.25 * top / H;
+        if (!best || score < best.score) best = { top, occlusion, line, score };
+      }
+      if (!best) continue;
+      const laid = block(spec, SIDE - 4, best.top, textWidth);
+      note(name, laid);
+      const report: TrackedHeadlinePlacement = { placement: "behind_subject", occlusion: Number(best.occlusion.toFixed(4)), lineOcclusion: Number(best.line.toFixed(4)), foregroundOcclusion: 0, fontSize: laid.size, top: best.top };
+      return { laid, report, layer: "behind" as const };
+    }
+    // No band keeps the moving subject off most of the headline: it goes in front (its backing stays
+    // beneath the subject), where its glyphs hide the subject least.
+    const spec: TextSpec = { text, face: "serif", size: 96, minSize: 72, maxLines: 3, color: theme.light, lineHeight: 1.04 };
+    const probe = block(spec, SIDE - 4, minTop, textWidth);
+    const glyphs = await shaded(probe.svg);
+    let best = { top: minTop, hidden: Infinity };
+    for (let top = minTop; top + probe.bounds.bottom - minTop <= maxBottom; top += LEDGER_FACTOR * 6) {
+      const hidden = subjectHidden(cover, [glyphs], top - minTop);
+      if (hidden < best.hidden - 1e-6) best = { top, hidden };
+    }
+    const laid = block(spec, SIDE - 4, best.top, textWidth);
+    note(name, laid);
+    const report: TrackedHeadlinePlacement = { placement: "in_front", occlusion: 0, lineOcclusion: 0, foregroundOcclusion: Number((Number.isFinite(best.hidden) ? best.hidden : 0).toFixed(4)), fontSize: laid.size, top: best.top };
+    return { laid, report, layer: "front" as const };
+  };
   const acts: Record<TrackedAct, ActItem[]> = { hook: [], proof: [], value: [], cta: [] };
 
-  // HOOK — kicker and giant headline behind the subject; body in front at the bottom.
-  const hookStats = subjectStats(plan, "hook")!;
-  const hookHeadline = depthHeadline(hookScene.headline, hookStats, 150, 92, "start", 176);
-  note("hook.headline", hookHeadline);
-  acts.hook.push({ g: await shaded(hookHeadline.svg), layer: "behind", start: 0.2, rise: 44, fadeOut: true, role: "hook_headline" });
-  if (hookScene.kicker.trim()) acts.hook.push({ g: await renderGraphic(block({ text: hookScene.kicker, face: "sansBold", size: 26, maxLines: 1, color: theme.kickerOnDark, letterSpacing: 5, uppercase: true }, SIDE, Math.max(140, hookHeadline.bounds.top - 60), textWidth).svg), layer: "behind", start: 0.12, rise: 40, fadeOut: true });
+  // HOOK — kicker and giant headline behind the subject (placed against its motion over the act); body in front at the bottom.
+  const hookBodySpec: TextSpec = { text: hookScene.body, face: "sans", size: 36, maxLines: 3, color: theme.light, lineHeight: 1.3 };
+  const hookBodyTop = H - 150 - block(hookBodySpec, 0, 0, textWidth).bounds.bottom;
+  const hookPlaced = await placeHeadline("hook.headline", hookScene.headline, await coverage("hook"), HOOK_HEADLINE_SIZES, 176, Math.min(H - 300, hookScene.body.trim() ? hookBodyTop - 40 : H - 300));
+  if (hookScene.kicker.trim()) {
+    const kicker = block({ text: hookScene.kicker, face: "sansBold", size: 26, maxLines: 1, color: kickerColor, letterSpacing: 5, uppercase: true }, SIDE, Math.max(140, hookPlaced.laid.bounds.top - 60), textWidth);
+    await backed(acts.hook, [kicker], opacity.kicker, { layer: "behind", start: 0.12, rise: 40, fadeOut: true }, false);
+  }
+  await backed(acts.hook, [hookPlaced.laid], opacity.display, { layer: hookPlaced.layer, start: 0.2, rise: 44, fadeOut: true, role: hookPlaced.layer === "behind" ? "hook_headline" : undefined });
   if (hookScene.body.trim()) {
-    const spec: TextSpec = { text: hookScene.body, face: "sans", size: 36, maxLines: 3, color: theme.light, lineHeight: 1.3 };
-    const laid = block(spec, SIDE, H - 150 - block(spec, 0, 0, textWidth).bounds.bottom, textWidth);
+    const laid = block(hookBodySpec, SIDE, hookBodyTop, textWidth);
     note("hook.body", laid);
-    acts.hook.push({ g: await shaded(laid.svg), layer: "front", start: 0.9, rise: 30, fadeOut: true });
+    await backed(acts.hook, [laid], opacity.body, { layer: "front", start: 0.9, rise: 30, fadeOut: true });
   }
 
   // PROOF — kicker/headline/body stack in front on the side the subject leaves free.
+  const hookStats = subjectStats(plan, "hook")!;
   const proofStats = subjectStats(plan, "proof") ?? hookStats;
   const stackSide: "top" | "bottom" = proofStats.cy > H * 0.5 ? "top" : "bottom";
   const proofSpecs: TextSpec[] = [
-    { text: proofScene.kicker, face: "sansBold", size: 24, maxLines: 1, color: theme.kickerOnDark, letterSpacing: 4.5, uppercase: true },
+    { text: proofScene.kicker, face: "sansBold", size: 24, maxLines: 1, color: kickerColor, letterSpacing: 4.5, uppercase: true },
     { text: proofScene.headline, face: "serif", size: 78, minSize: 56, maxLines: 3, color: theme.light, lineHeight: 1.06 },
     { text: proofScene.body, face: "sans", size: 33, minSize: 27, maxLines: 3, color: theme.light, lineHeight: 1.32, opacity: 0.94 },
   ];
@@ -529,25 +799,30 @@ async function prepareLayout(input: TrackedReelInput, plan: TrackedReelPlan, cal
   const stackHeight = Math.max(0, ...layStack(0).map((laid) => laid?.bounds.bottom ?? 0));
   const stackTop = stackSide === "top" ? 176 : H - 150 - stackHeight;
   acts.proof.push({ g: await gradient("proofShade", stackSide === "top" ? 0 : stackTop - 260, stackHeight + 260 + (stackSide === "top" ? stackTop : 150), stackSide === "top"), layer: "behind", start: 0, rise: 0, fadeOut: true });
-  for (const [index, laid] of layStack(stackTop).entries()) {
+  const proofStack = layStack(stackTop);
+  // The stack's backing sits beneath the subject; the stacked text is in front.
+  acts.proof.push({ g: await backing([unionBounds(proofStack)], Math.max(opacity.body, opacity.kicker)), layer: "behind", start: 0.1, rise: 34, fadeOut: true });
+  for (const [index, laid] of proofStack.entries()) {
     if (!laid) continue;
     note(`proof.${index}`, laid);
-    acts.proof.push({ g: await shaded(laid.svg), layer: "front", start: 0.1 + index * 0.12, rise: 34, fadeOut: true });
+    acts.proof.push({ g: await shaded(laid.svg), layer: "front", start: 0.1 + index * 0.12, rise: 34, fadeOut: true, role: "front_text" });
   }
 
-  // VALUE — a second depth headline behind the subject; body in front at the bottom.
-  const valueStats = subjectStats(plan, "value") ?? proofStats;
-  const valueHeadline = depthHeadline(valueScene.headline, valueStats, 124, 84, "start", 176);
-  note("value.headline", valueHeadline);
-  if (valueScene.kicker.trim()) acts.value.push({ g: await renderGraphic(block({ text: valueScene.kicker, face: "sansBold", size: 24, maxLines: 1, color: theme.kickerOnDark, letterSpacing: 4.5, uppercase: true }, SIDE, Math.max(140, valueHeadline.bounds.top - 56), textWidth).svg), layer: "behind", start: 0.1, rise: 36, fadeOut: true });
-  acts.value.push({ g: await shaded(valueHeadline.svg), layer: "behind", start: 0.16, rise: 44, fadeOut: true });
-  if (valueScene.body.trim()) {
-    const spec: TextSpec = { text: valueScene.body, face: "sans", size: 33, minSize: 27, maxLines: 3, color: theme.light, lineHeight: 1.32, opacity: 0.94 };
-    const height = block(spec, 0, 0, textWidth).bounds.bottom;
-    const laid = block(spec, SIDE, H - 150 - height, textWidth);
+  // VALUE — a second depth headline behind the subject (placed against its motion); body in front at the bottom.
+  const valueBodySpec: TextSpec = { text: valueScene.body, face: "sans", size: 33, minSize: 27, maxLines: 3, color: theme.light, lineHeight: 1.32, opacity: 0.94 };
+  const valueBodyHeight = valueScene.body.trim() ? block(valueBodySpec, 0, 0, textWidth).bounds.bottom : 0;
+  const valueBodyTop = H - 150 - valueBodyHeight;
+  const valuePlaced = await placeHeadline("value.headline", valueScene.headline, await coverage("value"), VALUE_HEADLINE_SIZES, 176, Math.min(H - 300, valueBodyHeight ? valueBodyTop - 40 : H - 300));
+  if (valueScene.kicker.trim()) {
+    const kicker = block({ text: valueScene.kicker, face: "sansBold", size: 24, maxLines: 1, color: kickerColor, letterSpacing: 4.5, uppercase: true }, SIDE, Math.max(140, valuePlaced.laid.bounds.top - 56), textWidth);
+    await backed(acts.value, [kicker], opacity.kicker, { layer: "behind", start: 0.1, rise: 36, fadeOut: true }, false);
+  }
+  await backed(acts.value, [valuePlaced.laid], opacity.display, { layer: valuePlaced.layer, start: 0.16, rise: 44, fadeOut: true });
+  if (valueBodyHeight) {
+    const laid = block(valueBodySpec, SIDE, valueBodyTop, textWidth);
     note("value.body", laid);
-    acts.value.push({ g: await gradient("valueShade", H - 150 - height - 240, height + 390, false), layer: "behind", start: 0, rise: 0, fadeOut: true });
-    acts.value.push({ g: await shaded(laid.svg), layer: "front", start: 0.45, rise: 30, fadeOut: true });
+    acts.value.push({ g: await gradient("valueShade", valueBodyTop - 240, valueBodyHeight + 390, false), layer: "behind", start: 0, rise: 0, fadeOut: true });
+    await backed(acts.value, [laid], opacity.body, { layer: "front", start: 0.45, rise: 30, fadeOut: true });
   }
 
   // CTA — brand line and CTA pill in front; the CTA headline behind the subject. Only drawn on real frames.
@@ -565,10 +840,10 @@ async function prepareLayout(input: TrackedReelInput, plan: TrackedReelPlan, cal
     note("cta.body", body);
     acts.cta.push({ g: await gradient("ctaTop", 0, Math.max(headline.bounds.bottom, brand.bounds.bottom) + 120, true), layer: "behind", start: 0, rise: 0, fadeOut: false });
     acts.cta.push({ g: await gradient("ctaBottom", pillTop - 260, H - pillTop + 260, false), layer: "behind", start: 0, rise: 0, fadeOut: false });
-    acts.cta.push({ g: await shaded(headline.svg), layer: "behind", start: 0.12, rise: 34, fadeOut: false });
-    acts.cta.push({ g: await shaded(brand.svg), layer: "front", start: 0, rise: 28, fadeOut: false });
+    await backed(acts.cta, [headline], opacity.display, { layer: "behind", start: 0.12, rise: 34, fadeOut: false });
+    await backed(acts.cta, [brand], opacity.body, { layer: "front", start: 0, rise: 28, fadeOut: false });
     acts.cta.push({ g: await renderGraphic(ctaPill.svg), layer: "front", start: 0.4, rise: 28, fadeOut: false });
-    if (body) acts.cta.push({ g: await shaded(body.svg), layer: "front", start: 0.55, rise: 28, fadeOut: false });
+    await backed(acts.cta, [body], opacity.body, { layer: "front", start: 0.55, rise: 28, fadeOut: false });
   }
 
   // CALLOUT — the focus/offering name attached to the tracked subject through the proof and value acts.
@@ -589,7 +864,7 @@ async function prepareLayout(input: TrackedReelInput, plan: TrackedReelPlan, cal
   const calloutSide = fits(preferred) ? preferred : fits(preferred === "above" ? "below" : "above") ? (preferred === "above" ? "below" : "above") : preferred;
 
   return {
-    theme, chrome, acts, conceptLabel: concept, provenanceLabel, truncated,
+    theme, chrome, acts, conceptLabel: concept, provenanceLabel, truncated, hookHeadline: hookPlaced.report, valueHeadline: valuePlaced.report, textContrast,
     callout: { above: calloutAbove, below: calloutBelow, width: calloutWidth, side: calloutSide, text: label.boxes[0]?.text ?? calloutText },
   };
 }
@@ -598,8 +873,15 @@ async function prepareLayout(input: TrackedReelInput, plan: TrackedReelPlan, cal
 // Per-frame compositor
 // ---------------------------------------------------------------------------
 
-interface DrawOp { g: Graphic; dx: number; dy: number; opacity: number; role?: "hook_headline" }
-export interface TrackedFrameStats { maskPresent: boolean; headlineOcclusion: number | null }
+interface DrawOp { g: Graphic; dx: number; dy: number; opacity: number; role?: ItemRole }
+export interface TrackedFrameStats {
+  maskPresent: boolean;
+  headlineOcclusion: number | null;
+  /** Share of the shown in-front text glyph area drawn over the real subject (no backing there); null when no front text is shown. */
+  frontTextOverSubject: number | null;
+  /** Mask pixels the compositing refinement dropped (specks) or filled (pin-holes) on this frame; null without a footage mask. */
+  maskRefinement: { removedPixels: number; filledPixels: number; edgeSigma: number } | null;
+}
 
 class FootageCompositor {
   private readonly reframed = new Float32Array(W * H * 3);
@@ -627,16 +909,21 @@ class FootageCompositor {
     lookup(W, LW, this.upCols); lookup(H, LH, this.upRows);
   }
 
-  /** One bilinear resample of the clip frame into the 9:16 crop (edge-clamped). */
-  private reframe(frame: ClipFrame, crop: TrackedCrop): void {
-    const sw = frame.width, sh = frame.height, src = frame.rgba, scale = crop.width / W;
-    const axis = (count: number, origin: number, size: number, target: { index: Int32Array; frac: Float32Array }) => {
+  /**
+   * One bilinear resample of the footage frame into the 9:16 crop (edge-clamped). `crop` is in
+   * tracking-clip pixels; `k` maps it per axis onto a larger render-source frame.
+   */
+  private reframe(frame: ClipFrame, crop: TrackedCrop, k: { x: number; y: number } | null): void {
+    const sw = frame.width, sh = frame.height, src = frame.rgba;
+    const sourceCrop = k ? { x: crop.x * k.x, y: crop.y * k.y, width: crop.width * k.x, height: crop.height * k.y } : crop;
+    const scaleX = sourceCrop.width / W, scaleY = k ? sourceCrop.height / H : scaleX;
+    const axis = (count: number, origin: number, size: number, scale: number, target: { index: Int32Array; frac: Float32Array }) => {
       for (let i = 0; i < count; i++) {
         const u = clamp(origin + (i + 0.5) * scale - 0.5, 0, size - 1), i0 = Math.max(0, Math.min(size - 2, Math.floor(u)));
         target.index[i] = i0; target.frac[i] = size > 1 ? u - i0 : 0;
       }
     };
-    axis(W, crop.x, sw, this.cols); axis(H, crop.y, sh, this.rows);
+    axis(W, sourceCrop.x, sw, scaleX, this.cols); axis(H, sourceCrop.y, sh, scaleY, this.rows);
     const dst = this.reframed, rowStride = sw * 4, step = sw > 1 ? 4 : 0, next = sh > 1 ? rowStride : 0;
     for (let y = 0; y < H; y++) {
       const r0 = this.rows.index[y] * rowStride, fy = this.rows.frac[y];
@@ -694,33 +981,35 @@ class FootageCompositor {
   }
 
   /**
-   * Pops the real subject on top: output = background·(1−α) + reframed·α, with α the upsampled SAM
-   * mask whose edge ramp spans SUBJECT_FEATHER_PX output pixels. Returns the subject's inside and
-   * full (transformed) areas for crop accounting; fills `subjectReduced` for the ledger.
+   * Pops the real subject on top: output = background·(1−α) + reframed·α, with α the refined SAM
+   * mask (smoothed coverage field, bilinearly upsampled) whose edge ramp spans SUBJECT_FEATHER_PX
+   * output pixels. Returns the subject's inside and full (transformed) areas for crop accounting and
+   * what the refinement removed/filled; fills `subjectReduced` for the ledger.
    */
-  private popSubject(mask: FrameMask, crop: TrackedCrop): { insideArea: number; totalArea: number } {
+  private popSubject(mask: FrameMask, crop: TrackedCrop): { insideArea: number; totalArea: number; refined: { removedPixels: number; filledPixels: number; edgeSigma: number } } {
     const s = W / crop.width, { left, top, right, bottom } = mask.bounds;
-    const mw = right - left, mh = bottom - top, raster = mask.raster;
-    let maskArea = 0;
-    for (let i = 0; i < raster.length; i++) maskArea += raster[i];
-    const x0 = Math.max(0, Math.floor((left - crop.x) * s) - 2), x1 = Math.min(W, Math.ceil((right - crop.x) * s) + 2);
-    const y0 = Math.max(0, Math.floor((top - crop.y) * s) - 2), y1 = Math.min(H, Math.ceil((bottom - crop.y) * s) + 2);
+    const refined = refineMaskField(mask.raster, right - left, bottom - top, { sigma: trackedMaskSigma(s) });
+    const field = refined.field, fw = refined.width, fh = refined.height;
+    // Clip position of field cell (0, 0)'s pixel centre is (gx + 0.5, gy + 0.5).
+    const gx = left + refined.ox, gy = top + refined.oy;
+    const x0 = Math.max(0, Math.floor((gx - crop.x) * s) - 2), x1 = Math.min(W, Math.ceil((gx + fw - crop.x) * s) + 2);
+    const y0 = Math.max(0, Math.floor((gy - crop.y) * s) - 2), y1 = Math.min(H, Math.ceil((gy + fh - crop.y) * s) + 2);
     const reduced = this.subjectReduced, cell = 1 / (LEDGER_FACTOR * LEDGER_FACTOR);
     reduced.fill(0);
     let inside = 0;
-    const ramp = s / SUBJECT_FEATHER_PX, src = this.reframed, out = this.out;
-    for (let y = y0; y < y1; y++) {
-      const v = crop.y + (y + 0.5) / s - 0.5 - top, j0 = Math.floor(v), fy = v - j0;
-      const row0 = j0 >= 0 && j0 < mh, row1 = j0 + 1 >= 0 && j0 + 1 < mh;
+    const ramp = refined.gain * s / SUBJECT_FEATHER_PX, src = this.reframed, out = this.out;
+    for (let y = y0; y < y1 && fw > 0; y++) {
+      const v = crop.y + (y + 0.5) / s - 0.5 - gy, j0 = Math.floor(v), fy = v - j0;
+      const row0 = j0 >= 0 && j0 < fh, row1 = j0 + 1 >= 0 && j0 + 1 < fh;
       if (!row0 && !row1) continue;
       const reducedRow = (y >> 2) * LW;
       for (let x = x0; x < x1; x++) {
-        const u = crop.x + (x + 0.5) / s - 0.5 - left, i0 = Math.floor(u), fx = u - i0;
-        const col0 = i0 >= 0 && i0 < mw, col1 = i0 + 1 >= 0 && i0 + 1 < mw;
+        const u = crop.x + (x + 0.5) / s - 0.5 - gx, i0 = Math.floor(u), fx = u - i0;
+        const col0 = i0 >= 0 && i0 < fw, col1 = i0 + 1 >= 0 && i0 + 1 < fw;
         if (!col0 && !col1) continue;
-        const p = j0 * mw + i0;
-        const value = (row0 && col0 ? raster[p] * (1 - fx) * (1 - fy) : 0) + (row0 && col1 ? raster[p + 1] * fx * (1 - fy) : 0)
-          + (row1 && col0 ? raster[p + mw] * (1 - fx) * fy : 0) + (row1 && col1 ? raster[p + mw + 1] * fx * fy : 0);
+        const p = j0 * fw + i0;
+        const value = (row0 && col0 ? field[p] * (1 - fx) * (1 - fy) : 0) + (row0 && col1 ? field[p + 1] * fx * (1 - fy) : 0)
+          + (row1 && col0 ? field[p + fw] * (1 - fx) * fy : 0) + (row1 && col1 ? field[p + fw + 1] * fx * fy : 0);
         const a = clamp01((value - 0.5) * ramp + 0.5);
         if (a <= 0) continue;
         const o = (y * W + x) * 3;
@@ -730,7 +1019,7 @@ class FootageCompositor {
         reduced[reducedRow + (x >> 2)] += a * cell;
       }
     }
-    return { insideArea: inside, totalArea: maskArea * s * s };
+    return { insideArea: inside, totalArea: refined.area * s * s, refined: { removedPixels: refined.report.removedPixels, filledPixels: refined.report.filledPixels, edgeSigma: refined.report.edgeSigma } };
   }
 
   private wash(amount: number): void {
@@ -750,18 +1039,20 @@ class FootageCompositor {
     return out;
   }
 
-  compose(frame: ClipFrame, mask: FrameMask | null, crop: TrackedCrop, treatment: number, behind: readonly DrawOp[], front: readonly DrawOp[], wash: number, chrome: Graphic | null): { rgba: Buffer; canvas: LedgerCanvas; stats: TrackedFrameStats } {
+  compose(frame: ClipFrame, k: { x: number; y: number } | null, mask: FrameMask | null, crop: TrackedCrop, treatment: number, behind: readonly DrawOp[], front: readonly DrawOp[], wash: number, chrome: Graphic | null): { rgba: Buffer; canvas: LedgerCanvas; stats: TrackedFrameStats } {
     const canvas = new LedgerCanvas(LW, LH);
-    this.reframe(frame, crop);
+    this.reframe(frame, crop, k);
     this.treat(treatment);
     canvas.over("treated_source", this.ones, 1);
     for (const op of behind) {
       drawGraphicPixels(this.out, op.g, op.dx, op.dy, op.opacity);
       canvas.over("background_graphics", shiftedReduced(op.g, op.dx, op.dy, this.ledgerScratch), clamp01(op.opacity));
     }
-    let headlineOcclusion: number | null = null;
+    let headlineOcclusion: number | null = null, frontTextOverSubject: number | null = null, maskRefinement: TrackedFrameStats["maskRefinement"] = null;
     if (mask) {
-      canvas.addSubjectInstance(this.popSubject(mask, crop));
+      const popped = this.popSubject(mask, crop);
+      maskRefinement = popped.refined;
+      canvas.addSubjectInstance({ insideArea: popped.insideArea, totalArea: popped.totalArea });
       canvas.over("subject", this.subjectReduced, 1);
       const headline = behind.find((op) => op.role === "hook_headline" && op.opacity >= 0.9);
       if (headline) {
@@ -771,13 +1062,27 @@ class FootageCompositor {
         headlineOcclusion = total > 0 ? covered / total : null;
       }
     }
+    const text = front.filter((op) => op.role === "front_text");
+    if (text.length) {
+      let total = 0, over = 0;
+      for (const op of text) {
+        const glyphs = shiftedReduced(op.g, op.dx, op.dy, this.ledgerScratch), weight = clamp01(op.opacity);
+        for (let i = 0; i < glyphs.length; i++) {
+          if (!(glyphs[i] > 0)) continue;
+          const a = Math.min(1, glyphs[i]) * weight;
+          total += a;
+          if (mask) over += a * Math.min(1, this.subjectReduced[i]);
+        }
+      }
+      frontTextOverSubject = total > 0 ? over / total : null;
+    }
     for (const op of front) {
       drawGraphicPixels(this.out, op.g, op.dx, op.dy, op.opacity);
       canvas.over("foreground_graphics", shiftedReduced(op.g, op.dx, op.dy, this.ledgerScratch), clamp01(op.opacity));
     }
     if (wash > 0) { this.wash(wash); canvas.over("transition", this.ones, clamp01(wash)); }
     if (chrome) { drawGraphicPixels(this.out, chrome, 0, 0, 1); canvas.over("foreground_graphics", chrome.reduced, 1); }
-    return { rgba: this.toRgba(), canvas, stats: { maskPresent: Boolean(mask), headlineOcclusion } };
+    return { rgba: this.toRgba(), canvas, stats: { maskPresent: Boolean(mask), headlineOcclusion, frontTextOverSubject, maskRefinement } };
   }
 }
 
@@ -790,9 +1095,12 @@ export interface TrackedReelComposer {
   readonly layout: TrackedReelResult["layout"];
   readonly endCardFallback: boolean;
   readonly endCard: TrackedEndCardReport;
+  /** Source-to-output enlargement of the planned footage and freeze frames. */
+  readonly footageUpscale: TrackedFootageUpscale;
   /**
-   * Draws output frame `index`. Footage and freeze frames need the decoded clip frame named by
-   * the plan and the hero mask for it (null when tracking was lost); still-depth frames ignore both.
+   * Draws output frame `index`. Footage and freeze frames need the decoded footage frame named by
+   * the plan (from the render clip when one was supplied, else the tracking clip) and the hero
+   * mask for it (null when tracking was lost); still-depth frames ignore both.
    */
   draw(index: number, source: ClipFrame | null, mask: FrameMask | null): { rgba: Buffer; canvas: LedgerCanvas; stats: TrackedFrameStats };
 }
@@ -801,6 +1109,23 @@ function treatmentAt(frame: TrackedFramePlan, plan: TrackedReelPlan): number {
   if (frame.act !== "hook") return 1;
   const [start, end] = plan.acts.hook;
   return easeInOut(frame.actTime / Math.min(0.8, (end - start) / FPS * 0.5));
+}
+
+/** Enlargement of every planned footage/freeze crop when drawn from a sourceWidth×sourceHeight frame. */
+function measureUpscale(plan: TrackedReelPlan, source: TrackedFootageUpscale["source"], sourceWidth: number, sourceHeight: number, k: { x: number; y: number }): TrackedFootageUpscale {
+  const factors = plan.frames.filter((frame) => frame.crop).map((frame) => Math.max(W / (frame.crop!.width * k.x), H / (frame.crop!.height * k.y)));
+  const round = (value: number) => Number(value.toFixed(3));
+  return {
+    source, sourceWidth, sourceHeight,
+    max: round(factors.length ? Math.max(...factors) : 0),
+    mean: round(factors.length ? factors.reduce((sum, value) => sum + value, 0) / factors.length : 0),
+    framesOverLimit: factors.filter((value) => value > MAX_FOOTAGE_UPSCALE).length,
+  };
+}
+
+/** Footage frames of the input: the render clip when supplied, else the tracking clip. */
+function footageFrames(input: TrackedReelInput, fromFrame: number, toFrame: number): AsyncGenerator<ClipFrame, void, undefined> {
+  return input.renderClip ? readRenderClipFrames(input.renderClip, { fromFrame, toFrame }) : readClipFrames(input.clip, { fromFrame, toFrame });
 }
 
 /** Only this module's and the encoder's fixed-message errors leave the public entry points. */
@@ -820,7 +1145,7 @@ async function composeTrackedReel(input: TrackedReelInput): Promise<TrackedReelC
   if (!hero) throw new TrackedCinemaError("The hero object is not part of this masklet set.");
   let still: StillDepthComposer | null = null, endCardFallback = false;
   const footageLength = parsed.window ? parsed.window.toFrame - parsed.window.fromFrame + 1 : parsed.clip.frameCount;
-  const stillLabel = cleanText(parsed.endCard?.provenanceLabel ?? DEFAULT_END_CARD_PROVENANCE, 64);
+  const stillLabel = cleanText(parsed.endCard?.provenanceLabel ?? "", 64);
   if (parsed.endCard && footageLength >= MIN_TRACKED_FOOTAGE_FRAMES && footageLength < TRACKED_REEL_FRAMES) {
     try {
       still = await prepareStillDepth({
@@ -838,6 +1163,10 @@ async function composeTrackedReel(input: TrackedReelInput): Promise<TrackedReelC
   const layout = await prepareLayout(parsed, plan, calloutText);
   const compositor = new FootageCompositor(layout.theme);
   const { width: clipWidth, height: clipHeight } = parsed.clip;
+  const render = parsed.renderClip ?? null;
+  const sourceWidth = render?.width ?? clipWidth, sourceHeight = render?.height ?? clipHeight;
+  const k = render ? { x: render.width / clipWidth, y: render.height / clipHeight } : null;
+  const footageUpscale = measureUpscale(plan, render ? "render_clip" : "tracking_clip", sourceWidth, sourceHeight, k ?? { x: 1, y: 1 });
 
   const opsFor = (frame: TrackedFramePlan, maskPresent: boolean) => {
     const [start, end] = plan.acts[frame.act];
@@ -875,15 +1204,19 @@ async function composeTrackedReel(input: TrackedReelInput): Promise<TrackedReelC
     plan,
     endCardFallback,
     endCard,
-    layout: { conceptLabel: layout.conceptLabel, provenanceLabel: layout.provenanceLabel, calloutLabel: layout.callout.text, calloutSide: layout.callout.side, truncatedText: layout.truncated },
+    footageUpscale,
+    layout: {
+      conceptLabel: layout.conceptLabel, provenanceLabel: layout.provenanceLabel, calloutLabel: layout.callout.text, calloutSide: layout.callout.side, truncatedText: layout.truncated,
+      hookHeadline: layout.hookHeadline, valueHeadline: layout.valueHeadline, textContrast: layout.textContrast,
+    },
     draw(index, source, mask) {
       if (!Number.isInteger(index) || index < 0 || index >= TRACKED_REEL_FRAMES) throw new TrackedCinemaError("Frame index is outside the Reel.");
       const frame = plan.frames[index];
       if (frame.kind === "still_depth") {
         const k = frame.endCardFrame!;
-        return { rgba: still!.renderFrame(k), canvas: still!.analyzeFrame(k), stats: { maskPresent: true, headlineOcclusion: null } };
+        return { rgba: still!.renderFrame(k), canvas: still!.analyzeFrame(k), stats: { maskPresent: true, headlineOcclusion: null, frontTextOverSubject: null, maskRefinement: null } };
       }
-      if (!source || source.frame !== frame.sourceFrame || source.width !== clipWidth || source.height !== clipHeight || source.rgba.length !== clipWidth * clipHeight * 4) {
+      if (!source || source.frame !== frame.sourceFrame || source.width !== sourceWidth || source.height !== sourceHeight || source.rgba.length !== sourceWidth * sourceHeight * 4) {
         throw new TrackedCinemaError("A decoded footage frame does not match the plan.");
       }
       if (mask) {
@@ -892,7 +1225,7 @@ async function composeTrackedReel(input: TrackedReelInput): Promise<TrackedReelC
           || mask.raster.length !== (right - left) * (bottom - top)) throw new TrackedCinemaError("A hero mask does not match its footage frame.");
       }
       const { behind, front } = opsFor(frame, Boolean(mask));
-      return compositor.compose(source, mask, frame.crop!, treatmentAt(frame, plan), behind, front, frame.wash, layout.chrome);
+      return compositor.compose(source, k, mask, frame.crop!, treatmentAt(frame, plan), behind, front, frame.wash, layout.chrome);
     },
   };
 }
@@ -908,7 +1241,7 @@ export async function renderTrackedReelFrame(input: TrackedReelInput, index: num
     const frame = composer.plan.frames[index];
     let source: ClipFrame | null = null, mask: FrameMask | null = null;
     if (frame.sourceFrame !== null) {
-      for await (const decoded of readClipFrames(input.clip, { fromFrame: frame.sourceFrame, toFrame: frame.sourceFrame })) source = decoded;
+      for await (const decoded of footageFrames(input, frame.sourceFrame, frame.sourceFrame)) source = decoded;
       mask = await input.reader.frameMask(input.heroObjectId, frame.sourceFrame);
     }
     const { rgba, stats } = composer.draw(index, source, mask);
@@ -940,7 +1273,8 @@ export async function renderTrackedReel(input: TrackedReelInput, options: { time
   const encoder = openH264Encoder({ outputPath: parsed.outputPath, width: W, height: H, fps: FPS, expectedFrames: TRACKED_REEL_FRAMES, timeoutMs: options.timeoutMs ?? 420_000 });
   const ledger = new CompositionLedgerAccumulator();
   let coverPng: Buffer | null = null, missingMasks = 0;
-  const occlusions: number[] = [];
+  const occlusions: number[] = [], frontText: number[] = [];
+  const refinement = { edgeSigma: { min: 0, max: 0 }, framesRefined: 0, framesWithSpecksRemoved: 0, framesWithHolesFilled: 0, removedPixels: 0, filledPixels: 0 };
   let held: { source: ClipFrame; mask: FrameMask | null } | null = null;
   const emit = async (index: number, source: ClipFrame | null, mask: FrameMask | null) => {
     const { rgba, canvas, stats } = composer.draw(index, source, mask);
@@ -949,6 +1283,14 @@ export async function renderTrackedReel(input: TrackedReelInput, options: { time
     written.catch(() => undefined);
     ledger.addFrame(canvas);
     if (stats.headlineOcclusion !== null) occlusions.push(stats.headlineOcclusion);
+    if (stats.frontTextOverSubject !== null) frontText.push(stats.frontTextOverSubject);
+    if (stats.maskRefinement) {
+      const sigma = Number(stats.maskRefinement.edgeSigma.toFixed(3));
+      refinement.edgeSigma = refinement.framesRefined ? { min: Math.min(refinement.edgeSigma.min, sigma), max: Math.max(refinement.edgeSigma.max, sigma) } : { min: sigma, max: sigma };
+      refinement.framesRefined++;
+      if (stats.maskRefinement.removedPixels) { refinement.framesWithSpecksRemoved++; refinement.removedPixels += stats.maskRefinement.removedPixels; }
+      if (stats.maskRefinement.filledPixels) { refinement.framesWithHolesFilled++; refinement.filledPixels += stats.maskRefinement.filledPixels; }
+    }
     if (index === TRACKED_COVER_FRAME) coverPng = await sharp(rgba, { raw: { width: W, height: H, channels: 4 } }).png({ compressionLevel: 9 }).toBuffer();
     await written;
   };
@@ -956,7 +1298,7 @@ export async function renderTrackedReel(input: TrackedReelInput, options: { time
   try {
     let index = 0;
     const from = plan.window.fromFrame;
-    for await (const source of readClipFrames(parsed.clip, { fromFrame: from, toFrame: from + plan.footageFrames - 1 })) {
+    for await (const source of footageFrames(parsed, from, from + plan.footageFrames - 1)) {
       if (index >= plan.footageFrames) throw new TrackedCinemaError("The footage stream did not match the plan.");
       const mask = await parsed.reader.frameMask(parsed.heroObjectId, source.frame);
       if (!mask) missingMasks++;
@@ -994,6 +1336,8 @@ export async function renderTrackedReel(input: TrackedReelInput, options: { time
   if (finished.framesSubjectCropped > TRACKED_REEL_FRAMES * 0.1) violations.push("subject_cropped");
   if (headlineMean > MAX_TRACKED_HEADLINE_OCCLUSION) violations.push("headline_hidden");
   if (composer.endCardFallback) violations.push("end_card_fallback");
+  const drawnFootage = plan.frames.filter((frame) => frame.crop).length;
+  if (composer.footageUpscale.framesOverLimit > drawnFootage * 0.1) violations.push("low_resolution_footage");
   return {
     reel: { sha256: reel.sha256, bytes: reel.bytes, frames: reel.frames, durationSeconds: reel.durationSeconds, width: W, height: H, fps: FPS },
     cover: { sha256: createHash("sha256").update(coverPng!).digest("hex"), bytes: coverPng!.length, width: W, height: H, frame: TRACKED_COVER_FRAME },
@@ -1004,6 +1348,12 @@ export async function renderTrackedReel(input: TrackedReelInput, options: { time
     qa: {
       violations, framesSubjectHiddenByTransition: ledger.framesSubjectHiddenByTransition, footageFramesWithoutMask: missingMasks,
       headlineOcclusion: { mean: Number(headlineMean.toFixed(4)), max: Number((occlusions.length ? Math.max(...occlusions) : 0).toFixed(4)) },
+      frontTextOverSubject: {
+        mean: Number((frontText.length ? frontText.reduce((sum, value) => sum + value, 0) / frontText.length : 0).toFixed(4)),
+        max: Number((frontText.length ? Math.max(...frontText) : 0).toFixed(4)),
+      },
+      footageUpscale: composer.footageUpscale,
+      maskRefinement: refinement,
     },
   };
 }

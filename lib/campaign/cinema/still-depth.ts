@@ -8,6 +8,7 @@ import { REEL_DURATION_SECONDS, REEL_FPS, REEL_HEIGHT, REEL_WIDTH } from "../../
 import { CinemaEncodeError, openH264Encoder } from "./encode";
 import { dilateMask, fillBehindSubject, gaussianBlurZero, squaredDistanceTransform } from "./fill";
 import { CompositionLedgerAccumulator, LedgerCanvas, type LedgerLayerClass } from "./ledger";
+import { refineMaskAlpha, type MaskRefinementReport } from "./mask-refine";
 import { cleanText, pill, svgDocument, textBlock, type Bounds, type FontFace, type TextBlock } from "./typography";
 
 /**
@@ -15,6 +16,9 @@ import { cleanText, pill, svgDocument, textBlock, type Bounds, type FontFace, ty
  *
  * Pixel provenance is structural: the subject layer is only ever the resized cutout
  * (source RGB × mask alpha) — it is never blurred, recoloured or generated. The
+ * compositing alpha is the SAM mask after a deterministic alpha-only refinement (specks dropped,
+ * pin-holes filled, ragged edges smoothed to a ~1 px anti-aliased ramp; see mask-refine.ts); the
+ * supplied mask itself is never modified, and the refinement is reported in the layout. The
  * background is the same photo with the subject area filled from surrounding
  * background pixels (normalized convolution), then blurred/darkened, or an optional
  * generated Muse plate that always sits underneath the subject. Typography is local
@@ -124,6 +128,8 @@ export interface StillDepthLayoutReport {
   provenanceLabel: string;
   /** The concept chip text rendered on every frame. */
   conceptLabel: string;
+  /** Alpha-only refinement applied to the supplied SAM mask for compositing (the mask itself is unchanged). */
+  subjectMask: MaskRefinementReport;
 }
 
 /**
@@ -546,18 +552,26 @@ async function renderGraphic(body: string, defs = ""): Promise<Graphic | null> {
   return { x: left, y: top, width, height, data: premultiply(crop, width, height), reduced };
 }
 
+/** Edge smoothing for a still's SAM mask: about 1 px per 900 px of the long side (0.8–2 px). */
+export function stillMaskSigma(width: number, height: number): number {
+  return Math.min(2, Math.max(0.8, Math.max(width, height) / 900));
+}
+
 async function prepareAssets(input: StillDepthInput) {
   const theme = tokens(input.theme);
   const source = await decodePng(input.source, "source", theme.dark);
   const maskImage = await decodePng(input.subjectMask, "mask", "#000000");
   if (maskImage.width !== source.width || maskImage.height !== source.height) throw new StillDepthError("The subject mask must match the source dimensions.");
   const sw = source.width, sh = source.height;
-  const mask = maskImage.data;
+  // Compositing alpha: the SAM mask (thresholded at 128) without specks or pin-holes and with a
+  // smoothed ~1 source-pixel edge ramp. Only alpha changes; the caller's mask bytes stay untouched.
+  const refined = refineMaskAlpha(maskImage.data, sw, sh, { sigma: stillMaskSigma(sw, sh), threshold: 128 });
+  const mask = Buffer.from(refined.alpha.buffer, refined.alpha.byteOffset, refined.alpha.length);
   let area = 0, sumX = 0, sumY = 0, left = sw, right = -1, top = sh, bottom = -1;
   for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) {
     const i = y * sw + x;
-    if (mask[i] < 128) { mask[i] = 0; continue; }
-    mask[i] = 255; area++; sumX += x + 0.5; sumY += y + 0.5;
+    if (mask[i] < 128) continue;
+    area++; sumX += x + 0.5; sumY += y + 0.5;
     if (x < left) left = x; if (x > right) right = x; if (y < top) top = y; if (y > bottom) bottom = y;
   }
   if (area < sw * sh * 0.002 || area > sw * sh * 0.97) throw new StillDepthError("The subject mask is empty or covers almost the whole image.");
@@ -656,7 +670,7 @@ async function prepareAssets(input: StillDepthInput) {
   const shadow = derived(0, 16 * smallest.scaleX, 0.62);
   const silhouette = derived(Math.max(1, 14 * smallest.scaleX), 1.2, 1);
 
-  return { theme, subjectLevels: levels, shadow, silhouette, plateA, plateB, plateC, backdrop, subject, touches, pole };
+  return { theme, subjectLevels: levels, shadow, silhouette, plateA, plateB, plateC, backdrop, subject, touches, pole, maskRefinement: refined.report };
 }
 
 // ---------------------------------------------------------------------------
@@ -978,6 +992,7 @@ async function prepareLayout(input: StillDepthInput, assets: Prepared) {
     usesGeneratedBackdrop: Boolean(assets.backdrop),
     provenanceLabel,
     conceptLabel: concept,
+    subjectMask: assets.maskRefinement,
   };
   return {
     chrome, chromeOnly, layout,

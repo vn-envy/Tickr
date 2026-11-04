@@ -8,7 +8,7 @@ import { approveRun, getAutopilotState, getRun, HttpError, retryRun } from "./ap
 import { AutopilotIntake } from "./autopilot-intake";
 import { AutopilotReady } from "./autopilot-ready";
 import { DirectorsRoom, type StateStatus } from "./directors-room";
-import { isActiveRun, isUuid, RUN_STORAGE_KEY } from "./model";
+import { isActiveRun, isOAuthReturn, isUuid, RUN_STORAGE_KEY, stoppedStateRetryDelay } from "./model";
 
 function rememberRun(id: string) {
   try { window.localStorage.setItem(RUN_STORAGE_KEY, id); } catch { /* Browsing without storage is supported. */ }
@@ -34,9 +34,10 @@ export function AutopilotExperience({ onStudio }: { onStudio: () => void }) {
   const onStudioRef = useRef(onStudio);
   useEffect(() => { onStudioRef.current = onStudio; }, [onStudio]);
   // Read the OAuth-return marker before any passive effect runs: the intake's own effect restores the
-  // draft and strips ?business= from the URL, and child effects run before this component's effects.
+  // draft and strips ?business=/?connected= from the URL, and child effects run before this component's
+  // effects. A failed return can carry only ?connected=error (the callback drops an unverified business).
   const oauthReturn = useRef(false);
-  useLayoutEffect(() => { oauthReturn.current = new URLSearchParams(window.location.search).has("business"); }, []);
+  useLayoutEffect(() => { oauthReturn.current = isOAuthReturn(window.location.search); }, []);
 
   useEffect(() => {
     let stopped = false;
@@ -84,6 +85,7 @@ export function AutopilotExperience({ onStudio }: { onStudio: () => void }) {
     if (!runId) return;
     let stopped = false;
     let timer: ReturnType<typeof setTimeout>;
+    let attempt = 0;
     async function load() {
       try {
         const body = await getAutopilotState(runId!);
@@ -92,6 +94,14 @@ export function AutopilotExperience({ onStudio }: { onStudio: () => void }) {
       } catch (cause) {
         if (stopped) return;
         if (cause instanceof HttpError && [404, 405, 501].includes(cause.status)) { setStateStatus("unavailable"); return; }
+        // A stopped run is fetched once; retry a bounded number of times after a transient failure, then
+        // settle on an error message (keeping any media already shown) instead of loading forever.
+        if (!active) {
+          const delay = stoppedStateRetryDelay(cause instanceof HttpError ? cause.status : null, attempt++);
+          if (delay === null) setStateStatus((previous) => previous === "ready" ? "ready" : "error");
+          else timer = setTimeout(load, delay);
+          return;
+        }
       }
       if (!stopped && active) timer = setTimeout(load, 2000);
     }

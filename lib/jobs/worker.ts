@@ -10,8 +10,8 @@ import {
   type BusinessContext, type BusinessDiscovery, type ResearchInput, type CollectedSource, type ResearchReport, type ModelUsage, type CampaignKit,
 } from "../research/contracts";
 import { contentHash, jobs, RESEARCH_WORKFLOW_VERSION, type JobStore } from "./store";
-import { createAutopilotBudget } from "../autopilot/budget";
-import { AutopilotResumableError, type AutopilotProductionInput, type AutopilotProductionResult } from "../autopilot/production-types";
+import { AutopilotBudgetError, createAutopilotBudget } from "../autopilot/budget";
+import { AutopilotPaidStepError, AutopilotResumableError, type AutopilotProductionInput, type AutopilotProductionResult } from "../autopilot/production-types";
 import { prepareDiscoveryCheckpoint, prepareEnrichmentCheckpoint, discoveryNeedsIdentityConfirmation, mergeResearchSources, requiredResearchSourceIds, resolveEnrichedBusiness, type DiscoveryCheckpoint, type EnrichmentCheckpoint } from "./discovery";
 
 export interface WorkerDependencies {
@@ -279,6 +279,15 @@ export async function runNextJob(options: { store?: JobStore; dependencies?: Wor
     if (autopilotRun && error instanceof AutopilotResumableError) {
       message = error.message;
       retrySafe = true;
+    }
+    if (autopilotRun && error instanceof AutopilotPaidStepError) {
+      message = error.message;
+      retrySafe = false;
+    }
+    if (autopilotRun && error instanceof AutopilotBudgetError && error.role === "spark_copy") {
+      // Copy is required: with its budget used and no saved copy, no retry can ever finish the run.
+      message = "The campaign copy request budget for this run is already used and no saved copy is available, so the run cannot continue without another paid request. Retry is withheld.";
+      retrySafe = false;
     }
     if (error instanceof CampaignCopyValidationError && renderInput && dependencies) {
       try {

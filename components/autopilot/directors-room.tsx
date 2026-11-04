@@ -5,9 +5,9 @@ import { Ban, Check, CircleAlert, Clapperboard, Crosshair, Eye, Film, ImageOff, 
 import type { RunView } from "@/lib/research/contracts";
 import type { AutopilotPublicState } from "@/lib/autopilot/public-state";
 import { BoxedImage } from "./boxed-image";
-import { autopilotFileUrl, CHANNEL_LABEL, deriveRail, directorLog, GOAL_FIT_LABEL, isListed, PROVENANCE_LABEL, REEL_MODE_LABEL, RIGHTS_LABEL, roleBadges, SAM_ORIGIN_LABEL, type PublicMedia, type RailStep } from "./model";
+import { autopilotFileUrl, CHANNEL_LABEL, deriveRail, directorLog, GOAL_FIT_LABEL, isListed, type MediaStateStatus, mediaWallMode, PROVENANCE_LABEL, REEL_MODE_LABEL, RIGHTS_LABEL, roleBadges, roomHeadline, SAM_ORIGIN_LABEL, type PublicMedia, type RailStep } from "./model";
 
-export type StateStatus = "loading" | "ready" | "unavailable";
+export type StateStatus = MediaStateStatus;
 
 export function PhaseRail({ steps, compact = false }: { steps: RailStep[]; compact?: boolean }) {
   const active = steps.find((step) => step.status === "active" || step.status === "failed");
@@ -60,12 +60,15 @@ export function MediaWall({ run, state, status }: { run: RunView; state: Autopil
   const media = state?.media ?? [];
   const counts = state?.sources;
   const analyzed = media.filter((item) => item.analysis).length;
+  const mode = mediaWallMode(run, status, media.length);
+  const gathered = counts ? [counts.officialWebsite ? `${counts.officialWebsite} from the website` : null, counts.ownerUploads ? `${counts.ownerUploads} uploaded` : null, counts.ownerInstagram ? `${counts.ownerInstagram} from Instagram` : null, counts.ownerFacebook ? `${counts.ownerFacebook} from Facebook` : null].filter(Boolean).join(" · ") : "";
   return <section className="ap-panel ap-wall" aria-labelledby="ap-wall-title">
     <div className="ap-panel-head"><h2 id="ap-wall-title"><Eye size={16} />Media wall</h2>{media.length > 0 && <span className="ap-count">{analyzed}/{media.length} studied</span>}</div>
-    {counts && <p className="ap-sources-line">{[counts.officialWebsite ? `${counts.officialWebsite} from the website` : null, counts.ownerUploads ? `${counts.ownerUploads} uploaded` : null, counts.ownerInstagram ? `${counts.ownerInstagram} from Instagram` : null, counts.ownerFacebook ? `${counts.ownerFacebook} from Facebook` : null].filter(Boolean).join(" · ") || "Gathering photos and videos…"}</p>}
-    {status === "unavailable" ? <p className="ap-empty-note"><ImageOff size={16} />The live media view isn’t available in this build. Progress continues in the director’s log.</p>
-      : media.length ? <ul className="ap-wall-grid">{media.map((item) => <MediaTile key={item.assetId} media={item} runId={run.id} state={state!} />)}</ul>
-      : <ul className="ap-wall-grid is-skeleton" aria-label="Media loading">{Array.from({ length: 8 }, (_, index) => <li key={index} className="ap-skeleton-tile" aria-hidden="true" />)}</ul>}
+    {counts && (gathered || mode === "skeleton") && <p className="ap-sources-line">{gathered || "Gathering photos and videos…"}</p>}
+    {mode === "unavailable" ? <p className="ap-empty-note"><ImageOff size={16} />The live media view isn’t available in this build. Progress continues in the director’s log.</p>
+      : mode === "grid" ? <ul className="ap-wall-grid">{media.map((item) => <MediaTile key={item.assetId} media={item} runId={run.id} state={state!} />)}</ul>
+      : mode === "skeleton" ? <ul className="ap-wall-grid is-skeleton" aria-label="Media loading">{Array.from({ length: 8 }, (_, index) => <li key={index} className="ap-skeleton-tile" aria-hidden="true" />)}</ul>
+      : <p className="ap-empty-note" role="status"><ImageOff size={16} />{mode === "loading" ? "Loading what Autopilot gathered…" : mode === "error" ? "Autopilot couldn’t load the photos and videos for this run. Reload the page to try again; the director’s log still shows what happened." : mode === "empty_failed" ? "Autopilot stopped before it gathered any photos or videos. Try resuming the run above." : "No photos or videos were gathered for this run."}</p>}
     {media.length > 0 && <p className="ap-fineprint">Outlines are Muse Spark’s located observations, not verified product identity. Hover or focus a tile for its reasons.</p>}
   </section>;
 }
@@ -138,13 +141,13 @@ export function SelectionCard({ run }: { run: RunView }) {
 export function DirectorsRoom({ run, state, stateStatus, onRetry, retrying, onStudio }: { run: RunView; state: AutopilotPublicState | null; stateStatus: StateStatus; onRetry: () => void; retrying: boolean; onStudio: () => void }) {
   const rail = deriveRail(run, state);
   const busy = ["queued", "running"].includes(run.status);
-  const name = run.discovery?.name ?? (run.business.name || null);
+  const headline = roomHeadline(run);
   const waitingOnOwner = run.status === "waiting";
   return <div className="ap-room">
     <header className="ap-room-head">
       <div>
         <span className="ap-kicker"><Layers3 size={14} />Director’s room</span>
-        <h1>{name ?? <span className="ap-shimmer-text">Finding your business…</span>}</h1>
+        <h1>{headline.pending ? <span className="ap-shimmer-text">{headline.text}</span> : headline.text}</h1>
         <p>{[run.discovery?.locality ?? run.business.locality, run.business.goal].filter(Boolean).join(" · ")}</p>
       </div>
       <span className={`ap-status ${run.status === "failed" ? "is-failed" : waitingOnOwner ? "is-waiting" : ""}`} role="status">{busy ? <LoaderCircle size={14} className="spin" /> : run.status === "failed" ? <CircleAlert size={14} /> : <Check size={14} />}{busy ? "Autopilot is working" : run.status === "failed" ? "Needs attention" : waitingOnOwner ? "Paused for you" : "Finished"}</span>

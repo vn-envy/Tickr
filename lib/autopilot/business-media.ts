@@ -1,9 +1,7 @@
-import { execFile } from "node:child_process";
 import { constants } from "node:fs";
 import { createHash, createHmac, hkdfSync, randomBytes, timingSafeEqual } from "node:crypto";
 import { lstat, mkdir, open, realpath, rename, rm, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { promisify } from "node:util";
 import sharp from "sharp";
 import { z } from "zod";
 import { db } from "../db";
@@ -11,6 +9,7 @@ import { assertSameOriginRequest, RequestError } from "../http";
 import { validRunId } from "../jobs/http";
 import type { OwnerMediaConsent } from "../media/cinema-types";
 import { MediaLibrary, MediaLibraryError, mediaLibraryIntegrityKey, type MediaAssetRecord } from "../media/library";
+import { extractVideoPosterPng } from "../media/poster";
 import { acceptOwnerUpload, MAX_OWNER_IMAGE_BYTES, MAX_OWNER_VIDEO_BYTES, OwnerUploadError } from "../media/uploads";
 import { getMetaConnectorStatus, MetaGraphError, revokeMetaPermissions, type OwnerMediaSource } from "../meta/graph";
 import { defaultConnectionsDirectory, deleteOwnerToken, GraphTokenError, isValidBusinessId, loadOwnerToken, TOKEN_KEY_ENV } from "../meta/graph-tokens";
@@ -30,11 +29,7 @@ export const MAX_BUSINESS_UPLOADS = 40;
 export const THUMB_MAX_SIDE = 480;
 const MAX_THUMB_BYTES = 2 * 1024 * 1024;
 const MAX_FILENAME_PARAM_CHARS = 1024;
-const POSTER_TIMEOUT_MS = 20_000;
-const POSTER_MAX_BUFFER = 16 * 1024 * 1024;
-const DEMUXER_ALLOWLIST = "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm";
 const ASSET_ID = /^asset_[a-f0-9]{24}$/;
-const execFileAsync = promisify(execFile);
 
 export const UPLOAD_MIME_TYPES = {
   "image/png": "image", "image/jpeg": "image", "image/webp": "image",
@@ -115,20 +110,26 @@ async function ensurePrivateSubdir(parent: string, name: string): Promise<string
 /**
  * Opens the business library with the server integrity key. A library first written while
  * TICKR_SECRET_KEY was unset carries a plain SHA-256 digest that a keyed open rejects; that normal
- * "upload first, configure the connector later" order is upgraded once to an HMAC manifest (see
- * upgradeUnkeyedManifest). Any other integrity failure is reported, never repaired.
+ * "upload first, configure the connector later" order is upgraded to an HMAC manifest (see
+ * upgradeUnkeyedManifest), but only for a library that has never been opened under a key. Every
+ * successful keyed open records that fact (markLibraryKeyed), so a keyed manifest that someone
+ * without the key rewrote as plain SHA-256 stays MANIFEST_TAMPERED instead of being re-signed.
+ * Any other integrity failure is reported, never repaired.
  */
 export async function openBusinessLibrary(businessId: string): Promise<MediaLibrary> {
   const directory = await ensureBusinessMediaDir(businessId);
   const key = mediaLibraryIntegrityKey();
+  let library: MediaLibrary;
   try {
-    return await MediaLibrary.open(directory, { integrityKey: key });
+    library = await MediaLibrary.open(directory, { integrityKey: key });
   } catch (error) {
     if (!key || !(error instanceof MediaLibraryError) || error.code !== "MANIFEST_TAMPERED") throw error;
     const upgraded = await withLock(`upgrade:${businessId}`, () => upgradeUnkeyedManifest(directory, key));
     if (!upgraded) throw error;
-    return MediaLibrary.open(directory, { integrityKey: key });
+    library = await MediaLibrary.open(directory, { integrityKey: key });
   }
+  if (key) await markLibraryKeyed(directory, businessId, key);
+  return library;
 }
 
 const locks = new Map<string, Promise<unknown>>();
@@ -236,11 +237,39 @@ async function replaceManifest(libraryDir: string, expectedText: string, nextTex
 
 const envelopeText = (body: ManifestBody, key: Buffer | null) => JSON.stringify({ body, digest: manifestDigest(body, key), integrity: key ? "hmac-sha256" : "sha256" });
 
+/*
+ * Keyed marker: `<media>/media-library.keyed`, written the first time the library opens under the
+ * server key. Its presence (any entry at that path, whatever its content or type) forbids the
+ * unkeyed upgrade for good. The content is an HMAC of the business id for operators; it is never
+ * trusted, only the presence is checked, so a damaged marker still fails closed.
+ */
+const KEYED_MARKER = "media-library.keyed";
+
+async function libraryWasKeyed(mediaDir: string): Promise<boolean> {
+  try { await lstat(join(mediaDir, KEYED_MARKER)); return true; } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code !== "ENOENT"; // An unreadable marker counts as present.
+  }
+}
+
+/** Idempotently records that this library has been opened under the server key; refuses to continue when it cannot. */
+async function markLibraryKeyed(mediaDir: string, businessId: string, key: Buffer): Promise<void> {
+  if (await libraryWasKeyed(mediaDir)) return;
+  const content = `${createHmac("sha256", key).update(`tickr-media-library-keyed-v1\n${businessId}`).digest("hex")}\n`;
+  try {
+    const handle = await open(join(mediaDir, KEYED_MARKER), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    try { await handle.writeFile(content); await handle.sync(); } finally { await handle.close(); }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "EEXIST") return;
+    throw new RequestError("Media storage failed its integrity setup. Check local storage and try again.", 409);
+  }
+}
+
 /**
- * One-time upgrade of an unkeyed business library to the server key. Only a manifest whose plain
- * SHA-256 digest verifies and that holds nothing but consented owner uploads (the only thing this
- * business library ever stores) is re-signed; its body is kept byte-for-byte. Returns false when
- * the manifest is not eligible, so the caller reports the original integrity error.
+ * One-time upgrade of an unkeyed business library to the server key. Only a library that has never
+ * been opened under a key (no keyed marker), whose plain SHA-256 digest verifies and that holds
+ * nothing but consented owner uploads (the only thing this business library ever stores) is
+ * re-signed; its body is kept byte-for-byte. Returns false when the manifest is not eligible, so
+ * the caller reports the original integrity error.
  */
 async function upgradeUnkeyedManifest(mediaDir: string, key: Buffer): Promise<boolean> {
   const libraryDir = join(mediaDir, LIBRARY_FOLDER);
@@ -248,10 +277,25 @@ async function upgradeUnkeyedManifest(mediaDir: string, key: Buffer): Promise<bo
   if (!current) return false;
   const { manifest } = current;
   if (manifest.integrity === "hmac-sha256") return digestVerifies(manifest, key); // A concurrent request already upgraded it.
+  // A keyed library rewritten with a recomputable digest is a downgrade, never re-signed.
+  if (await libraryWasKeyed(mediaDir)) return false;
   if (!digestVerifies(manifest, null)) return false;
   if (!manifest.body.assets.every((asset) => asset.provenance === "owner_upload")) return false;
-  const nextText = envelopeText(manifest.body, key);
-  if (!await libraryAcceptsManifest(mediaDir, nextText, key, manifest.body.assets.map((asset) => asset.id))) return false;
+  // An unkeyed manifest is only as trustworthy as the filesystem. The upgrade keeps the owner's
+  // rights attestation (every owner upload requires it) but resets "people shown have agreed" to
+  // unconfirmed, so a forged consent flip can never unlock imagery of people; the director then
+  // treats those uploads as lacking consent wherever Spark sees a person.
+  const body: ManifestBody = {
+    ...manifest.body,
+    assets: manifest.body.assets.map((asset) => {
+      const consent = (asset as { consent?: unknown }).consent;
+      return consent && typeof consent === "object" && (consent as { peopleVisibleHaveConsented?: unknown }).peopleVisibleHaveConsented === true
+        ? { ...asset, consent: { ...consent, peopleVisibleHaveConsented: false } }
+        : asset;
+    }),
+  };
+  const nextText = envelopeText(body, key);
+  if (!await libraryAcceptsManifest(mediaDir, nextText, key, body.assets.map((asset) => asset.id))) return false;
   try { await replaceManifest(libraryDir, current.text, nextText); } catch { return false; }
   return true;
 }
@@ -453,30 +497,14 @@ export async function removeBusinessUpload(businessId: string, assetId: string):
 // Thumbnails
 // ---------------------------------------------------------------------------
 
-/** Minimal child environment: server credentials never reach FFmpeg. */
-function toolEnv(): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { NODE_ENV: process.env.NODE_ENV, PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin" };
-  if (process.env.LD_LIBRARY_PATH) env.LD_LIBRARY_PATH = process.env.LD_LIBRARY_PATH;
-  return env;
-}
-
-/** One poster frame as PNG from a private local video (file protocol and allowlisted demuxers only). */
+/**
+ * One poster frame as PNG from a private local video (file protocol, allowlisted demuxers and a
+ * credential-free child; HDR and BT.2020 sources are tone mapped to BT.709 SDR, see lib/media/poster).
+ */
 export async function videoPosterPng(path: string, durationSeconds: number | null, maxSide = THUMB_MAX_SIDE): Promise<Buffer> {
-  const preferred = durationSeconds !== null && durationSeconds > 1.5 ? Math.min(1, durationSeconds / 3) : 0;
-  for (const at of preferred > 0 ? [preferred, 0] : [0]) {
-    try {
-      const { stdout } = await execFileAsync("ffmpeg", [
-        "-hide_banner", "-loglevel", "error", "-nostdin", "-threads", "2",
-        "-protocol_whitelist", "file,pipe", "-format_whitelist", DEMUXER_ALLOWLIST,
-        "-ss", at.toFixed(3), "-i", `file:${path}`,
-        "-map", "0:v:0", "-an", "-sn", "-dn", "-frames:v", "1",
-        "-vf", `scale=w=${maxSide}:h=${maxSide}:force_original_aspect_ratio=decrease`,
-        "-f", "image2pipe", "-c:v", "png", "pipe:1",
-      ], { encoding: "buffer", timeout: POSTER_TIMEOUT_MS, maxBuffer: POSTER_MAX_BUFFER, killSignal: "SIGKILL", windowsHide: true, env: toolEnv() });
-      if (stdout.length > 8) return stdout;
-    } catch { /* Try the first frame next; child errors carry local paths and are never forwarded. */ }
-  }
-  throw new RequestError("A preview frame could not be read from this video.", 422);
+  const poster = await extractVideoPosterPng(path, durationSeconds, maxSide);
+  if (!poster) throw new RequestError("A preview frame could not be read from this video.", 422);
+  return poster;
 }
 
 /** JPEG thumbnail, long side at most THUMB_MAX_SIDE, without metadata. */

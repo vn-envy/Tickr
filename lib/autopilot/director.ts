@@ -28,7 +28,10 @@ function exclusionReasons(asset: AnalyzedAsset, offerApproved: boolean): string[
   const analysis = asset.analysis;
   if (asset.kind === "image" && !analysis) reasons.push("Not analyzed, so its content and risks are unknown.");
   if (asset.kind === "video" && !asset.shotLog) reasons.push("No shot log, so its moments and risks are unknown.");
-  const risks = new Set(analysis?.risks.map((risk) => risk.kind) ?? []);
+  // The shot log cannot report minors, branding or price text, so footage needs the image risk
+  // check on its sampled frames; without it the footage fails closed like an unanalyzed image.
+  if (asset.kind === "video" && !(asset.frameRisks && asset.frameRisks.framesChecked > 0)) reasons.push("Its frames were not checked for minors, third-party branding or price text.");
+  const risks = new Set([...(analysis?.risks.map((risk) => risk.kind) ?? []), ...(asset.kind === "video" ? asset.frameRisks?.risks.map((risk) => risk.kind) ?? [] : [])]);
   const consented = asset.consent?.peopleVisibleHaveConsented === true;
   if (risks.has("possible_minor")) reasons.push("A possible minor is visible; Autopilot never uses this automatically.");
   if ((risks.has("person") || risks.has("face") || analysis?.subjectKind === "people" || asset.shotLog?.peopleVisible) && !consented) {

@@ -1,12 +1,13 @@
 "use client";
 
 import { useCallback, useEffect, useId, useRef, useState, type FormEvent } from "react";
-import { ArrowRight, AtSign, Ban, CircleCheck, CircleDollarSign, Globe, Link2, LoaderCircle, MapPin, MessageSquareOff, PlugZap, Search, ShieldCheck, Sparkles, Unplug, WandSparkles } from "lucide-react";
+import { ArrowRight, AtSign, Ban, CircleCheck, CircleDollarSign, CircleStop, Globe, Link2, LoaderCircle, MapPin, MessageSquareOff, PlugZap, Search, ShieldCheck, Sparkles, Unplug, WandSparkles } from "lucide-react";
 import type { RunView } from "@/lib/research/contracts";
 import { DEFAULT_CAMPAIGN_GOAL } from "@/lib/businesses/input";
 import { createBusiness, deleteBusinessMedia, disconnectMeta, getBusiness, getBusinessMedia, HttpError, startAutopilotRun, uploadMedia, type BusinessMedia, type MetaConnection } from "./api";
 import { MediaDropzone, type QueuedFile } from "./media-dropzone";
-import { classifyUpload, composeGoal, connectUrl, DRAFT_STORAGE_KEY, GOALS, isUuid, LINK_KIND_LABEL, MAX_UPLOADS, normalizeBusinessLink, type GoalId, type PeopleVisible } from "./model";
+import { classifyUpload, composeGoal, connectUrl, DRAFT_STORAGE_KEY, GOALS, isUuid, LINK_KIND_LABEL, MAX_UPLOADS, normalizeBusinessLink, resolveOAuthReturn, type GoalId, type PeopleVisible } from "./model";
+import { UploadCancelledError, uploadBatch } from "./upload-batch";
 
 type Draft = { businessId: string; url: string; goal: string };
 type StoredDraft = Draft & { link: string; goalId: GoalId | null; goalText: string };
@@ -39,12 +40,23 @@ export function AutopilotIntake({ restoring, onStarted }: { restoring: boolean; 
   const [connectNotice, setConnectNotice] = useState<null | "returned" | "error" | "not_configured">(null);
   const [busy, setBusy] = useState<Busy>(null);
   const [error, setError] = useState<string | null>(null);
+  const [stoppedNotice, setStoppedNotice] = useState<string | null>(null);
   const errorRef = useRef<HTMLDivElement>(null);
   const linkRef = useRef<HTMLInputElement>(null);
   const consentRef = useRef<HTMLFieldSetElement>(null);
   const queueRef = useRef(queue);
+  // Upload control: the running batch, each in-flight file's request, and files the owner removed.
+  const batchRef = useRef<AbortController | null>(null);
+  const uploadsRef = useRef(new Map<string, AbortController>());
+  const removedRef = useRef(new Set<string>());
+  const mountedRef = useRef(true);
   const ids = useId();
   useEffect(() => { queueRef.current = queue; }, [queue]);
+  // Leaving the intake (e.g. switching to the studio) cancels the upload and the run it would start.
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; batchRef.current?.abort(); };
+  }, []);
 
   const normalized = normalizeBusinessLink(link);
   const goal = composeGoal(goalId, goalText);
@@ -60,21 +72,22 @@ export function AutopilotIntake({ restoring, onStarted }: { restoring: boolean; 
     catch (cause) { setMediaStatus(cause instanceof HttpError && [404, 405, 501].includes(cause.status) ? "unavailable" : "idle"); return null; }
   }, []);
 
-  // OAuth return (?business=…&connected=meta|error): restore the draft that started the connection.
+  // OAuth return (?business=…&connected=meta|error, or only ?connected=error when the callback could
+  // not verify the state): restore the draft that started the connection and report the outcome.
   // The query is stripped only once the restore has settled, so a re-run effect (StrictMode, remount)
   // still sees it; restoring twice is idempotent.
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const businessId = params.get("business");
-    const connected = params.get("connected");
-    if (!businessId) return;
+    const stored = readStoredDraft();
+    const target = resolveOAuthReturn(window.location.search, stored?.businessId ?? null);
+    if (!target) return;
     const stripReturnParams = () => { const url = new URL(window.location.href); url.searchParams.delete("business"); url.searchParams.delete("connected"); window.history.replaceState(null, "", url); };
-    if (!isUuid(businessId)) { stripReturnParams(); return; }
+    const businessId = target.businessId;
     let stopped = false;
     void (async () => {
-      const stored = readStoredDraft();
+      // No draft to restore (the callback dropped the business and this tab saved none): still report the failure.
+      if (!businessId) { if (!stopped) { setConnectNotice(target.notice); stripReturnParams(); } return; }
       try {
-        if (stored?.businessId === businessId) {
+        if (target.fromDraft && stored) {
           setLink(stored.link); setGoalId(stored.goalId); setGoalText(stored.goalText); setDraft({ businessId, url: stored.url, goal: stored.goal });
         } else {
           const { business } = await getBusiness(businessId);
@@ -82,7 +95,7 @@ export function AutopilotIntake({ restoring, onStarted }: { restoring: boolean; 
           const savedGoal = business.goal === DEFAULT_CAMPAIGN_GOAL ? "" : business.goal;
           setLink(business.website ?? ""); setGoalText(savedGoal); setDraft({ businessId, url: business.website ?? "", goal: savedGoal });
         }
-        setConnectNotice(connected === "error" ? "error" : connected === "meta" ? "returned" : null);
+        setConnectNotice(target.notice);
         await loadMedia(businessId);
       } catch { if (!stopped) setError("We couldn’t restore your draft after connecting. Paste your link again to continue."); }
       finally { if (!stopped) stripReturnParams(); }
@@ -110,6 +123,9 @@ export function AutopilotIntake({ restoring, onStarted }: { restoring: boolean; 
     if (accepted.length) setQueue((items) => [...items, ...accepted]);
   }
   function removeQueued(id: string) {
+    // Recorded synchronously so a running batch skips the file, and its request is aborted if in flight.
+    removedRef.current.add(id);
+    uploadsRef.current.get(id)?.abort();
     setQueue((items) => { const item = items.find((entry) => entry.id === id); if (item) URL.revokeObjectURL(item.previewUrl); return items.filter((entry) => entry.id !== id); });
   }
   async function removeUploaded(assetId: string) {
@@ -138,61 +154,94 @@ export function AutopilotIntake({ restoring, onStarted }: { restoring: boolean; 
     setConsentError(true); window.setTimeout(() => consentRef.current?.focus(), 0);
     throw new Error("Confirm the rights to your photos and videos before they upload.");
   }
-  async function uploadQueued(businessId: string, consent: PeopleVisible) {
-    const pending = queueRef.current.filter((item) => item.status !== "uploading");
+  async function uploadQueued(businessId: string, consent: PeopleVisible, signal: AbortSignal) {
+    const pending = queueRef.current.filter((item) => item.status !== "uploading" && !removedRef.current.has(item.id));
     if (!pending.length) return;
     setBusy("upload");
-    let failures = 0;
-    for (const item of pending) {
-      patchQueued(item.id, { status: "uploading", progress: 0, error: null });
-      try {
-        const asset = await uploadMedia(businessId, item.file, item.mimeType, consent, (progress) => patchQueued(item.id, { progress }));
+    let unremoved = 0;
+    // Assets this library already lists, or that a kept file of this batch uploaded: never undone.
+    // (Only when the listed library belongs to this business: a fresh draft starts empty.)
+    const kept = new Set(draft?.businessId === businessId ? (media?.assets ?? []).map((asset) => asset.id) : []);
+    const { failures } = await uploadBatch(pending, signal, {
+      isRemoved: (id) => removedRef.current.has(id),
+      track: (id, controller) => { if (controller) uploadsRef.current.set(id, controller); else uploadsRef.current.delete(id); },
+      onStart: (item) => patchQueued(item.id, { status: "uploading", progress: 0, error: null }),
+      upload: (item, itemSignal) => uploadMedia(businessId, item.file, item.mimeType, consent, (progress) => patchQueued(item.id, { progress }), itemSignal),
+      onUploaded: (item, asset) => {
+        kept.add(asset.id);
         URL.revokeObjectURL(item.previewUrl);
         setQueue((items) => items.filter((entry) => entry.id !== item.id));
         // The server de-duplicates by content and returns the existing asset: never list it twice.
         setMedia((current) => ({ assets: current?.assets.some((existing) => existing.id === asset.id) ? current.assets : [...(current?.assets ?? []), asset], connection: current?.connection ?? { status: "disconnected", provider: "meta", accountName: null, instagramUsername: null, pageName: null, expiresAt: null, mediaCount: null } }));
-      } catch (cause) {
-        failures += 1;
-        patchQueued(item.id, { status: "error", progress: 0, error: cause instanceof Error ? cause.message : "The upload failed." });
-        if (cause instanceof HttpError && cause.status === 404) break;
-      }
-    }
+      },
+      // The owner removed this file but its upload had already completed: take it back out of the library.
+      onRemovedAfterUpload: async (_item, asset) => {
+        if (kept.has(asset.id)) return; // The server de-duplicated it onto a file the owner kept.
+        try { await deleteBusinessMedia(businessId, asset.id); }
+        catch {
+          unremoved += 1;
+          setMedia((current) => current && !current.assets.some((existing) => existing.id === asset.id) ? { ...current, assets: [...current.assets, asset] } : current);
+        }
+      },
+      onFailed: (item, cause) => patchQueued(item.id, { status: "error", progress: 0, error: cause instanceof Error ? cause.message : "The upload failed." }),
+      onCancelled: (item) => patchQueued(item.id, { status: "queued", progress: 0, error: null }),
+      stopAfter: (cause) => cause instanceof HttpError && cause.status === 404,
+    });
+    if (unremoved) throw new Error(`${unremoved === 1 ? "A file you removed" : `${unremoved} files you removed`} had already uploaded and couldn’t be taken back out. Remove ${unremoved === 1 ? "it" : "them"} from your uploaded files before running.`);
     if (failures) throw new Error(`${failures} file${failures === 1 ? "" : "s"} didn’t upload. Try again, or remove ${failures === 1 ? "it" : "them"} to continue without.`);
+  }
+  function cancelUpload() { batchRef.current?.abort(); }
+  /** One controller per Run/Connect action: cancelling or leaving stops the uploads and the step after them. */
+  function beginBatch(): AbortSignal {
+    batchRef.current?.abort();
+    const controller = new AbortController();
+    batchRef.current = controller;
+    return controller.signal;
+  }
+  function settle(cause: unknown) {
+    if (cause instanceof UploadCancelledError) { if (mountedRef.current) setStoppedNotice(cause.message); return; }
+    fail(cause);
   }
 
   async function run(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (disabled) return;
-    setError(null);
+    setError(null); setStoppedNotice(null);
+    const signal = beginBatch();
     try {
       const url = validLink();
       const consent = consentReady();
       const businessId = await ensureDraft(url);
-      await uploadQueued(businessId, consent);
+      await uploadQueued(businessId, consent, signal);
+      // Cancelled, or the owner left the intake: never start a run they walked away from.
+      if (signal.aborted || !mountedRef.current) throw new UploadCancelledError();
       setBusy("start");
       const { run: started } = await startAutopilotRun(businessId);
       writeStoredDraft(null);
-      onStarted(started);
-    } catch (cause) { fail(cause); }
-    finally { setBusy(null); }
+      if (mountedRef.current) onStarted(started);
+    } catch (cause) { settle(cause); }
+    finally { if (batchRef.current?.signal === signal) batchRef.current = null; if (mountedRef.current) setBusy(null); }
   }
   async function connect() {
     if (disabled) return;
-    setError(null);
+    setError(null); setStoppedNotice(null);
+    const signal = beginBatch();
     try {
       if (!attest) throw new Error("Confirm the media attestation to connect your accounts.");
       const url = validLink();
       const consent = consentReady();
       const businessId = await ensureDraft(url);
-      await uploadQueued(businessId, consent);
+      await uploadQueued(businessId, consent, signal);
+      if (signal.aborted || !mountedRef.current) throw new UploadCancelledError();
       setBusy("connect");
       const body = await loadMedia(businessId);
       if (!body) { setConnectNotice("not_configured"); return; }
       if (body.connection.status === "not_configured") { setConnectNotice("not_configured"); return; }
+      if (signal.aborted || !mountedRef.current) throw new UploadCancelledError();
       writeStoredDraft({ businessId, url, goal, link, goalId, goalText });
       window.location.assign(connectUrl(businessId));
-    } catch (cause) { fail(cause); }
-    finally { setBusy(null); }
+    } catch (cause) { settle(cause); }
+    finally { if (batchRef.current?.signal === signal) batchRef.current = null; if (mountedRef.current) setBusy(null); }
   }
   async function disconnect() {
     if (!draft || disabled) return;
@@ -253,7 +302,8 @@ export function AutopilotIntake({ restoring, onStarted }: { restoring: boolean; 
 
       <div className="ap-cta-row">
         <button className="button button-primary ap-run" type="submit" disabled={disabled} aria-describedby={`${ids}-cta-note`}>{busy ? <LoaderCircle size={18} className="spin" /> : <Sparkles size={18} />}{actionLabel}{!busy && <ArrowRight size={18} />}</button>
-        <p id={`${ids}-cta-note`}>{restoring ? "Checking your saved workspace…" : anchored && draftStale ? <span className="ap-stale">The link or goal changed after you added files or connected. Running now starts a fresh draft without them.</span> : "Usually a few minutes. You can leave this page — the run keeps going."}</p>
+        {busy === "upload" && <button type="button" className="button button-secondary ap-cancel-upload" onClick={cancelUpload}><CircleStop size={16} />Cancel upload</button>}
+        <p id={`${ids}-cta-note`}>{restoring ? "Checking your saved workspace…" : stoppedNotice && !busy ? stoppedNotice : anchored && draftStale ? <span className="ap-stale">The link or goal changed after you added files or connected. Running now starts a fresh draft without them.</span> : "Usually a few minutes. You can leave this page — the run keeps going."}</p>
       </div>
     </form>
 

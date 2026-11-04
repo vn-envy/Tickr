@@ -302,6 +302,22 @@ export class MediaLibrary {
     return asset;
   }
 
+  /** Drops these assets from the manifest and deletes their private copies; unknown ids are ignored. */
+  async removeAssets(ids: readonly string[]): Promise<number> {
+    const drop = new Set(ids);
+    return withLock(this.manifestPath, async () => {
+      const manifest = await this.load();
+      const removed = manifest.assets.filter((asset) => drop.has(asset.id));
+      if (!removed.length) return 0;
+      await this.write({ ...manifest, assets: manifest.assets.filter((asset) => !drop.has(asset.id)) });
+      for (const asset of removed) {
+        const path = join(this.filesDirectory, asset.file);
+        if (path.startsWith(this.filesDirectory + sep)) await unlink(path).catch(() => undefined);
+      }
+      return removed.length;
+    });
+  }
+
   async addAsset(input: NewMediaAsset): Promise<AddAssetResult> {
     const prepared = await this.prepare(input);
     return withLock(this.manifestPath, () => this.commit(prepared));

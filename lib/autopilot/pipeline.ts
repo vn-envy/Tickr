@@ -8,7 +8,7 @@ import { renderTrackedReel } from "../campaign/cinema/tracked";
 import { sha256File } from "../campaign/cinema/encode";
 import { CampaignCopyValidationError, ensureCampaignCopy, renderCampaignKit, type CampaignExtraAsset, type CampaignProduction, type CreateCampaignInput, type PrebuiltReel, type RenderImage, type RoutedChannel } from "../campaign/index";
 import { prepareCampaignVisual } from "../campaign/visual";
-import { normalizeOwnerClip } from "../media/clip";
+import { normalizeOwnerClip, normalizeOwnerRenderClip } from "../media/clip";
 import type { MediaLibrary } from "../media/library";
 import { RequestError } from "../http";
 import { MetaClientError } from "../meta/config";
@@ -20,14 +20,14 @@ import type { CampaignVisual, ModelUsage } from "../research/contracts";
 import { analysisOfferings, analyzeHarvest, type AnalysisRecord, type AnalyzeDependencies, type PaidGate } from "./analyze";
 import { AutopilotBudgetError } from "./budget";
 import type { AutopilotRole, PlannedChannel, ProductionPlan } from "./contracts";
-import { applyDeterministicFixes, criticReportDocument, critiqueSnapshot, publicCritic, REEL_FILES, runCritique, type CritiqueOutcome } from "./critique";
+import { applyDeterministicFixes, ARCHIVE_FILE, criticReportDocument, critiqueSnapshot, publicCritic, REEL_FILES, runCritique, SAM_OVERLAY_FILE, withheldKitFiles, type CritiqueOutcome } from "./critique";
 import { planProduction } from "./director";
 import { defaultHarvestDependencies, harvestMedia, harvestThumbnail, officialWebsiteFor, openRunLibrary, type HarvestDependencies, type HarvestRecord } from "./harvest";
 import {
   prebuiltReel, produceReel, renderImageFor, savedReel, segmentStill, workingStill,
   MAX_SEGMENTED_STILLS, type ReelDependencies, type ReelRecord, type ReelVariant, type StillLayer, type StillSource,
 } from "./produce";
-import { AutopilotResumableError, type AutopilotProductionInput, type AutopilotProductionResult, type AutopilotQuality } from "./production-types";
+import { AutopilotPaidStepError, AutopilotResumableError, type AutopilotProductionInput, type AutopilotProductionResult, type AutopilotQuality } from "./production-types";
 import { AutopilotCheckpointError, bounded, digestOf, DirectorRoom, directorReport, planRoles, publicAnalysis, publicSam, readCheckpoint, sha256Hex, writeCheckpoint, type SamRecord } from "./report";
 
 /**
@@ -52,7 +52,7 @@ export interface AutopilotDependencies extends HarvestDependencies, AnalyzeDepen
 
 export const defaultAutopilotDependencies: AutopilotDependencies = {
   ...defaultHarvestDependencies,
-  analyzeMedia: analyzeMediaAssets, analyzeShots: analyzeClipShots, normalizeClip: normalizeOwnerClip,
+  analyzeMedia: analyzeMediaAssets, analyzeShots: analyzeClipShots, normalizeClip: normalizeOwnerClip, normalizeRenderClip: normalizeOwnerRenderClip,
   segment: segmentMetaImage, trackVideo: trackMetaVideo, renderTracked: renderTrackedReel, renderStillDepth: renderStillDepthReel, renderOverlay: renderSamOverlayVideo,
   ensureCopy: ensureCampaignCopy, prepareVisual: prepareCampaignVisual, renderKit: renderCampaignKit, critique: critiqueCampaign,
 };
@@ -61,9 +61,10 @@ class LeaseLostError extends Error {
   constructor() { super("Worker lease was lost before the next Autopilot request."); this.name = "LeaseLostError"; }
 }
 
-const PASS_THROUGH = [MetaClientError, AutopilotBudgetError, AutopilotCheckpointError, AutopilotResumableError, CampaignCopyValidationError, LeaseLostError];
+const PASS_THROUGH = [MetaClientError, AutopilotBudgetError, AutopilotCheckpointError, AutopilotResumableError, AutopilotPaidStepError, CampaignCopyValidationError, LeaseLostError];
 const MAX_NOTES = 30;
-const ARCHIVE_FILE = "campaign-concept.zip";
+/** AutopilotQualitySchema.withheldFiles bound: a longer list must never be truncated into approvable files. */
+const MAX_WITHHELD_FILES = 80;
 const PLAN_CHANNELS: readonly PlannedChannel[] = ["instagram_feed", "facebook_ads", "instagram_stories", "click_to_whatsapp", "whatsapp_status"];
 
 async function markerExists(directory: string, prefix: string): Promise<boolean> {
@@ -78,18 +79,38 @@ export async function produceAutopilotCampaign(input: AutopilotProductionInput, 
   const directory = join(outputDir, "autopilot");
   const room = new DirectorRoom(outputDir, input.runId);
   let paidStarted = false;
+  // A paid request was reserved but its adapter has not run to an end yet: its response may be lost.
+  let paidUncertain = false;
+  // Errors raised inside a paid adapter (a new request or a stored-response recovery) leave that
+  // step's paid outcome unknown; a step that catches one and falls back records its own outcome.
+  const paidFailures = new WeakSet<object>();
+  const settled = <A extends unknown[], R>(adapter: (...args: A) => Promise<R>) => async (...args: A): Promise<R> => {
+    try { return await adapter(...args); }
+    catch (error) {
+      if (error && typeof error === "object") paidFailures.add(error);
+      throw error;
+    } finally { paidUncertain = false; }
+  };
+  const guarded: AutopilotDependencies = {
+    ...dependencies,
+    ensureCopy: settled(dependencies.ensureCopy), analyzeMedia: settled(dependencies.analyzeMedia), analyzeShots: settled(dependencies.analyzeShots),
+    segment: settled(dependencies.segment), trackVideo: settled(dependencies.trackVideo), critique: settled(dependencies.critique), prepareVisual: settled(dependencies.prepareVisual),
+  };
   try {
     await mkdir(directory, { recursive: true, mode: 0o700 });
-    return await produce(input, dependencies, { outputDir, directory, room, markPaid: () => { paidStarted = true; } });
+    return await produce(input, guarded, { outputDir, directory, room, markPaid: () => { paidStarted = true; }, markReserved: () => { paidStarted = true; paidUncertain = true; } });
   } catch (error) {
     await room.save("failed", "Autopilot stopped before the kit was ready. Saved progress is kept.");
     if (PASS_THROUGH.some((type) => error instanceof type) || !paidStarted) throw error;
+    // A paid step whose outcome is unknown (reserved but not returned, or failing inside its adapter)
+    // may have lost a completed response: never present that as a safe retry.
+    if (paidUncertain || (error && typeof error === "object" && paidFailures.has(error))) throw new AutopilotPaidStepError();
     // Every paid step either stored its response or never started: a retry reuses them offline.
     throw new AutopilotResumableError();
   }
 }
 
-interface Runtime { outputDir: string; directory: string; room: DirectorRoom; markPaid: () => void }
+interface Runtime { outputDir: string; directory: string; room: DirectorRoom; markPaid: () => void; markReserved: () => void }
 
 async function produce(input: AutopilotProductionInput, dependencies: AutopilotDependencies, runtime: Runtime): Promise<AutopilotProductionResult> {
   const { outputDir, directory, room } = runtime;
@@ -111,7 +132,8 @@ async function produce(input: AutopilotProductionInput, dependencies: AutopilotD
       if (error instanceof RequestError && error.status === 409) throw new AutopilotBudgetError(role);
       throw error;
     }
-    runtime.markPaid();
+    // Cleared only when the paid adapter returns (see `settled`).
+    runtime.markReserved();
   };
   const gate: PaidGate = async (role, requestDirectory, prefix) => {
     if (await markerExists(requestDirectory, prefix)) { runtime.markPaid(); return "recover"; }
@@ -418,25 +440,51 @@ async function produce(input: AutopilotProductionInput, dependencies: AutopilotD
   // 9. Export -------------------------------------------------------------------------------
   await input.progress("export", fixes.fixesApplied.length ? "Applying safe fixes and exporting the review kit." : "Exporting the review kit.");
   await room.save("export", "Exporting the review kit.");
-  const recheckFiles = (fixes.plan?.recheckAssetIds ?? []).map((assetId) => assetId === "reel" ? "instagram_reel.mp4" : snapshot!.stills.find((item) => item.assetId === assetId)?.filename).filter((name): name is string => Boolean(name));
+  // Only fixes that were actually applied change bytes; recommendation-only remedies change nothing.
+  const recheckFiles = fixes.rerenderedFiles;
   const finalNotes = [...fixes.recommendations, ...(recheckFiles.length ? [`${plural(recheckFiles.length, "file")} changed after the critique (${recheckFiles.slice(0, 6).join(", ")}); review those new versions closely.`] : [])];
   const final = await dependencies.renderKit(campaignInput, opportunity, copy, copyResult.usage, production(copy, reel, reelOverride, [
     { filename: "director-report.json", content: await directorDocument(reel, finalNotes) },
     { filename: "critic-report.json", content: criticReportDocument({ report: critique.report, fixes, snapshot, notes: [...critique.notes, ...snapshot.notes], changedAfterCritique: recheckFiles }) },
   ]));
   const campaign = final.campaign;
-  // Bytes that differ from what the critic saw, beyond the planned rechecks, are disclosed.
-  const unexpected = snapshot.stills.filter((item) => !recheckFiles.includes(item.filename) && campaign.assets.find((asset) => asset.filename === item.filename)?.sha256 !== item.sha256).map((item) => item.filename);
-  if (unexpected.length) notes.push(`${plural(unexpected.length, "file")} differ from the critiqued version (${unexpected.slice(0, 6).join(", ")}); review them before approving.`);
-  const present = new Set(campaign.assets.map((asset) => asset.filename));
-  const withheldFiles = [...withheld].filter((file) => present.has(file));
-  // The concept archive bundles every kit file, withheld ones included: approving it would approve
-  // the withheld bytes, so it is withheld with them.
-  if (withheldFiles.length && present.has(ARCHIVE_FILE)) {
-    withheldFiles.push(ARCHIVE_FILE);
-    notes.push(`${ARCHIVE_FILE} contains the withheld files, so it is withheld too; approve the individual files instead.`);
+  // Withholding follows the source pixels, not just the critiqued file (fail closed).
+  const heroSources = heroImage ? [visual.kind === "meta_illustration" ? "@illustration" : plan.hero?.assetId ?? "@hero"] : [];
+  const reelPlan = plan.reel;
+  const reelSources = reel.mode === "tracked_video" && reelPlan.mode === "tracked_video" ? [reelPlan.clipAssetId, ...(reelPlan.fallbackStill ? [reelPlan.fallbackStill.assetId] : [])]
+    : reel.mode === "still_depth" && reelPlan.mode === "still_depth" ? [reelPlan.still.assetId]
+    : reel.mode === "still_depth" && reelPlan.mode === "tracked_video" && reelPlan.fallbackStill ? [reelPlan.fallbackStill.assetId]
+    : heroSources; // The in-kit (legacy) Reel and an unattributable depth Reel are composed from the hero.
+  const overlaySources = reelPlan.mode === "tracked_video" ? [reelPlan.clipAssetId] : reelSources;
+  const channelSources = (channel: string) => (PLAN_CHANNELS as readonly string[]).includes(channel) && channelImages[channel as PlannedChannel] && plan.channelAssets[channel as PlannedChannel]
+    ? [plan.channelAssets[channel as PlannedChannel]!] : heroSources;
+  const sourcesOf = (filename: string): readonly string[] => {
+    if (filename === "campaign-hero-source.png") return heroSources;
+    if (filename === SAM_OVERLAY_FILE) return overlaySources;
+    if ((REEL_FILES as readonly string[]).includes(filename)) return reelSources;
+    const mask = /^sam-mask-(.+)\.png$/.exec(filename);
+    if (mask) return [mask[1]];
+    const slide = /^instagram_carousel_([1-4])\.png$/.exec(filename);
+    if (slide) return carouselImages ? [plan.carousel[Number(slide[1]) - 1]?.assetId ?? "@carousel"] : heroSources;
+    if (filename === "facebook_ads_portrait.png") return channelSources("facebook_ads");
+    const placement = /^([a-z_]+)\.png$/.exec(filename);
+    return placement && campaign.assets.some((asset) => asset.filename === filename && asset.channel === placement[1]) ? channelSources(placement[1]) : [];
+  };
+  const withheldFiles = withheldKitFiles({ files: campaign.assets.map((asset) => asset.filename), withheld, contentWithheld: fixes.contentWithheldFiles, withholdAll: fixes.withholdAll, sourcesOf });
+  if (withheldFiles.length > MAX_WITHHELD_FILES) throw new Error("Too many withheld files to record; the kit was not offered for approval.");
+  if (fixes.withholdAll) notes.push("The critic reported a critical problem it could not attribute to one file, so every file is withheld from approval; run Autopilot again for a fresh critique.");
+  else {
+    const derived = withheldFiles.filter((file) => !withheld.has(file) && file !== ARCHIVE_FILE);
+    if (derived.length) notes.push(`${plural(derived.length, "other file")} built from the same photo or footage ${derived.length === 1 ? "is" : "are"} withheld too (${derived.slice(0, 6).join(", ")}).`);
+    // The concept archive bundles every kit file, withheld ones included: approving it would approve the withheld bytes.
+    if (withheldFiles.includes(ARCHIVE_FILE)) notes.push(`${ARCHIVE_FILE} contains the withheld files, so it is withheld too; approve the individual files instead.`);
   }
-  withheldFiles.sort();
+  // Every approvable critiqued file whose final bytes differ from what the critic saw, beyond the
+  // fixes actually applied, is disclosed.
+  const critiqued = [...snapshot.stills, ...(snapshot.reel ? [snapshot.reel] : [])];
+  const unexpected = critiqued.filter((item) => !fixes.rerenderedFiles.includes(item.filename) && !withheldFiles.includes(item.filename)
+    && campaign.assets.find((asset) => asset.filename === item.filename)?.sha256 !== item.sha256).map((item) => item.filename);
+  if (unexpected.length) notes.push(`${plural(unexpected.length, "file")} differ from the critiqued version (${unexpected.slice(0, 6).join(", ")}); review them before approving.`);
 
   const cover = campaign.assets.find((asset) => asset.filename === "instagram_reel_cover.png");
   if (cover) {
@@ -448,7 +496,7 @@ async function produce(input: AutopilotProductionInput, dependencies: AutopilotD
     version: 1, planVersion: plan.version, reelMode,
     mediaAnalyzed: analysis.imagesAnalyzed + analysis.videosLogged, mediaExcluded: plan.excluded.length,
     criticVerdict: critique.report?.verdict ?? "not_run", findings: critique.report?.findings.length ?? 0,
-    fixesApplied: fixes.fixesApplied.map((fix) => bounded(fix, 300)).slice(0, 40), withheldFiles: withheldFiles.map((file) => bounded(file, 160)).slice(0, 80),
+    fixesApplied: fixes.fixesApplied.map((fix) => bounded(fix, 300)).slice(0, 40), withheldFiles: withheldFiles.map((file) => bounded(file, 160)),
     roleCounts: await roleCounts(),
     notes: [...new Set([...notes, ...finalNotes])].map((note) => bounded(note, 600)).filter(Boolean).slice(0, MAX_NOTES),
   };

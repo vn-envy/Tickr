@@ -810,6 +810,31 @@ test("Autopilot auto-selects the recommended opportunity and continues to produc
   } finally { await rm(resolve(".data/runs", run.id), { recursive: true, force: true }); }
 });
 
+test("an Autopilot paid step with an unknown outcome, or a used-up copy budget, is never offered as a safe retry", async () => {
+  const { AutopilotPaidStepError, AutopilotResumableError } = await import("../../lib/autopilot/production-types");
+  const { AutopilotBudgetError } = await import("../../lib/autopilot/budget");
+  const cases: Array<{ error: () => Error; retrySafe: boolean; message: RegExp }> = [
+    { error: () => new AutopilotResumableError(), retrySafe: true, message: /saved every completed Meta response/ },
+    { error: () => new AutopilotPaidStepError(), retrySafe: false, message: /may have been lost/ },
+    { error: () => new AutopilotBudgetError("spark_copy"), retrySafe: false, message: /copy request budget for this run is already used/ },
+  ];
+  for (const [index, { error, retrySafe, message }] of cases.entries()) {
+    const dep = dependencies();
+    dep.produceAutopilotCampaign = vi.fn(async () => { throw error(); });
+    // Distinct input per case: identical research input would reuse the first run.
+    const run = await store.enqueueResearch(businessId, { ...input, autopilot: true, sources: [{ ...input.sources[0], text: `${input.sources[0].text} Case ${index + 1}.` }] });
+    try {
+      await runNextJob({ store, dependencies: dep });
+      await runNextJob({ store, dependencies: dep });
+      expect(dep.produceAutopilotCampaign).toHaveBeenCalledTimes(1);
+      const stored = await client.run.findUniqueOrThrow({ where: { id: run.id } });
+      expect(stored.status).toBe("failed");
+      expect(stored.retrySafe).toBe(retrySafe);
+      expect(stored.error).toMatch(message);
+    } finally { await rm(resolve(".data/runs", run.id), { recursive: true, force: true }); }
+  }
+});
+
 test("manual runs still wait for the owner's selection", async () => {
   const run = await store.enqueueResearch(businessId, input);
   expect((await client.run.findUniqueOrThrow({ where: { id: run.id } })).modelCallLimit).toBe(6);

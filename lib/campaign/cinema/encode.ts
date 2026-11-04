@@ -4,12 +4,14 @@ import { createReadStream } from "node:fs";
 import { rename, rm, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
+import { mediaToolEnv } from "../../media/tool-env";
 
 const run = promisify(execFile);
 
 /**
  * Local H.264 encoder fed with raw RGBA frames over stdin. There is no shell, no
- * network protocol (file/pipe only) and no audio. The finished file is verified with
+ * network protocol (file/pipe only), no server credentials in the child's environment and no
+ * audio. The finished file is verified with
  * ffprobe before it replaces `outputPath`; nothing partial is left behind on failure.
  * Public errors are fixed strings: FFmpeg diagnostics can contain local paths.
  */
@@ -70,7 +72,7 @@ export async function sha256File(path: string): Promise<{ sha256: string; bytes:
 /** Probes an MP4 and returns its first video stream facts, or throws CONTRACT_MISMATCH. */
 export async function probeVideo(path: string): Promise<{ width: number; height: number; codec: string; frameRate: string; frames: number; durationSeconds: number; audioStreams: number }> {
   try {
-    const result = await run("ffprobe", ["-v", "error", "-protocol_whitelist", "file", "-show_entries", "stream=codec_type,width,height,codec_name,nb_frames,r_frame_rate:format=duration", "-of", "json", path], { timeout: 15_000, maxBuffer: 64_000 });
+    const result = await run("ffprobe", ["-v", "error", "-protocol_whitelist", "file", "-show_entries", "stream=codec_type,width,height,codec_name,nb_frames,r_frame_rate:format=duration", "-of", "json", path], { timeout: 15_000, maxBuffer: 64_000, killSignal: "SIGKILL", windowsHide: true, env: mediaToolEnv() });
     const probe = JSON.parse(result.stdout) as { streams?: { codec_type?: string; width?: number; height?: number; codec_name?: string; nb_frames?: string; r_frame_rate?: string }[]; format?: { duration?: string } };
     const video = probe.streams?.find((stream) => stream.codec_type === "video");
     if (!video) throw new Error("no video");
@@ -105,7 +107,7 @@ export function openH264Encoder(options: H264EncoderOptions): H264Encoder {
   ];
 
   let child: ChildProcessWithoutNullStreams;
-  try { child = spawn("ffmpeg", args, { stdio: ["pipe", "pipe", "pipe"], windowsHide: true }); }
+  try { child = spawn("ffmpeg", args, { stdio: ["pipe", "pipe", "pipe"], windowsHide: true, env: mediaToolEnv() }); }
   catch { throw new CinemaEncodeError("ENCODER_UNAVAILABLE"); }
 
   let failure: CinemaEncodeError | null = null;

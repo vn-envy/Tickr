@@ -8,7 +8,8 @@ import { dilateMask } from "../campaign/cinema/fill";
 import type { renderSamOverlayVideo } from "../campaign/cinema/overlay";
 import { StillDepthError, type renderStillDepthReel, type StillDepthScene, type StillDepthTheme } from "../campaign/cinema/still-depth";
 import { TrackedCinemaError, type renderTrackedReel } from "../campaign/cinema/tracked";
-import { OwnerClipError, type normalizeOwnerClip } from "../media/clip";
+import { REEL_HEIGHT, REEL_WIDTH } from "../rendering/reel-contract";
+import { OwnerClipError, renderClipMatches, verifyRenderClip, type normalizeOwnerClip, type normalizeOwnerRenderClip, type OwnerRenderClip } from "../media/clip";
 import type { CompositionLedger, NormalizedClip } from "../media/cinema-types";
 import type { MediaLibrary } from "../media/library";
 import { MaskletStoreError } from "../media/masklets";
@@ -194,6 +195,11 @@ export async function renderImageFor(still: StillSource, layer: StillLayer | nul
 
 export interface ReelDependencies {
   normalizeClip: typeof normalizeOwnerClip;
+  /**
+   * Prepares the local render-resolution copy of the tracking clip's frames for the tracked Reel's
+   * output pixels (never sent to Meta). Absent: the Reel is drawn from the 1280-px tracking clip.
+   */
+  normalizeRenderClip?: typeof normalizeOwnerRenderClip;
   trackVideo: typeof trackMetaVideo;
   /** Null when no tracked-footage renderer is available; Autopilot then never pays for SAM video. */
   renderTracked: typeof renderTrackedReel | null;
@@ -331,6 +337,39 @@ export function heroTrack(objects: ReadonlyArray<{ objectId: string; framesPrese
     .sort((a, b) => b.framesPresent * b.meanCoverage - a.framesPresent * a.meanCoverage || a.objectId.localeCompare(b.objectId))[0] ?? null;
 }
 
+/**
+ * The render-resolution footage for the tracked Reel, reused from its checkpoint only while it still
+ * verifies against the tracking clip. Null (with a note) when it cannot be prepared: the Reel then
+ * uses the tracking clip and its QA reports any enlargement.
+ */
+async function reelRenderClip(context: ReelContext, assetId: string, consent: NonNullable<ReturnType<typeof clipConsent>>, reel: Extract<ReelPlan, { mode: "tracked_video" }>, clip: NormalizedClip, notes: string[]): Promise<OwnerRenderClip | null> {
+  const normalize = context.dependencies.normalizeRenderClip;
+  if (!normalize) return null;
+  const saved = await readCheckpoint<{ renderClip: OwnerRenderClip | null }>(context.directory, "reel-render-clip", context.binding);
+  if (saved && saved.renderClip === null) return null;
+  if (saved?.renderClip) {
+    try { await verifyRenderClip(saved.renderClip, clip); return saved.renderClip; } catch (error) { if (!(error instanceof OwnerClipError)) throw error; }
+  }
+  let renderClip: OwnerRenderClip | null;
+  try {
+    const record = await context.library.verifyAsset(assetId);
+    renderClip = await normalize({
+      tracking: clip, sourcePath: record.localPath, outputDir: join(context.directory, "reel-clips"), consent,
+      startSeconds: reel.windowStartSeconds, maxSeconds: Math.max(0.5, reel.windowSeconds), cover: { width: REEL_WIDTH, height: REEL_HEIGHT },
+    });
+  } catch (error) {
+    if (!(error instanceof OwnerClipError)) throw error;
+    notes.push("The owner footage could not be prepared at full Reel resolution; the Reel uses the smaller tracking copy.");
+    return null;
+  }
+  if (renderClip && !renderClipMatches(renderClip, clip)) {
+    notes.push("The full-resolution footage did not match the tracked frames; the Reel uses the smaller tracking copy.");
+    return null;
+  }
+  await writeCheckpoint(context.directory, "reel-render-clip", context.binding, { renderClip });
+  return renderClip;
+}
+
 async function trackedReel(context: ReelContext, reel: Extract<ReelPlan, { mode: "tracked_video" }>, notes: string[]): Promise<ReelRecord | null> {
   const renderTracked = context.dependencies.renderTracked;
   if (!renderTracked) { notes.push("Tracked-footage Reels are not available in this build; the hero photo drives the Reel instead."); return null; }
@@ -379,10 +418,11 @@ async function trackedReel(context: ReelContext, reel: Extract<ReelPlan, { mode:
   const endLayer = reel.fallbackStill ? context.layers.get(reel.fallbackStill.assetId) : undefined;
   const endMask = endLayer ? await readFile(endLayer.maskPath) : null;
   const endCard = endStill && endMask && sha256Hex(endMask) === endLayer!.maskSha256 ? { source: await sharp(endStill.bytes).png().toBuffer(), subjectMask: endMask, provenanceLabel: stillProvenanceLabel(endStill.provenance, true) } : undefined;
+  const renderClip = await reelRenderClip(context, asset.assetId, consent, reel, clip, notes);
   let result: Awaited<ReturnType<typeof renderTrackedReel>>;
   try {
     result = await renderTracked({
-      clip, reader: tracked.reader, heroObjectId: hero.objectId, scenes, cta,
+      clip, ...(renderClip ? { renderClip } : {}), reader: tracked.reader, heroObjectId: hero.objectId, scenes, cta,
       businessName: bounded(context.business.name, 100) || "Local business", campaignName: bounded(context.copy.name, 140) || "Campaign", mode: context.mode,
       provenanceLabel: `${ownerLabel} · SAM 3.1 TRACKED`, theme: reelTheme(context.business.vertical, context.copy), outputPath: paths.videoPath, coverPath: paths.coverPath,
       ...(endCard ? { endCard } : {}),
@@ -396,6 +436,11 @@ async function trackedReel(context: ReelContext, reel: Extract<ReelPlan, { mode:
   if (violations.includes("tracking_lost")) notes.push("SAM lost the subject on some footage frames; those frames show the footage without the cut-out.");
   if (violations.includes("subject_cropped")) notes.push("The tracked subject touches the frame edge in parts of the Reel; review the framing.");
   if (violations.includes("headline_hidden")) notes.push("The product covers much of the Reel's hook headline; review its legibility.");
+  if (result.layout.hookHeadline?.placement === "in_front") notes.push("The product moves through every headline band during the Reel's opening, so its hook headline is set in front of the product on a dark backing; review the framing.");
+  if (violations.includes("low_resolution_footage")) {
+    const upscale = result.qa.footageUpscale;
+    notes.push(`The tracked Reel enlarges the owner footage up to ${upscale.max.toFixed(1)}× (from ${upscale.sourceWidth}×${upscale.sourceHeight}), so it may look soft; review its sharpness or supply higher-resolution footage.`);
+  }
   const overlayPath = join(context.directory, "reel", `sam-tracking-overlay${variantSuffix(context.variant)}.mp4`);
   let overlay: ReelRecord["overlay"] = null;
   try {

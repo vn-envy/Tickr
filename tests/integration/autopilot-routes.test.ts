@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
-import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { lstat, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import sharp from "sharp";
@@ -292,6 +292,22 @@ describe("owner media library maintenance", () => {
     expect(JSON.parse((await listMedia(business)).text).assets.map((item: { id: string }) => item.id)).toEqual([second]);
   });
 
+  test("the keyed upgrade resets 'people shown have agreed' to unconfirmed, keeping 'no people' and rights", async () => {
+    clearConnector();
+    const business = freshBusiness();
+    const consentedBytes = await tinted(5);
+    const consented = await upload(business, new Uint8Array(consentedBytes), "image/png", { filename: "people.png", ownsOrLicensedMedia: "true", peopleVisible: "consented" });
+    expect(consented.status).toBe(201);
+    const noPeople = await uploadedId(business, await tinted(6));
+    configureConnector();
+    expect(JSON.parse((await listMedia(business)).text).mediaError).toBeUndefined();
+    const manifest = JSON.parse(await readFile(join(mediaDir(business), "media-library", "manifest.json"), "utf8"));
+    expect(manifest.integrity).toBe("hmac-sha256");
+    const byId = new Map(manifest.body.assets.map((asset: { id: string; consent: { ownsOrLicensedMedia: boolean; peopleVisibleHaveConsented: unknown } }) => [asset.id, asset.consent]));
+    expect(byId.get((await consented.json()).asset.id)).toEqual(expect.objectContaining({ ownsOrLicensedMedia: true, peopleVisibleHaveConsented: false }));
+    expect(byId.get(noPeople)).toEqual(expect.objectContaining({ ownsOrLicensedMedia: true, peopleVisibleHaveConsented: "no_people" }));
+  });
+
   test("never upgrades an unkeyed manifest that fails its own digest", async () => {
     clearConnector();
     const business = freshBusiness();
@@ -308,6 +324,34 @@ describe("owner media library maintenance", () => {
     expect(body.mediaError).toMatch(/could not be verified with the current server secret/);
     expect(body.connection.status).toBe("disconnected");
     expect(JSON.parse(await readFile(path, "utf8")).integrity).toBe("sha256");
+  });
+
+  test("never re-signs a keyed manifest that was rewritten with a plain SHA-256 digest (downgrade)", async () => {
+    configureConnector();
+    const business = freshBusiness();
+    await uploadedId(business, await tinted(6));
+    const path = join(mediaDir(business), "media-library", "manifest.json");
+    const keyed = JSON.parse(await readFile(path, "utf8"));
+    expect(keyed.integrity).toBe("hmac-sha256");
+    expect(keyed.body.assets[0].consent.peopleVisibleHaveConsented).toBe("no_people");
+    const marker = await lstat(join(mediaDir(business), "media-library.keyed"));
+    expect([marker.isFile(), marker.mode & 0o777]).toEqual([true, 0o600]);
+    // Someone who can write .data but lacks TICKR_SECRET_KEY flips consent and recomputes the plain digest.
+    const canonical = (value: unknown): string => Array.isArray(value) ? `[${value.map(canonical).join(",")}]`
+      : value && typeof value === "object" ? `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`).join(",")}}`
+        : JSON.stringify(value);
+    keyed.body.assets[0].consent.peopleVisibleHaveConsented = true;
+    const forged = JSON.stringify({ body: keyed.body, digest: createHash("sha256").update(`tickr-media-library-v1\n${canonical(keyed.body)}`).digest("hex"), integrity: "sha256" });
+    await writeFile(path, forged);
+    // The forgery is well formed: an unkeyed open accepts it, so only the keyed history can refuse it.
+    await expect(MediaLibrary.open(mediaDir(business))).resolves.toBeDefined();
+    const listed = await listMedia(business);
+    expect(listed.status).toBe(200);
+    const body = JSON.parse(listed.text);
+    expect(body.assets).toEqual([]);
+    expect(body.mediaError).toMatch(/could not be verified with the current server secret/);
+    expect(await readFile(path, "utf8")).toBe(forged);
+    await expect(MediaLibrary.open(mediaDir(business), { integrityKey: mediaLibraryIntegrityKey() })).rejects.toMatchObject({ code: "MANIFEST_TAMPERED" });
   });
 
   test("reports a changed or missing server secret honestly and still returns the connection status", async () => {
@@ -413,7 +457,8 @@ describe("Meta connection routes", () => {
     const [payload, mac] = state.split(".");
     const decoded = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
     const swapped = `${Buffer.from(JSON.stringify({ ...decoded, b: other })).toString("base64url")}.${mac}`;
-    const flipped = `${payload}.${mac.slice(0, -1)}${mac.endsWith("A") ? "B" : "A"}`;
+    // Flip a leading character: the last base64url character of a 32-byte MAC carries padding bits, so changing it can decode to the same bytes.
+    const flipped = `${payload}.${mac.startsWith("A") ? "B" : "A"}${mac.slice(1)}`;
     for (const [query, sentCookie] of [
       [{ code: "synthetic-code-123", state: swapped }, cookie],
       [{ code: "synthetic-code-123", state: flipped }, cookie],

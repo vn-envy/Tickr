@@ -85,6 +85,30 @@ export function uploadUrl(businessId: string, filename: string, people: PeopleVi
 }
 export const connectUrl = (businessId: string) => `/api/connections/meta/start?${new URLSearchParams({ businessId, attest: "1" }).toString()}`;
 
+/** True for any Meta OAuth return (?business=… and/or ?connected=…): a stored run must not replace the intake. */
+export function isOAuthReturn(search: string): boolean {
+  const params = new URLSearchParams(search);
+  return params.has("business") || params.has("connected");
+}
+
+export type OAuthReturn = { businessId: string | null; fromDraft: boolean; notice: "returned" | "error" | null };
+/**
+ * What the intake restores after the Meta callback redirect. The callback leaves the business out
+ * whenever it could not verify the signed state (expired, unparseable, nonce mismatch, connector not
+ * ready); the draft this browser saved just before leaving is then the only context to restore, and
+ * the connection is reported as failed. Returns null when the URL is not an OAuth return.
+ */
+export function resolveOAuthReturn(search: string, storedDraftBusinessId: string | null): OAuthReturn | null {
+  const params = new URLSearchParams(search);
+  const business = params.get("business");
+  const connected = params.get("connected");
+  if (business === null && connected === null) return null;
+  const stored = isUuid(storedDraftBusinessId) ? storedDraftBusinessId : null;
+  if (isUuid(business)) return { businessId: business, fromDraft: stored === business, notice: connected === "error" ? "error" : connected === "meta" ? "returned" : null };
+  // No verified business: an unverified "connected=meta" is not trusted as success.
+  return { businessId: stored, fromDraft: stored !== null, notice: connected === null ? null : "error" };
+}
+
 /* ---------- Director's room: phases, log, media ---------- */
 
 export const RAIL = [
@@ -167,6 +191,43 @@ export function roleBadges(media: Pick<PublicMedia, "roles">): string[] {
   }).filter((label, position, all) => all.indexOf(label) === position);
 }
 
+/**
+ * What the media wall shows. Skeleton tiles promise that media is on its way, so they are only shown
+ * while the run is queued or running; a stopped run (failed, waiting, finished) gets a plain message.
+ */
+export type MediaWallMode = "grid" | "unavailable" | "skeleton" | "loading" | "error" | "empty_failed" | "empty_stopped";
+export type MediaStateStatus = "loading" | "ready" | "unavailable" | "error";
+export function mediaWallMode(run: Pick<RunView, "status">, stateStatus: MediaStateStatus, mediaCount: number): MediaWallMode {
+  if (stateStatus === "unavailable") return "unavailable";
+  if (mediaCount > 0) return "grid";
+  if (isActiveRun(run)) return "skeleton";
+  if (stateStatus === "loading") return "loading";
+  if (stateStatus === "error") return "error";
+  return run.status === "failed" ? "empty_failed" : "empty_stopped";
+}
+
+/**
+ * Retry schedule for a stopped run's public-state fetch. A stopped run no longer changes, so a failed
+ * fetch is retried a few times with backoff for transient faults (network, 408, 429, 5xx) and then
+ * given up; any other client error (400, 403, 409, 422 …) will not fix itself, so it stops at once.
+ * Returns the delay in ms before the next attempt, or null to stop. `attempt` counts prior retries.
+ */
+export const STOPPED_STATE_MAX_RETRIES = 4;
+export function stoppedStateRetryDelay(httpStatus: number | null, attempt: number): number | null {
+  if (attempt >= STOPPED_STATE_MAX_RETRIES) return null;
+  if (httpStatus !== null && httpStatus >= 400 && httpStatus < 500 && httpStatus !== 408 && httpStatus !== 429) return null;
+  return Math.min(5000 * 2 ** attempt, 30_000);
+}
+
+/** The director's-room title: the in-progress "Finding your business…" only while the run can still find it. */
+export function roomHeadline(run: Pick<RunView, "status" | "discovery" | "business">): { text: string; pending: boolean } {
+  const name = run.discovery?.name ?? (run.business.name || null);
+  if (name) return { text: name, pending: false };
+  if (isActiveRun(run)) return { text: "Finding your business…", pending: true };
+  if (run.status === "failed") return { text: "Autopilot stopped before it found your business", pending: false };
+  return { text: "Your business isn’t identified yet", pending: false };
+}
+
 export const isListed = (state: Pick<AutopilotPublicState, "files"> | null, name: string | null | undefined): name is string => Boolean(name && state?.files.some((file) => file.name === name));
 export const autopilotFileUrl = (runId: string, name: string) => `/api/runs/${encodeURIComponent(runId)}/autopilot/files/${encodeURIComponent(name)}`;
 export const runFileUrl = (runId: string, name: string) => `/api/runs/${encodeURIComponent(runId)}/files/${encodeURIComponent(name)}`;
@@ -234,6 +295,34 @@ export function withoutWithheld(run: RunView): RunView {
   const withheld = new Set(serverWithheld(run));
   if (!run.campaign || !withheld.size) return run;
   return { ...run, campaign: { ...run.campaign, assets: run.campaign.assets.filter((asset) => !withheld.has(asset.filename)) } };
+}
+
+/**
+ * The concept ZIP, only when it may be offered for download. The archive bundles every kit file, so
+ * it is never offered once the server withheld it (lib/autopilot/pipeline.ts withholds it whenever
+ * any kit file is withheld). After approval it is offered only when the approval covers exactly
+ * these archive bytes. Fails closed: anything uncertain returns null.
+ */
+export function offerableArchive(run: Pick<RunView, "campaign" | "quality" | "approval">) {
+  const archive = archiveAsset(run.campaign);
+  if (!archive || serverWithheld(run).includes(archive.filename)) return null;
+  const approval = run.approval;
+  if (!approval) return archive;
+  if (approval.withheldFiles.includes(archive.filename)) return null;
+  const approved = approval.files.find((file) => file.filename === archive.filename);
+  return approved && approved.sha256 === archive.sha256 && approved.bytes === archive.bytes ? archive : null;
+}
+
+/** Approved files that are still byte-identical in the current kit and not withheld: the individual downloads after approval. */
+export function approvedDownloads(run: Pick<RunView, "campaign" | "quality" | "approval">): CampaignKit["assets"] {
+  const approval = run.approval;
+  const campaign = run.campaign;
+  if (!approval || !campaign) return [];
+  const withheld = new Set([...serverWithheld(run), ...approval.withheldFiles]);
+  return approval.files.flatMap((file) => {
+    const asset = campaign.assets.find((item) => item.filename === file.filename);
+    return asset && !withheld.has(file.filename) && asset.sha256 === file.sha256 && asset.bytes === file.bytes ? [asset] : [];
+  });
 }
 
 /** Text the server records with the approval (shared module, cannot drift). */

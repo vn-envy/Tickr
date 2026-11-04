@@ -42,6 +42,18 @@ export interface AutopilotProductionResult {
 }
 
 /**
+ * A paid Autopilot step stopped with an unknown outcome (reserved but not finished, or failing
+ * inside its Meta adapter): a completed response may have been lost, so retry is withheld.
+ */
+export class AutopilotPaidStepError extends Error {
+  readonly retrySafe = false;
+  constructor(message = "A paid Autopilot step stopped before its result was saved, so a completed Meta response may have been lost. It was not retried automatically; retry is withheld and saved progress is kept.") {
+    super(message);
+    this.name = "AutopilotPaidStepError";
+  }
+}
+
+/**
  * Thrown when local work failed after every paid step had either completed and been stored,
  * or never started. A retry reuses stored responses and checkpoints without new paid requests
  * for completed steps; uncertain (requested but unstored) steps still fail closed.

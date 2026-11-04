@@ -1,23 +1,26 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import sharp from "sharp";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { probeVideo } from "../../lib/campaign/cinema/encode";
-import { assertLedger } from "../../lib/campaign/cinema/ledger";
+import { assertLedger, measureLedgerFrame } from "../../lib/campaign/cinema/ledger";
 import {
   renderSamOverlayVideo, SAM_OVERLAY_LABEL, SAM_OVERLAY_PALETTE, samOverlayDisclosure, samOverlaySize, samOverlayTextColor,
 } from "../../lib/campaign/cinema/overlay";
 import {
-  CALLOUT_SAFE, DEFAULT_END_CARD_PROVENANCE, planTrackedReel, prepareTrackedReel, renderTrackedReel, renderTrackedReelFrame, smoothTrack, TRACKED_COVER_FRAME, TRACKED_LABEL_BANDS,
-  TrackedCinemaError, type TrackedCrop, type TrackedReelInput,
+  backedContrast, backingOpacity, CALLOUT_SAFE, MAX_FOOTAGE_UPSCALE, MIN_DISPLAY_CONTRAST, MIN_TEXT_CONTRAST, planTrackedReel, prepareTrackedReel, renderTrackedReel, renderTrackedReelFrame, smoothTrack, TRACKED_COVER_FRAME, TRACKED_LABEL_BANDS, TRACKED_REEL_FRAMES,
+  TrackedCinemaError, trackedMaskSigma, type TrackedCrop, type TrackedReelInput,
 } from "../../lib/campaign/cinema/tracked";
 import type { ClipFrame, FrameMask, MaskletReader, MaskletSet, NormalizedClip, OwnerMediaConsent } from "../../lib/media/cinema-types";
-import { normalizeOwnerClip, readClipFrames } from "../../lib/media/clip";
+import {
+  normalizeOwnerClip, normalizeOwnerRenderClip, OwnerClipError, readClipFrames, readRenderClipFrames, renderClipMatches, renderClipSize, verifyRenderClip, type OwnerRenderClip,
+} from "../../lib/media/clip";
 import { createMaskletWriter } from "../../lib/media/masklets";
+import { MAX_FOREGROUND_OCCLUSION, MAX_HEADLINE_OCCLUSION } from "../../lib/campaign/cinema/still-depth";
 
 // SYNTHETIC fixtures only: an FFmpeg lavfi testsrc2 pattern with a drawn red disk, masks computed
 // from the same disk geometry, invented labels and copy. No real business media, no network.
@@ -328,21 +331,24 @@ describe("tracked Reel frames", () => {
 
   test("a still-depth end card is used when supplied; an unusable one falls back to the freeze", async () => {
     const { source, subjectMask, empty } = await endCardStill();
-    const composer = await prepareTrackedReel(input({ endCard: { source, subjectMask } }));
+    const label = "Synthetic still · SAM cutout";
+    const composer = await prepareTrackedReel(input({ endCard: { source, subjectMask, provenanceLabel: label } }));
     expect(composer.plan.endCard.kind).toBe("still_depth");
     expect(composer.endCardFallback).toBe(false);
     // The end card is a different source asset: it carries its own provenance, not the footage label.
-    expect(composer.endCard).toMatchObject({ source: "owner_still", provenanceLabel: DEFAULT_END_CARD_PROVENANCE });
-    expect(composer.endCard.stillDepthLayout?.provenanceLabel).toBe(DEFAULT_END_CARD_PROVENANCE);
+    expect(composer.endCard).toMatchObject({ source: "owner_still", provenanceLabel: label });
+    expect(composer.endCard.stillDepthLayout?.provenanceLabel).toBe(label);
+    // There is no guessed default: an end card without its own provenance label is rejected.
+    await expect(prepareTrackedReel(input({ endCard: { source, subjectMask } as unknown as TrackedReelInput["endCard"] }))).rejects.toThrow("The tracked Reel input is invalid.");
     const first = composer.draw(150, null, null), last = composer.draw(359, null, null);
     expect(first.rgba.length).toBe(W * H * 4);
     expect(last.canvas.subjectInstances.length).toBeGreaterThan(0);
-    const fallback = await prepareTrackedReel(input({ endCard: { source, subjectMask: empty } }));
+    const fallback = await prepareTrackedReel(input({ endCard: { source, subjectMask: empty, provenanceLabel: label } }));
     expect(fallback.endCardFallback).toBe(true);
     expect(fallback.plan.endCard.kind).toBe("freeze");
     expect(fallback.endCard).toEqual({ source: "footage_freeze", provenanceLabel: "Owner footage · SAM 3.1 selection", stillDepthLayout: null });
     // Undecodable end-card bytes also fall back instead of failing the Reel.
-    const garbage = await prepareTrackedReel(input({ endCard: { source: new Uint8Array(64).fill(7), subjectMask } }));
+    const garbage = await prepareTrackedReel(input({ endCard: { source: new Uint8Array(64).fill(7), subjectMask, provenanceLabel: label } }));
     expect(garbage.endCardFallback).toBe(true);
   }, 120_000);
 });
@@ -374,12 +380,17 @@ describe("tracked Reel render", () => {
     expect(result.qa.headlineOcclusion.max).toBeLessThanOrEqual(1);
     expect(result.layout).toMatchObject({ provenanceLabel: "Owner footage · SAM 3.1 selection", calloutLabel: "Synthetic red disk" });
     expect(result.endCard).toEqual({ source: "footage_freeze", provenanceLabel: "Owner footage · SAM 3.1 selection", stillDepthLayout: null });
+    // A 640×360 tracking clip is enlarged several times into the 1080×1920 Reel: that is a QA flag, never silent.
+    expect(result.qa.footageUpscale).toMatchObject({ source: "tracking_clip", sourceWidth: CLIP_W, sourceHeight: CLIP_H });
+    expect(result.qa.footageUpscale.mean).toBeGreaterThan(5);
+    expect(result.qa.footageUpscale.framesOverLimit).toBe(360);
+    expect(result.qa.violations).toContain("low_resolution_footage");
   }, 300_000);
 
   test("a failed re-render keeps the previous cover and MP4 paired and leaves no staged files", async () => {
     const [reelBefore, coverBefore] = await Promise.all([readFile(join(root, "out", "reel.mp4")), readFile(join(root, "out", "cover.png"))]);
-    // Fails after the cover frame (60) has been composed.
-    const failing: MaskletReader = { set: reader.set, frameMask: async (objectId, frame) => { if (frame === 100) throw new Error("synthetic read failure"); return reader.frameMask(objectId, frame); } };
+    // Fails after the cover frame (60) has been composed (odd frames are not read while laying out).
+    const failing: MaskletReader = { set: reader.set, frameMask: async (objectId, frame) => { if (frame === 101) throw new Error("synthetic read failure"); return reader.frameMask(objectId, frame); } };
     await expect(renderTrackedReel(input({ reader: failing }))).rejects.toThrow(new TrackedCinemaError("The tracked Reel could not be composed."));
     expect((await readFile(join(root, "out", "reel.mp4"))).equals(reelBefore)).toBe(true);
     expect((await readFile(join(root, "out", "cover.png"))).equals(coverBefore)).toBe(true);
@@ -476,4 +487,359 @@ describe("SAM overlay video", () => {
     expect(Math.abs(r - 233)).toBeLessThan(30); expect(Math.abs(g - 105)).toBeLessThan(30); expect(b).toBeLessThan(70);
     await expect(renderSamOverlayVideo({ clip: tiny, reader: tinyReader, outputPath, objectLabels: {}, window: { fromFrame: 0, toFrame: 0 } })).resolves.toMatchObject({ video: { frames: 1 } });
   }, 180_000);
+});
+
+// SYNTHETIC: a 4K landscape testsrc2 pattern (the common phone default the 1280-px tracking cap shrinks).
+describe("render-resolution footage", () => {
+  const SOURCE_W = 3840, SOURCE_H = 2160;
+  /** A textured hero region in tracking-clip pixels (1280×720), constant on every frame. */
+  const HERO = { left: 560, top: 260, right: 760, bottom: 460 };
+  let source = "", tracking: NormalizedClip, render: OwnerRenderClip, heroReader: MaskletReader;
+  const heroMask = (frame: number): FrameMask => ({ objectId: "1", frame, bounds: HERO, confidence: 0.95, raster: new Uint8Array((HERO.right - HERO.left) * (HERO.bottom - HERO.top)).fill(1) });
+  const fourK = (extra: Partial<TrackedReelInput> = {}) => input({ clip: tracking, reader: heroReader, ...extra });
+
+  beforeAll(async () => {
+    source = join(root, "synthetic-4k.mp4");
+    await run("ffmpeg", [
+      "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-f", "lavfi", "-i", `testsrc2=size=${SOURCE_W}x${SOURCE_H}:rate=30:duration=2`,
+      "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16", "-pix_fmt", "yuv420p", source,
+    ], { timeout: 180_000 });
+    tracking = await normalizeOwnerClip({ sourcePath: source, outputDir: join(root, "clip-4k"), consent, provenance: "owner_upload" });
+    expect(tracking).toMatchObject({ width: 1280, height: 720, frameCount: 60 });
+    const rendered = await normalizeOwnerRenderClip({ tracking, sourcePath: source, outputDir: join(root, "clip-4k"), consent, cover: { width: W, height: H } });
+    expect(rendered).not.toBeNull();
+    render = rendered!;
+    const writer = await createMaskletWriter(join(root, "masklets-4k"), { sha256: tracking.sha256, width: tracking.width, height: tracking.height, fps: tracking.fps, frameCount: tracking.frameCount });
+    for (let frame = 0; frame < tracking.frameCount; frame++) await writer.add(heroMask(frame));
+    heroReader = await writer.commit({
+      identity: () => ({ label: "Synthetic pattern", origin: "owner_tap" }),
+      set: { responseId: "resp_synthetic_4k", promptKind: "geometry", propagation: "both", framesBilled: 60, elapsedMs: 1, createdAt: new Date(0).toISOString() },
+      binding: { inputHash: "f".repeat(64), usage: { frames_processed: 60 }, unmatchedPromptIds: [] },
+    });
+  }, 300_000);
+
+  test("the render source repeats the tracking frames at a size that covers the Reel 1:1", async () => {
+    expect(renderClipSize(SOURCE_W, SOURCE_H, { width: W, height: H })).toEqual({ width: 3412, height: 1920 });
+    expect(renderClipSize(1080, 1920, { width: W, height: H })).toEqual({ width: 1080, height: 1920 });
+    expect(renderClipSize(7680, 4320, { width: W, height: H })).toEqual({ width: 3412, height: 1920 });
+    expect(render).toMatchObject({ kind: "render_source", trackingSha256: tracking.sha256, width: 3412, height: 1920, fps: 30, frameCount: tracking.frameCount });
+    await verifyRenderClip(render, tracking);
+    expect(renderClipMatches(render, tracking)).toBe(true);
+    expect(renderClipMatches({ ...render, trackingSha256: "a".repeat(64) }, tracking)).toBe(false);
+    expect(renderClipMatches({ ...render, frameCount: 59 }, tracking)).toBe(false);
+    expect(renderClipMatches({ ...render, width: 2400 }, tracking)).toBe(false);
+    // Same frames: the render frame, downscaled to the tracking size, matches the tracking frame.
+    let small: ClipFrame | null = null, large: ClipFrame | null = null;
+    for await (const frame of readClipFrames(tracking, { fromFrame: 37, toFrame: 37 })) small = frame;
+    for await (const frame of readRenderClipFrames(render, { fromFrame: 37, toFrame: 37, width: 1280, height: 720 })) large = frame;
+    let diff = 0;
+    for (let i = 0; i < small!.rgba.length; i += 4) for (let c = 0; c < 3; c++) diff += Math.abs(small!.rgba[i + c] - large!.rgba[i + c]);
+    expect(diff / (1280 * 720 * 3)).toBeLessThan(4);
+  });
+
+  test("small sources need no render copy; other files, missing consent and tampering fail closed", async () => {
+    expect(await normalizeOwnerRenderClip({ tracking: clip, sourcePath: join(root, "synthetic-disk.mp4"), outputDir: join(root, "clip"), consent, cover: { width: W, height: H } })).toBeNull();
+    await expect(normalizeOwnerRenderClip({ tracking, sourcePath: join(root, "synthetic-disk.mp4"), outputDir: join(root, "clip-4k"), consent, cover: { width: W, height: H } }))
+      .rejects.toMatchObject({ code: "SOURCE_CHANGED" });
+    await expect(normalizeOwnerRenderClip({ tracking, sourcePath: source, outputDir: join(root, "clip-4k"), consent: { ...consent, ownsOrLicensedMedia: false }, cover: { width: W, height: H } }))
+      .rejects.toMatchObject({ code: "CONSENT_REQUIRED" });
+    const tampered = join(root, "clip-4k", "tampered-render.mp4");
+    await copyFile(render.path, tampered);
+    await writeFile(tampered, Buffer.from("x"), { flag: "a" });
+    await expect(verifyRenderClip({ ...render, path: tampered }, tracking)).rejects.toBeInstanceOf(OwnerClipError);
+    await expect(verifyRenderClip(render, clip)).rejects.toBeInstanceOf(OwnerClipError);
+    // The Reel never guesses a mapping onto footage that is not the tracking clip's.
+    await expect(prepareTrackedReel(fourK({ renderClip: { ...render, frameCount: 59 } }))).rejects.toThrow("render-resolution footage does not match");
+    await expect(prepareTrackedReel(input({ renderClip: render }))).rejects.toThrow("render-resolution footage does not match");
+  }, 120_000);
+
+  test("hero pixels come from the render source, registered with the tracking crop, and are sharper", async () => {
+    const index = 30;
+    const sharp4k = await renderTrackedReelFrame(fourK({ renderClip: render }), index);
+    const soft = await renderTrackedReelFrame(fourK(), index);
+    const crop = sharp4k.frame.crop!;
+    expect(soft.frame.crop).toEqual(crop);
+    let frame: ClipFrame | null = null;
+    for await (const decoded of readRenderClipFrames(render, { fromFrame: index, toFrame: index })) frame = decoded;
+    const kx = render.width / tracking.width, ky = render.height / tracking.height;
+    const sx = crop.width * kx / W, sy = crop.height * ky / H;
+    const sample = (x: number, y: number, c: number) => {
+      const u = Math.min(frame!.width - 1, Math.max(0, crop.x * kx + (x + 0.5) * sx - 0.5)), v = Math.min(frame!.height - 1, Math.max(0, crop.y * ky + (y + 0.5) * sy - 0.5));
+      const i0 = Math.min(frame!.width - 2, Math.floor(u)), j0 = Math.min(frame!.height - 2, Math.floor(v)), fx = u - i0, fy = v - j0;
+      const p = (j0 * frame!.width + i0) * 4 + c, row = frame!.width * 4, px = frame!.rgba;
+      return (px[p] * (1 - fx) + px[p + 4] * fx) * (1 - fy) + (px[p + row] * (1 - fx) + px[p + row + 4] * fx) * fy;
+    };
+    // Output pixels of the eroded hero region (outside the label bands).
+    const s = W / crop.width;
+    const x0 = Math.ceil((HERO.left + 3 - crop.x) * s), x1 = Math.floor((HERO.right - 3 - crop.x) * s);
+    const y0 = Math.max(TRACKED_LABEL_BANDS.top.bottom, Math.ceil((HERO.top + 3 - crop.y) * s)), y1 = Math.min(TRACKED_LABEL_BANDS.bottom.top, Math.floor((HERO.bottom - 3 - crop.y) * s));
+    expect(x1 - x0).toBeGreaterThan(300); expect(y1 - y0).toBeGreaterThan(300);
+    let worst = 0, energySharp = 0, energySoft = 0;
+    for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
+      const o = (y * W + x) * 4;
+      for (let c = 0; c < 3; c++) {
+        worst = Math.max(worst, Math.abs(sharp4k.rgba[o + c] - Math.round(sample(x, y, c))));
+        if (x + 1 < x1) { energySharp += (sharp4k.rgba[o + 4 + c] - sharp4k.rgba[o + c]) ** 2; energySoft += (soft.rgba[o + 4 + c] - soft.rgba[o + c]) ** 2; }
+      }
+    }
+    expect(worst).toBeLessThanOrEqual(1);
+    expect(energySharp).toBeGreaterThan(energySoft * 1.5);
+  }, 120_000);
+
+  test("the Reel drawn from the render source is not flagged; the 1280-px tracking copy of 4K footage is", async () => {
+    const composerSoft = await prepareTrackedReel(fourK());
+    expect(composerSoft.footageUpscale).toMatchObject({ source: "tracking_clip", sourceWidth: 1280, sourceHeight: 720 });
+    expect(composerSoft.footageUpscale.max).toBeGreaterThan(2.6);
+    expect(composerSoft.footageUpscale.framesOverLimit).toBe(360);
+    const outputPath = join(root, "out", "reel-4k.mp4"), coverPath = join(root, "out", "cover-4k.png");
+    const result = await renderTrackedReel(fourK({ renderClip: render, outputPath, coverPath }));
+    expect(await probeVideo(outputPath)).toMatchObject({ width: 1080, height: 1920, frames: 360, durationSeconds: 12 });
+    expect(result.qa.footageUpscale).toMatchObject({ source: "render_clip", sourceWidth: 3412, sourceHeight: 1920, framesOverLimit: 0 });
+    expect(result.qa.footageUpscale.max).toBeLessThanOrEqual(MAX_FOOTAGE_UPSCALE);
+    expect(result.qa.violations).not.toContain("low_resolution_footage");
+    expect(result.ledger.generatedPixelsOnSubject).toBe(0);
+  }, 300_000);
+});
+
+// SYNTHETIC: masks rasterized from exact disks; live-run defects reproduced on generated footage only.
+describe("tracked Reel edge quality and text legibility", () => {
+  /** Per-pixel subject alpha recovered from frames drawn with and without the mask: with = without·(1−α) + source·α. */
+  function alphaAt(withMask: Buffer, without: Buffer, source: ClipFrame, crop: TrackedCrop, x: number, y: number): number | null {
+    let best = -1, alpha = 0;
+    for (let c = 0; c < 3; c++) {
+      const o = (y * W + x) * 4 + c, delta = reference(source, crop, x, y, c) - without[o];
+      if (Math.abs(delta) > best) { best = Math.abs(delta); alpha = (withMask[o] - without[o]) / delta; }
+    }
+    return best >= 40 ? Math.min(1, Math.max(0, alpha)) : null;
+  }
+
+  test("the upsampled hero outline is smooth (no stair steps from the low-resolution SAM mask)", async () => {
+    const composer = await prepareTrackedReel(input());
+    const index = 30, frame = composer.plan.frames[index], crop = frame.crop!;
+    const source = await decodeFrame(index), mask = (await reader.frameMask("1", index))!;
+    const withMask = composer.draw(index, source, mask).rgba, without = composer.draw(index, source, null).rgba;
+    const s = W / crop.width;
+    expect(trackedMaskSigma(s)).toBeGreaterThan(1);
+    // The mask disk is centred on pixel index diskX (pixel centres at +0.5 in clip coordinates).
+    const cx = (diskX(index) + 0.5 - crop.x) * s, cy = (DISK_Y + 0.5 - crop.y) * s;
+    const radii: number[] = [];
+    for (let k = 0; k < 360; k++) {
+      const theta = (k / 360) * 2 * Math.PI;
+      let edge: number | null = null, previous: { r: number; a: number } | null = null;
+      for (let r = (RADIUS - 5) * s; r <= (RADIUS + 5) * s; r += 0.25) {
+        const x = Math.round(cx + Math.cos(theta) * r), y = Math.round(cy + Math.sin(theta) * r);
+        if (y < TRACKED_LABEL_BANDS.top.bottom || y >= TRACKED_LABEL_BANDS.bottom.top) break;
+        const a = alphaAt(withMask, without, source, crop, x, y);
+        if (a === null) continue;
+        if (previous && previous.a >= 0.5 && a < 0.5) { edge = previous.r + (r - previous.r) * (previous.a - 0.5) / (previous.a - a); break; }
+        previous = { r, a };
+      }
+      if (edge !== null) radii.push(edge);
+    }
+    expect(radii.length).toBeGreaterThan(300);
+    // Roughness: residual of the edge radius against its own ±12-sample moving average (a circle is constant).
+    const residual = radii.map((r, i) => {
+      let sum = 0;
+      for (let d = -12; d <= 12; d++) sum += radii[(i + d + radii.length) % radii.length];
+      return r - sum / 25;
+    });
+    const rms = Math.sqrt(residual.reduce((sum, value) => sum + value * value, 0) / residual.length);
+    // A hard binary mask enlarged ~5.3× steps by about ±half a mask pixel (rms ≈ 1.1 output px here).
+    expect(rms).toBeLessThan(0.75);
+    // Smoothing does not shrink or grow the subject: the mean edge stays on the true disk radius.
+    expect(Math.abs(radii.reduce((sum, value) => sum + value, 0) / radii.length / s - RADIUS)).toBeLessThan(0.6);
+  }, 120_000);
+
+  test("SAM specks and pin-holes never reach the Reel; the stored mask is untouched and the refinement is reported", async () => {
+    const index = 30, clean = (await reader.frameMask("1", index))!;
+    const noisy: FrameMask = { ...clean, raster: Uint8Array.from(clean.raster) };
+    const span = clean.bounds.right - clean.bounds.left;
+    // Two specks in the mask's empty corners and a 2×2 pin-hole inside the disk.
+    for (const [x, y] of [[1, 1], [2, 1], [span - 2, 1], [span - 2, 2]]) noisy.raster[y * span + x] = 1;
+    const centre = Math.floor((clean.bounds.bottom - clean.bounds.top) / 2) * span + Math.floor(span / 2);
+    for (const offset of [0, 1, span, span + 1]) noisy.raster[centre + offset] = 0;
+    const before = Uint8Array.from(noisy.raster);
+    const composer = await prepareTrackedReel(input());
+    const source = await decodeFrame(index);
+    const a = composer.draw(index, source, clean), b = composer.draw(index, source, noisy);
+    expect(b.rgba.equals(a.rgba)).toBe(true);
+    expect(noisy.raster).toEqual(before);
+    expect(a.stats.maskRefinement).toMatchObject({ removedPixels: 0, filledPixels: 0 });
+    expect(b.stats.maskRefinement).toMatchObject({ removedPixels: 4, filledPixels: 4 });
+  }, 120_000);
+
+  describe("a subject moving down through the headline zone", () => {
+    const VW = 640, VH = 360, VR = 70, VX = 320;
+    /** Disk centre y for frame f: 30 + 60·T (it sweeps down the frame during the hook). */
+    const diskY = (frame: number) => 30 + 60 * frame / 30;
+    let vclip: NormalizedClip, vreader: MaskletReader;
+    const copy = [
+      { kicker: "Synthetic hook", headline: "Slow mornings start with warm cups", body: "Synthetic fixture copy for the hook act, long enough to read." },
+      ...scenes.slice(1),
+    ];
+    const vinput = (extra: Partial<TrackedReelInput> = {}) => input({ clip: vclip, reader: vreader, scenes: copy, ...extra });
+
+    beforeAll(async () => {
+      const raw = join(root, "synthetic-vertical.mp4"), inside = `lt(hypot(X-${VX},Y-(30+60*T)),${VR})`;
+      await run("ffmpeg", [
+        "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-f", "lavfi", "-i", `testsrc2=size=${VW}x${VH}:rate=30:duration=4`,
+        "-vf", `format=gbrp,geq=r='if(${inside},235,r(X,Y))':g='if(${inside},60,g(X,Y))':b='if(${inside},40,b(X,Y))',format=yuv420p`,
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "12", "-pix_fmt", "yuv420p", raw,
+      ], { timeout: 120_000 });
+      vclip = await normalizeOwnerClip({ sourcePath: raw, outputDir: join(root, "vertical-clip"), consent, provenance: "owner_upload" });
+      const writer = await createMaskletWriter(join(root, "vertical-masklets"), { sha256: vclip.sha256, width: vclip.width, height: vclip.height, fps: vclip.fps, frameCount: vclip.frameCount });
+      for (let frame = 0; frame < vclip.frameCount; frame++) await writer.add(circleMask("1", frame, VX, diskY(frame), VR, VW, VH, 0.9));
+      vreader = await writer.commit({
+        identity: () => ({ label: "Synthetic red disk", origin: "owner_tap" }),
+        set: { responseId: "resp_synthetic_vertical", promptKind: "geometry", propagation: "both", framesBilled: vclip.frameCount, elapsedMs: 1, createdAt: new Date(0).toISOString() },
+        binding: { inputHash: "d".repeat(64), usage: { frames_processed: vclip.frameCount }, unmatchedPromptIds: [] },
+      });
+    }, 180_000);
+
+    test("the hook headline is placed against the whole act: the passing subject hides at most the planned share", async () => {
+      const composer = await prepareTrackedReel(vinput());
+      const [start, end] = composer.plan.acts.hook;
+      const sources: ClipFrame[] = [];
+      for await (const decoded of readClipFrames(vclip, { fromFrame: start, toFrame: end - 1 })) sources.push(decoded);
+      const measured: number[] = [];
+      for (let index = start; index < end; index++) {
+        const { stats } = composer.draw(index, sources[index - start], await vreader.frameMask("1", index));
+        if (stats.headlineOcclusion !== null) measured.push(stats.headlineOcclusion);
+      }
+      const report = composer.layout.hookHeadline;
+      if (report.placement === "behind_subject") {
+        expect(report.occlusion).toBeLessThanOrEqual(MAX_HEADLINE_OCCLUSION);
+        expect(measured.length).toBeGreaterThan(10);
+        const mean = measured.reduce((sum, value) => sum + value, 0) / measured.length;
+        expect(mean).toBeLessThanOrEqual(MAX_HEADLINE_OCCLUSION + 0.05);
+        expect(Math.abs(mean - report.occlusion)).toBeLessThan(0.1);
+      } else {
+        // In front, on its own backing: it is never hidden, and the choice is reported.
+        expect(measured).toEqual([]);
+        expect(report.foregroundOcclusion).toBeLessThan(1);
+      }
+    }, 180_000);
+
+    test("text backings sit beneath the subject: the swept Reel renders without foreground_occlusion", async () => {
+      // Regression: front-text backings drawn over the subject hid >10% of it in the CTA act (frame 137)
+      // and the produced Reel was withheld. Backings are drawn beneath the subject; only glyphs are in front.
+      const result = await renderTrackedReel(vinput({ outputPath: join(root, "out", "sweep.mp4"), coverPath: join(root, "out", "sweep.png") }));
+      expect(result.qa.violations).not.toContain("foreground_occlusion");
+      expect(result.ledger.maxSubjectOcclusion).toBeLessThanOrEqual(MAX_FOREGROUND_OCCLUSION / 2);
+      expect(result.layout.textContrast.backingLayer).toBe("beneath_subject");
+      // Over the subject the front glyphs have no backing; how much of their area that is gets reported.
+      expect(result.qa.frontTextOverSubject.max).toBeGreaterThanOrEqual(0);
+      expect(result.qa.frontTextOverSubject.max).toBeLessThanOrEqual(1);
+    }, 300_000);
+
+    test("hook body copy keeps its contrast floor over bright footage", async () => {
+      const theme = input().theme;
+      // Worst case (pure white under the text) is covered by construction.
+      const opacity = backingOpacity(theme.paper, theme.ink, MIN_TEXT_CONTRAST)!;
+      expect(backedContrast(theme.paper, theme.ink, opacity)).toBeGreaterThanOrEqual(MIN_TEXT_CONTRAST);
+      expect(backedContrast(theme.paper, theme.ink, Math.max(0, opacity - 0.05))).toBeLessThan(MIN_TEXT_CONTRAST);
+      const composer = await prepareTrackedReel(vinput());
+      expect(composer.layout.textContrast.body).toBeGreaterThanOrEqual(MIN_TEXT_CONTRAST);
+      expect(composer.layout.textContrast.display).toBeGreaterThanOrEqual(MIN_DISPLAY_CONTRAST);
+      const bare = await prepareTrackedReel(vinput({ scenes: [{ ...copy[0], body: "" }, ...copy.slice(1)] }));
+      // ~1.0 s: the hook body is fully shown over fully treated synthetic test-pattern footage.
+      const index = 30;
+      let source: ClipFrame | null = null;
+      for await (const decoded of readClipFrames(vclip, { fromFrame: index, toFrame: index })) source = decoded;
+      const mask = await vreader.frameMask("1", index);
+      const withBody = composer.draw(index, source, mask).rgba, without = bare.draw(index, source, mask).rgba;
+      const light = [0xF5, 0xEE, 0xDF];
+      const lum = (rgba: Buffer, o: number) => {
+        const [r, g, b] = [rgba[o], rgba[o + 1], rgba[o + 2]].map((v) => v / 255).map((c) => c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      };
+      // Glyph cores: near the text colour and changed by the body text.
+      const rows = [H - 320, TRACKED_LABEL_BANDS.bottom.top - 8];
+      const glyph = new Uint8Array(W * H);
+      let left = W, right = -1, top = H, bottom = -1;
+      for (let y = rows[0]; y < rows[1]; y++) for (let x = 0; x < W; x++) {
+        const o = (y * W + x) * 4;
+        const near = Math.abs(withBody[o] - light[0]) + Math.abs(withBody[o + 1] - light[1]) + Math.abs(withBody[o + 2] - light[2]) < 45;
+        const changed = Math.abs(withBody[o] - without[o]) + Math.abs(withBody[o + 1] - without[o + 1]) + Math.abs(withBody[o + 2] - without[o + 2]) > 60;
+        if (near && changed) { glyph[y * W + x] = 1; left = Math.min(left, x); right = Math.max(right, x); top = Math.min(top, y); bottom = Math.max(bottom, y); }
+      }
+      expect(right - left).toBeGreaterThan(300);
+      // The backdrop around the letters: inside the text box, at least 3 px from any glyph core.
+      const backdrop: number[] = [];
+      for (let y = top; y <= bottom; y++) for (let x = left; x <= right; x++) {
+        let nearGlyph = false;
+        for (let dy = -3; dy <= 3 && !nearGlyph; dy++) for (let dx = -3; dx <= 3; dx++) if (glyph[(y + dy) * W + x + dx]) { nearGlyph = true; break; }
+        if (!nearGlyph) backdrop.push(lum(withBody, (y * W + x) * 4));
+      }
+      backdrop.sort((a, b) => a - b);
+      const brightBackdrop = backdrop[Math.floor(backdrop.length * 0.95)];
+      const textLum = lum(Buffer.from([...light, 255]), 0);
+      expect((textLum + 0.05) / (brightBackdrop + 0.05)).toBeGreaterThanOrEqual(MIN_TEXT_CONTRAST);
+    }, 180_000);
+  });
+
+  // Regression (live-4 follow-up): front-text backings drawn over the subject counted as hiding it and
+  // pushed the ledger past MAX_FOREGROUND_OCCLUSION, so produce.ts withheld the Reel. A subject low in
+  // the frame passes under the hook body copy; its backing must stay beneath the subject.
+  describe("a subject low in the frame, under the body copy", () => {
+    const LW_ = 640, LH_ = 360, LR = 60, LX = 320, LY = 290;
+    let lclip: NormalizedClip, lreader: MaskletReader;
+    const linput = (extra: Partial<TrackedReelInput> = {}) => input({ clip: lclip, reader: lreader, ...extra });
+
+    beforeAll(async () => {
+      lclip = await syntheticDiskClip("synthetic-low", LW_, LH_, 4, String(LX), LY, LR);
+      lreader = await diskMasklets("synthetic-low", lclip, () => LX, LY, LR);
+    }, 180_000);
+
+    test("only glyphs, never their backing, cover the subject; the ledger stays under the occlusion cap", async () => {
+      const composer = await prepareTrackedReel(linput());
+      // Same Reel without the hook and CTA body copy (and so without their backings).
+      const bare = await prepareTrackedReel(linput({ scenes: [{ ...scenes[0], body: "" }, scenes[1], scenes[2], { ...scenes[3], body: "" }] }));
+      expect(composer.layout.textContrast.backingLayer).toBe("beneath_subject");
+      const sources: ClipFrame[] = [];
+      for await (const decoded of readClipFrames(lclip, { fromFrame: 0, toFrame: composer.plan.footageFrames - 1 })) sources.push(decoded);
+      const worst: Record<string, number> = { hook: 0, proof: 0, value: 0, cta: 0 };
+      let overSubject = 0, ctaBodyAdds = 0, farDarkened = 0, farCompared = 0;
+      const [hookStart, hookEnd] = composer.plan.acts.hook;
+      for (let index = 0; index < TRACKED_REEL_FRAMES; index++) {
+        const frame = composer.plan.frames[index];
+        if (frame.kind === "still_depth") continue;
+        const source = sources[frame.sourceFrame!], mask = await lreader.frameMask("1", frame.sourceFrame!);
+        const drawn = composer.draw(index, source, mask);
+        const occlusion = measureLedgerFrame(drawn.canvas).subjectOcclusion;
+        worst[frame.act] = Math.max(worst[frame.act], occlusion);
+        overSubject = Math.max(overSubject, drawn.stats.frontTextOverSubject ?? 0);
+        if (frame.act === "cta" && index % 4 === 0) ctaBodyAdds = Math.max(ctaBodyAdds, occlusion - measureLedgerFrame(bare.draw(index, source, mask).canvas).subjectOcclusion);
+        // Hook body fully shown: subject pixels well away from any glyph are not darkened by the body's backing.
+        if (frame.act !== "hook" || index < hookStart + 0.6 * (hookEnd - hookStart) || index > hookEnd - 8) continue;
+        const without = bare.draw(index, source, mask).rgba, crop = frame.crop!, s = W / crop.width;
+        const cx = (LX + 0.5 - crop.x) * s, cy = (LY + 0.5 - crop.y) * s, r = (LR - 4) * s;
+        const glyph = new Uint8Array(W * H);
+        for (let y = H - 420; y < TRACKED_LABEL_BANDS.bottom.top; y++) for (let x = 0; x < W; x++) {
+          const o = (y * W + x) * 4;
+          if (drawn.rgba[o] + drawn.rgba[o + 1] + drawn.rgba[o + 2] > without[o] + without[o + 1] + without[o + 2] + 60) glyph[y * W + x] = 1;
+        }
+        for (let y = H - 400; y < TRACKED_LABEL_BANDS.bottom.top - 20; y += 2) for (let x = 20; x < W - 20; x += 2) {
+          if (Math.hypot(x + 0.5 - cx, y + 0.5 - cy) >= r) continue;
+          let near = false;
+          for (let dy = -26; dy <= 26 && !near; dy += 2) for (let dx = -26; dx <= 26; dx += 2) if (glyph[(y + dy) * W + x + dx]) { near = true; break; }
+          if (near) continue;
+          const o = (y * W + x) * 4;
+          farCompared++;
+          if (without[o] + without[o + 1] + without[o + 2] - (drawn.rgba[o] + drawn.rgba[o + 1] + drawn.rgba[o + 2]) > 12) farDarkened++;
+        }
+      }
+      // The scenario really puts body text over the subject…
+      expect(overSubject).toBeGreaterThan(0.05);
+      expect(farCompared).toBeGreaterThan(200);
+      // …yet no backing darkens the subject away from the glyphs…
+      expect(farDarkened / farCompared).toBeLessThan(0.02);
+      // …and text over the subject hides only its glyph share (a front backing pushed the hook to ~0.08).
+      expect(worst.hook).toBeLessThanOrEqual(0.04);
+      expect(worst.proof).toBeLessThanOrEqual(0.04);
+      expect(worst.value).toBeLessThanOrEqual(0.04);
+      // In the CTA act the body copy adds only its glyphs on top of what the opaque CTA pill covers.
+      expect(ctaBodyAdds).toBeLessThan(0.02);
+    }, 300_000);
+  });
 });

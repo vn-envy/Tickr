@@ -54,7 +54,8 @@ export function MediaDropzone({ queue, uploaded, rejected, disabled, rights, peo
         </div>
         <div className="ap-progress" role="progressbar" aria-label={`Upload progress for ${item.file.name}`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(item.progress * 100)}><span style={{ transform: `scaleX(${item.progress})` }} /></div>
         {item.status === "error" && item.error && <p className="ap-thumb-error">{item.error}</p>}
-        <button type="button" className="ap-thumb-remove" disabled={disabled && item.status === "uploading"} onClick={() => onRemoveQueued(item.id)} aria-label={`Remove ${item.file.name}`}><X size={14} /></button>
+        {/* Always available: removing a file skips it in a running batch, or cancels its upload in flight. */}
+        <button type="button" className="ap-thumb-remove" onClick={() => onRemoveQueued(item.id)} aria-label={item.status === "uploading" ? `Cancel the upload and remove ${item.file.name}` : `Remove ${item.file.name}`}><X size={14} /></button>
       </li>)}
     </ul>}
     {queue.length > 0 && <fieldset ref={consentRef} tabIndex={-1} className={`ap-consent ${consentError ? "has-error" : ""}`} disabled={disabled} aria-describedby={consentError ? `${helpId}-consent-error` : undefined}>

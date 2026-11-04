@@ -20,13 +20,13 @@ import { analyzeMediaAssets } from "../../lib/meta/media-analysis";
 import { trackMetaVideo, type SamVideoRequest } from "../../lib/meta/sam-video";
 import { segmentMetaImage, type MetaSegmentationRequest } from "../../lib/meta/segmentation";
 import { analyzeClipShots } from "../../lib/meta/video-understanding";
-import { AUTOPILOT_ROLE_CAPS, createAutopilotBudget, type AutopilotBudget } from "../../lib/autopilot/budget";
+import { AUTOPILOT_ROLE_CAPS, AutopilotBudgetError, createAutopilotBudget, type AutopilotBudget } from "../../lib/autopilot/budget";
 import type { AutopilotRole } from "../../lib/autopilot/contracts";
 import { applyDeterministicFixes, type CritiqueSnapshot } from "../../lib/autopilot/critique";
 import { officialWebsiteFor, selectHarvest } from "../../lib/autopilot/harvest";
 import { defaultAutopilotDependencies, produceAutopilotCampaign, type AutopilotDependencies } from "../../lib/autopilot/pipeline";
 import { heroTrack } from "../../lib/autopilot/produce";
-import { AutopilotResumableError, AutopilotQualitySchema, type AutopilotProductionInput } from "../../lib/autopilot/production-types";
+import { AutopilotPaidStepError, AutopilotResumableError, AutopilotQualitySchema, type AutopilotProductionInput } from "../../lib/autopilot/production-types";
 import { readPublicFile, readPublicState, type AutopilotPublicState } from "../../lib/autopilot/public-state";
 import type { BusinessEnrichment, CollectedSource, ResearchOpportunity, ResearchReport } from "../../lib/research/contracts";
 import { ChannelSchema } from "../../lib/schemas/common";
@@ -76,7 +76,10 @@ const fakeClient = (respond: (body: Record<string, unknown>) => unknown | Promis
   requestJson: vi.fn(async (_path: string, init?: { body?: Record<string, unknown> }) => respond(init!.body!)),
 }) as unknown as Pick<MetaClient, "requestJson">;
 
-function mediaResponse(body: Record<string, unknown>, risks: ReadonlyArray<{ kind: string; box: null; note: string }> = []) {
+type RiskFixture = ReadonlyArray<{ kind: string; box: null; note: string }>;
+/** Sampled video frames carry an "<assetId>:f<frame>" id; photos keep their library id. */
+const isVideoFrame = (assetId: string) => /:f\d+$/.test(assetId);
+function mediaResponse(body: Record<string, unknown>, risks: RiskFixture = [], frameRisks: RiskFixture = []) {
   const content = (body.input as Array<{ content: Array<{ type: string; text?: string }> }>)[0].content;
   const last = content.filter((part) => part.type === "input_text").at(-1)!.text!;
   const ids = JSON.parse(last.slice(last.indexOf("exactly once: ") + "exactly once: ".length).replace(/\.$/, "")) as string[];
@@ -84,7 +87,7 @@ function mediaResponse(body: Record<string, unknown>, risks: ReadonlyArray<{ kin
     assetId, depicts: "A synthetic cup shape on a plain background", subjectKind: "dish_or_drink", matchedOfferingIds: ["offering-1"],
     primarySubject: { label: "synthetic cup", box: { x_min: 300, y_min: 250, x_max: 700, y_max: 750 } },
     technicalQuality: { sharpness: "good", lighting: "good", composition: "good" }, goalFit: "strong", goalReason: "Shows a drink", heroWorthy: index === 0, heroReason: "Centered",
-    suitableFor: ["reel_hero", "carousel", "story", "feed", "ad", "whatsapp"], risks, visibleText: "",
+    suitableFor: ["reel_hero", "carousel", "story", "feed", "ad", "whatsapp"], risks: isVideoFrame(assetId) ? frameRisks : risks, visibleText: "",
   })) });
 }
 
@@ -147,8 +150,10 @@ async function syntheticPhoto(path: string, background: string, cup: string, var
 async function harness(name: string, options: {
   photos?: number; clip?: boolean; website?: boolean; caps?: Partial<Record<AutopilotRole, number>>; findings?: Finding[];
   realStillDepth?: boolean; realTracked?: boolean; renderKit?: AutopilotDependencies["renderKit"];
-  /** Risks reported for every analyzed image (e.g. a possible minor excludes them all). */
+  /** Risks reported for every analyzed photo (e.g. a possible minor excludes them all). */
   imageRisks?: Array<{ kind: string; box: null; note: string }>;
+  /** Risks reported for every safety-check frame sampled from the owner clip. */
+  frameRisks?: Array<{ kind: string; box: null; note: string }>;
   /** The instagram_reels body carries removable review wording, so the critic's fix re-renders the Reel. */
   reelDraft?: boolean;
 } = {}): Promise<Harness> {
@@ -195,7 +200,7 @@ async function harness(name: string, options: {
     openBusinessLibrary: async (directory) => (await lstat(directory).then(() => true, () => false)) ? MediaLibrary.open(directory) : null,
     collectGallery: gallery,
     harvestOwnerMeta: async () => ({ connected: false, imported: 0, notes: [] }),
-    analyzeMedia: (request, dependencies) => analyzeMediaAssets(request, { ...dependencies, client: fakeClient((body) => { calls.media++; return mediaResponse(body, options.imageRisks); }) }),
+    analyzeMedia: (request, dependencies) => analyzeMediaAssets(request, { ...dependencies, client: fakeClient((body) => { calls.media++; return mediaResponse(body, options.imageRisks, options.frameRisks); }) }),
     analyzeShots: (request, dependencies) => analyzeClipShots(request, { ...dependencies, client: fakeClient(() => { calls.shotlog++; return shotResponse(); }) }),
     segment: (request, dependencies) => segmentMetaImage(request, { ...dependencies, client: fakeClient(() => { calls.samImage++; return samImageResponse(request); }) }),
     trackVideo: (request: SamVideoRequest, dependencies) => trackMetaVideo(request, { ...dependencies, client: fakeClient(() => { calls.samVideo++; return samVideoResponse(request.clip); }) }),
@@ -263,12 +268,20 @@ describe("Autopilot production pipeline", () => {
     expect(quality.mediaExcluded).toBe(0);
     expect(quality.criticVerdict).toBe("blocking_findings");
     expect(quality.findings).toBe(2);
-    // The concept archive bundles the withheld file, so it is withheld with it.
-    expect(quality.withheldFiles).toEqual(["campaign-concept.zip", "facebook_ads.png"]);
+    // The branded photo's pixels are withheld wherever they appear: every kit file rendered from the
+    // same source photo, its SAM mask preview and, with a withheld Reel, the tracking overlay of the
+    // same footage. The concept archive bundles the withheld files, so it is withheld with them.
+    const brandedPhoto = (await readPublicState(outputDir))!.plan!.channelAssets.facebook_ads!;
+    expect(quality.withheldFiles).toEqual(expect.arrayContaining(["campaign-concept.zip", "facebook_ads.png", "facebook_ads_portrait.png", `sam-mask-${brandedPhoto}.png`]));
+    if (quality.withheldFiles.includes("instagram_reel.mp4")) expect(quality.withheldFiles).toContain("sam-tracking-overlay.mp4");
     const approvable = approvableFiles(result.campaign, quality.withheldFiles).map((file) => file.filename);
     expect(approvable).not.toContain("facebook_ads.png");
     expect(approvable).not.toContain("campaign-concept.zip");
-    expect(approvable).toContain("instagram_feed.png");
+    expect(approvable).not.toContain(`sam-mask-${brandedPhoto}.png`);
+    // The other photo's files stay approvable.
+    expect(approvable.filter((file) => file.startsWith("sam-mask-"))).toHaveLength(1);
+    expect(approvable.some((file) => /^(instagram|facebook|click|whatsapp)_[a-z_0-9]*\.png$/.test(file))).toBe(true);
+    expect(quality.notes.join(" ")).toMatch(/built from the same photo or footage/);
     expect(quality.notes.join(" ")).toMatch(/campaign-concept\.zip contains the withheld files/);
     expect(quality.fixesApplied.some((fix) => fix.includes("Withheld facebook_ads"))).toBe(true);
     expect(quality.fixesApplied.some((fix) => fix.includes("instagram_feed body"))).toBe(true);
@@ -296,6 +309,8 @@ describe("Autopilot production pipeline", () => {
     expect(criticJson.verdict).toBe("blocking_findings");
     expect(criticJson.withheldFiles).toEqual(["facebook_ads.png"]);
     expect(criticJson.changedAfterCritique).toContain("instagram_feed.png");
+    // The Reel only received a recommendation (minor visual note): it never "changed after the critique".
+    expect(criticJson.changedAfterCritique).not.toContain("instagram_reel.mp4");
 
     // Director's room: progression, previews and the critic panel.
     expect(h.stages).toEqual(["harvest", "copy", "analyze", "direct", "segment", "reel", "render", "critique", "export"]);
@@ -308,7 +323,7 @@ describe("Autopilot production pipeline", () => {
     expect(state.plan?.reelMode).toBe("tracked_video");
     expect(state.sam.map((record) => record.status)).toEqual(["segmented", "segmented", "tracked"]);
     expect(state.sam[2].overlayVideo).toBe("sam-overlay.mp4");
-    expect(state.critic?.withheld).toEqual(["campaign-concept.zip", "facebook_ads.png"]);
+    expect(state.critic?.withheld).toEqual(quality.withheldFiles);
     for (const name of [state.media[0].thumb!, state.sam[0].preview!, "sam-overlay.mp4", "reel-cover.jpg"]) expect(await readPublicFile(outputDir, name)).not.toBeNull();
     expect(JSON.stringify(state)).not.toContain(root);
   }, 400_000);
@@ -452,6 +467,20 @@ describe("Autopilot production pipeline", () => {
     expect(h.calls).toMatchObject({ samImage: 0, samVideo: 1 });
   }, 400_000);
 
+  test("owner footage whose sampled frames show a possible minor is never tracked, even with recorded consent", async () => {
+    const possibleMinor = [{ kind: "possible_minor", box: null, note: "A synthetic small figure." }];
+    const h = await harness("footage-minor", { photos: 1, clip: true, frameRisks: possibleMinor });
+    const result = await produceAutopilotCampaign(h.input, h.deps);
+    // The frames went through the same paid image-analysis request as the photo; no shot log or SAM video follows.
+    expect(h.calls).toMatchObject({ media: 1, shotlog: 0, samVideo: 0 });
+    expect(result.quality.reelMode).toBe("still_depth");
+    expect(result.quality.mediaExcluded).toBe(1);
+    const director = JSON.parse(await kitFile(h.input.outputDir, "director-report.json")) as { reel: { mode: string } };
+    expect(director.reel.mode).toBe("still_depth");
+    const state = (await readPublicState(h.input.outputDir))!;
+    expect(state.media.find((media) => media.kind === "video")).toMatchObject({ status: "excluded" });
+  }, 400_000);
+
   test("without usable media the campaign uses one labelled Muse illustration, and typography once that budget is gone", async () => {
     let images = 0;
     const withIllustration = async (caps?: Partial<Record<AutopilotRole, number>>, name = "illustration") => {
@@ -477,6 +506,47 @@ describe("Autopilot production pipeline", () => {
     expect(typography.result.quality.reelMode).toBe("legacy");
     expect(typography.result.campaign.visual?.kind).toBe("typography");
     expect(typography.result.quality.notes.join(" ")).toMatch(/illustration budget/);
+  }, 400_000);
+
+  test("a critical finding the critic could not attribute to one file withholds the whole kit from approval", async () => {
+    const h = await harness("unattributed", {
+      photos: 1,
+      findings: [{ assetId: "instagram_feed_final.png", severity: "critical", rule: "person_without_consent", description: "A synthetic identifiable face.", box: null, timeSeconds: null }],
+    });
+    const result = await produceAutopilotCampaign(h.input, h.deps);
+    expect(result.quality.criticVerdict).toBe("blocking_findings");
+    expect(result.quality.findings).toBe(0);
+    expect(result.quality.withheldFiles).toEqual(result.campaign.assets.map((asset) => asset.filename).sort());
+    expect(approvableFiles(result.campaign, result.quality.withheldFiles)).toEqual([]);
+    expect(result.quality.notes.join(" ")).toMatch(/could not attribute to one file, so every file is withheld/);
+    expect((await readPublicState(h.input.outputDir))?.critic?.withheld).toEqual(result.quality.withheldFiles);
+  }, 400_000);
+
+  test("a paid step that fails with an unknown outcome is never reported as a safe retry, and is not repeated", async () => {
+    const h = await harness("copy-lost", {});
+    h.deps.ensureCopy = async (_input, copyOptions) => {
+      await copyOptions?.reserveCopyCall?.();
+      h.calls.copy++;
+      // As copy.ts does for a response Meta did not complete: thrown before anything is stored.
+      throw new Error("Meta did not complete the campaign draft.");
+    };
+    await expect(produceAutopilotCampaign(h.input, h.deps)).rejects.toBeInstanceOf(AutopilotPaidStepError);
+    // A retry finds no stored copy, and the role cap refuses a second paid copy request.
+    await expect(produceAutopilotCampaign(h.input, h.deps)).rejects.toBeInstanceOf(AutopilotBudgetError);
+    expect(h.calls.copy).toBe(1);
+    expect(h.runCalls.count).toBe(1);
+
+    // The illustration step: its response is lost after the paid request (for example an undecodable image).
+    const visual = await harness("visual-lost", {});
+    let images = 0;
+    visual.deps.prepareVisual = async (input) => {
+      if (images === 0) await input.reserveModelCall?.();
+      images++;
+      throw new Error(images === 1 ? "Input buffer contains unsupported image format" : "A Muse image request for this campaign was started but its response is not stored.");
+    };
+    await expect(produceAutopilotCampaign(visual.input, visual.deps)).rejects.toBeInstanceOf(AutopilotPaidStepError);
+    await expect(produceAutopilotCampaign(visual.input, visual.deps)).rejects.toBeInstanceOf(AutopilotPaidStepError);
+    expect((await visual.budget.counts()).muse_image).toBe(1);
   }, 400_000);
 
   test("a lost lease stops before the first paid request", async () => {

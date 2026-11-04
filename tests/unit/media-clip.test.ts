@@ -8,8 +8,9 @@ import sharp from "sharp";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import type { NormalizedClip, OwnerMediaConsent } from "../../lib/media/cinema-types";
 import {
-  chooseClipWindow, extractClipFramePng, normalizeOwnerClip, OwnerClipError, probeMedia, readClipFrames, verifyNormalizedClip, videoDynamicRange,
+  chooseClipWindow, extractClipFramePng, MAX_OWNER_CLIP_INPUT_SECONDS, normalizeOwnerClip, OwnerClipError, probeMedia, readClipFrames, verifyNormalizedClip, videoDynamicRange,
 } from "../../lib/media/clip";
+import { MAX_OWNER_VIDEO_SECONDS } from "../../lib/media/uploads";
 
 // Every input here is synthetic: FFmpeg lavfi test patterns and sine tones generated locally.
 const run = promisify(execFile);
@@ -65,7 +66,9 @@ beforeAll(async () => {
     synth("synthetic-base.mp4", [...pattern("320x240", 30, 2), ...x264]),
     synth("synthetic-vp9.webm", [...pattern("256x144", 24, 2), "-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8", "-b:v", "300k"]),
     synth("synthetic-long.mp4", [...pattern("160x120", 30, 30), ...x264]),
-    synth("synthetic-too-long.mp4", [...pattern("64x64", 1, 181), ...x264]),
+    synth("synthetic-too-long.mp4", [...pattern("64x64", 1, 601), ...x264]),
+    // Longer than the old 180 s cap but within the 600 s upload limit (a shop walkthrough).
+    synth("synthetic-walkthrough.mp4", [...pattern("160x120", 2, 240), ...x264]),
     synth("synthetic-large.mp4", [...pattern("1922x1082", 30, 1), ...x264]),
     synth("synthetic-still.png", [...pattern("128x128", 1, 1), "-frames:v", "1"]),
     synth("synthetic-anim.gif", [...pattern("96x96", 10, 1)]),
@@ -197,7 +200,14 @@ describe("normalizeOwnerClip", () => {
     await expectClipError(normalizeOwnerClip({ sourcePath: fixture("synthetic-long.mp4"), outputDir: outputDir(), consent, startSeconds: 31 }), "INVALID_REQUEST");
   }, 90_000);
 
-  test("rejects inputs longer than 180 s, still images, GIFs and audio-only files", async () => {
+  test("accepts any duration owner intake accepts and reads only the window (240 s walkthrough)", async () => {
+    expect(MAX_OWNER_CLIP_INPUT_SECONDS).toBe(MAX_OWNER_VIDEO_SECONDS);
+    const clip = await normalizeOwnerClip({ sourcePath: fixture("synthetic-walkthrough.mp4"), outputDir: outputDir(), consent, maxSeconds: 4 });
+    expect(clip.original.durationSeconds).toBeGreaterThan(180);
+    expect(clip.durationSeconds).toBeCloseTo(4, 1);
+  }, 90_000);
+
+  test("rejects inputs longer than the 600 s intake limit, still images, GIFs and audio-only files", async () => {
     const dir = outputDir();
     await expectClipError(normalizeOwnerClip({ sourcePath: fixture("synthetic-too-long.mp4"), outputDir: dir, consent }), "SOURCE_TOO_LONG");
     await expectClipError(normalizeOwnerClip({ sourcePath: fixture("synthetic-still.png"), outputDir: dir, consent }), "UNSUPPORTED_MEDIA");

@@ -1,10 +1,12 @@
-import { execFile } from "node:child_process";
 import { lstat, mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { promisify } from "node:util";
 import sharp from "sharp";
+import { extractVideoPosterPng } from "../media/poster";
 import { collectOfficialGallery, type OfficialGalleryResult } from "../media/gallery";
-import { MediaLibrary, MediaLibraryError, mediaLibraryIntegrityKey, type MediaAssetRecord, type MetaGraphMediaItem } from "../media/library";
+import { MAX_LIBRARY_ASSETS, MAX_LIBRARY_VIDEOS, MediaLibrary, MediaLibraryError, mediaLibraryIntegrityKey, type MediaAssetRecord, type MetaGraphMediaItem } from "../media/library";
+import { MAX_OWNER_VIDEO_SECONDS } from "../media/uploads";
+import type { OwnerMediaSource } from "../meta/graph";
+import type { MetaAttestationRecord } from "./business-media";
 import type { OwnerMediaConsent } from "../media/cinema-types";
 import { validateSourceUrl } from "../research/source-reader";
 import type { BusinessContext, CollectedSource } from "../research/contracts";
@@ -20,10 +22,6 @@ export const HARVEST_MAX_IMAGES = 40;
 export const HARVEST_MAX_VIDEOS = 4;
 export const THUMB_LONG_SIDE = 480;
 const META_LIST_LIMIT = 25;
-const POSTER_TIMEOUT_MS = 20_000;
-const POSTER_MAX_BUFFER = 16 * 1024 * 1024;
-const DEMUXERS = "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm";
-const execFileAsync = promisify(execFile);
 
 export interface HarvestedAsset {
   assetId: string;
@@ -75,8 +73,35 @@ export function officialWebsiteFor(business: Pick<BusinessContext, "website">, s
   return null;
 }
 
+/**
+ * The connected Page (and its linked Instagram account) this business's media may come from.
+ * Nothing at connect time records which Page belongs to which business, and one Meta login's
+ * grants cover every business that login connected, so media is used only when the token grants
+ * exactly one Page and that Page (and Instagram account) is the one shown when the owner connected.
+ * Otherwise another branch's or business's media would be presented as this business's own.
+ */
+export function boundMetaSources(
+  listing: { sources: readonly OwnerMediaSource[]; truncated: boolean },
+  attestation: Pick<MetaAttestationRecord, "pageName" | "instagramUsername">,
+  profile: (sources: OwnerMediaSource[]) => Pick<MetaAttestationRecord, "pageName" | "instagramUsername">,
+): { sources: OwnerMediaSource[]; note: null } | { sources: []; note: string | null } {
+  const pages = listing.sources.filter((source) => source.kind === "facebook_page");
+  if (!pages.length && !listing.truncated) return { sources: [], note: null };
+  if (pages.length !== 1 || listing.truncated) {
+    return { sources: [], note: `The Meta connection gives access to ${listing.truncated ? "many" : pages.length} Facebook Pages, so Autopilot cannot tell which one is this business; connected media was not used. Reconnect and grant access only to this business's Page.` };
+  }
+  const page = pages[0];
+  const bound = [page, ...listing.sources.filter((source) => source.kind === "instagram_account" && source.pageId === page.id)];
+  const current = profile(bound);
+  if ((attestation.pageName !== null && current.pageName !== attestation.pageName) || (attestation.instagramUsername !== null && current.instagramUsername !== attestation.instagramUsername)) {
+    return { sources: [], note: "The connected Facebook Page or Instagram account no longer matches the one recorded when you connected, so its media was not used. Reconnect Instagram/Facebook for this business." };
+  }
+  return { sources: bound, note: null };
+}
+
 const isOwner = (provenance: MediaProvenance) => provenance === "owner_upload" || provenance === "owner_instagram" || provenance === "owner_facebook";
 const recency = (asset: Pick<MediaAssetRecord, "capturedAt" | "addedAt">) => asset.capturedAt ?? asset.addedAt;
+const newestFirst = (a: MediaAssetRecord, b: MediaAssetRecord) => recency(b).localeCompare(recency(a)) || a.id.localeCompare(b.id);
 
 /**
  * Deterministic selection under the caps: owner media first (most recent first), then website
@@ -85,8 +110,7 @@ const recency = (asset: Pick<MediaAssetRecord, "capturedAt" | "addedAt">) => ass
 export function selectHarvest(assets: readonly MediaAssetRecord[], caps = { images: HARVEST_MAX_IMAGES, videos: HARVEST_MAX_VIDEOS }): { selected: MediaAssetRecord[]; overflow: { images: number; videos: number } } {
   const usable = assets.filter((asset) => asset.provenance !== "meta_illustration");
   const ordered = (kind: "image" | "video") => {
-    const owner = usable.filter((asset) => asset.kind === kind && isOwner(asset.provenance))
-      .sort((a, b) => recency(b).localeCompare(recency(a)) || a.id.localeCompare(b.id));
+    const owner = usable.filter((asset) => asset.kind === kind && isOwner(asset.provenance)).sort(newestFirst);
     const website = usable.filter((asset) => asset.kind === kind && asset.provenance === "official_website")
       .sort((a, b) => a.addedAt.localeCompare(b.addedAt) || a.id.localeCompare(b.id));
     return [...owner, ...website];
@@ -111,27 +135,11 @@ export function openRunLibrary(outputDir: string): Promise<MediaLibrary> {
   return MediaLibrary.open(outputDir, { integrityKey: mediaLibraryIntegrityKey() });
 }
 
-/** Minimal child environment: server credentials never reach FFmpeg. */
-function toolEnv(): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { NODE_ENV: process.env.NODE_ENV, PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin" };
-  if (process.env.LD_LIBRARY_PATH) env.LD_LIBRARY_PATH = process.env.LD_LIBRARY_PATH;
-  return env;
-}
-
-/** One PNG poster frame from a private local video (file protocol, allow-listed demuxers, bounded output). */
+/** One PNG poster frame from a private local video (shared hardened helper; HDR/BT.2020 tone mapped to BT.709 SDR). */
 export async function videoPoster(path: string, durationSeconds: number | null, maxSide = THUMB_LONG_SIDE): Promise<Buffer> {
-  const preferred = durationSeconds !== null && durationSeconds > 1.5 ? Math.min(1, durationSeconds / 3) : 0;
-  for (const at of preferred > 0 ? [preferred, 0] : [0]) {
-    try {
-      const { stdout } = await execFileAsync("ffmpeg", [
-        "-hide_banner", "-loglevel", "error", "-nostdin", "-threads", "2", "-protocol_whitelist", "file,pipe", "-format_whitelist", DEMUXERS,
-        "-ss", at.toFixed(3), "-i", `file:${path}`, "-map", "0:v:0", "-an", "-sn", "-dn", "-frames:v", "1",
-        "-vf", `scale=w=${maxSide}:h=${maxSide}:force_original_aspect_ratio=decrease`, "-f", "image2pipe", "-c:v", "png", "pipe:1",
-      ], { encoding: "buffer", timeout: POSTER_TIMEOUT_MS, maxBuffer: POSTER_MAX_BUFFER, killSignal: "SIGKILL", windowsHide: true, env: toolEnv() });
-      if (stdout.length > 8) return stdout;
-    } catch { /* Try the first frame; child errors carry local paths and are never forwarded. */ }
-  }
-  throw new Error("A preview frame could not be read from a harvested video.");
+  const poster = await extractVideoPosterPng(path, durationSeconds, maxSide);
+  if (!poster) throw new Error("A preview frame could not be read from a harvested video.");
+  return poster;
 }
 
 /** ≤480 px JPEG thumbnail without metadata (video → poster frame). */
@@ -166,7 +174,7 @@ export const defaultHarvestDependencies: HarvestDependencies = {
  * valid stored token; bytes come from Meta CDNs only. Newest first, bounded per kind.
  */
 export async function harvestOwnerMetaMedia(input: { businessId: string; connectionsDir: string; library: MediaLibrary; workDir: string; maxImages: number; maxVideos: number }): Promise<MetaHarvestOutcome> {
-  const [{ readMetaAttestation, metaAttestationConsent }, graph, { loadOwnerToken }, { downloadMetaCdnMedia }] = await Promise.all([
+  const [{ readMetaAttestation, metaAttestationConsent, connectionProfile }, graph, { loadOwnerToken }, { downloadMetaCdnMedia }] = await Promise.all([
     import("./business-media"), import("../meta/graph"), import("../meta/graph-tokens"), import("../media/meta-cdn"),
   ]);
   if (graph.getMetaConnectorStatus().status !== "ready") return { connected: false, imported: 0, notes: [] };
@@ -180,19 +188,24 @@ export async function harvestOwnerMetaMedia(input: { businessId: string; connect
   const consent = metaAttestationConsent(attestation);
   const notes: string[] = [];
   const items: Awaited<ReturnType<typeof graph.listOwnerMedia>>["items"] = [];
+  let bound: OwnerMediaSource[];
   try {
-    const { sources } = await graph.listOwnerMediaSources(token.record.accessToken);
-    for (const source of sources.slice(0, 4)) {
-      try { items.push(...(await graph.listOwnerMedia(token.record.accessToken, source, { limit: META_LIST_LIMIT })).items); }
-      catch { notes.push("One connected account's media could not be listed; it was skipped."); }
-    }
+    const binding = boundMetaSources(await graph.listOwnerMediaSources(token.record.accessToken), attestation, connectionProfile);
+    if (binding.note) return { connected: true, imported: 0, notes: [binding.note] };
+    bound = binding.sources;
   } catch {
     return { connected: true, imported: 0, notes: ["The connected Instagram/Facebook accounts could not be listed; Autopilot continued with the other media."] };
   }
+  for (const source of bound) {
+    try { items.push(...(await graph.listOwnerMedia(token.record.accessToken, source, { limit: META_LIST_LIMIT })).items); }
+    catch { notes.push("One connected account's media could not be listed; it was skipped."); }
+  }
+  const boundIds = new Set(bound.map((source) => source.id));
   const newest = (a: { timestamp: string | null }, b: { timestamp: string | null }) => (b.timestamp ?? "").localeCompare(a.timestamp ?? "");
+  const usable = items.filter((item) => boundIds.has(item.sourceAccountId) && !(item.kind === "video" && item.durationSeconds !== null && item.durationSeconds > MAX_OWNER_VIDEO_SECONDS));
   const chosen = [
-    ...items.filter((item) => item.kind === "image").sort(newest).slice(0, input.maxImages),
-    ...items.filter((item) => item.kind === "video").sort(newest).slice(0, input.maxVideos),
+    ...usable.filter((item) => item.kind === "image").sort(newest).slice(0, Math.max(0, input.maxImages)),
+    ...usable.filter((item) => item.kind === "video").sort(newest).slice(0, Math.max(0, input.maxVideos)),
   ];
   const downloads = join(input.workDir, "meta-cdn");
   await mkdir(downloads, { recursive: true, mode: 0o700 });
@@ -218,7 +231,10 @@ export async function harvestOwnerMetaMedia(input: { businessId: string; connect
 
 /**
  * Builds the run library and selects at most 40 images and 4 videos. Each source is optional:
- * a source that fails is reported in the notes and the others continue.
+ * a source that fails is reported in the notes and the others continue. The caps apply BEFORE
+ * anything is copied: only the newest uploads that can still make the selection are verified and
+ * copied, connected-account downloads stop at the library's remaining room, and copies the final
+ * selection leaves out are removed from the run library.
  */
 export async function harvestMedia(input: {
   outputDir: string; workDir: string; businessId: string; businessMediaDir: string; connectionsDir: string; website: string | null;
@@ -230,16 +246,34 @@ export async function harvestMedia(input: {
   let business: MediaLibrary | null = null;
   try { business = await dependencies.openBusinessLibrary(input.businessMediaDir, input.businessId); }
   catch { notes.push("The owner's uploaded media could not be verified, so it was not used. Re-upload it or ask the operator to check the server secret."); }
+  const uploadOverflow = { images: 0, videos: 0 };
   if (business) {
-    const uploads = (await business.listAssets({ provenance: "owner_upload" })).sort((a, b) => b.addedAt.localeCompare(a.addedAt));
+    const uploads = (await business.listAssets({ provenance: "owner_upload" })).sort(newestFirst);
     let skipped = 0;
-    for (const upload of uploads) {
+    // Owner media ranks newest first, so uploads past the per-kind cap can never be selected: they
+    // are neither re-hashed nor copied. A failed upload lets the next newest one take its place.
+    const accepted: MediaAssetRecord[] = [];
+    for (const kind of ["image", "video"] as const) {
+      const cap = kind === "image" ? HARVEST_MAX_IMAGES : HARVEST_MAX_VIDEOS;
+      const ofKind = uploads.filter((upload) => upload.kind === kind);
+      let taken = 0, index = 0;
+      for (; index < ofKind.length && taken < cap; index++) {
+        try { accepted.push(await business.verifyAsset(ofKind[index].id)); taken++; }
+        catch (error) {
+          if (error instanceof MediaLibraryError && ["MANIFEST_INVALID", "MANIFEST_TAMPERED", "MANIFEST_KEY_REQUIRED", "LIBRARY_INVALID"].includes(error.code)) throw error;
+          skipped++;
+        }
+      }
+      uploadOverflow[kind === "image" ? "images" : "videos"] += ofKind.length - index;
+    }
+    // Oldest first, so the run library's own added-at order keeps the owner's newest upload newest.
+    for (const verified of accepted.reverse()) {
       try {
-        const verified = await business.verifyAsset(upload.id);
-        await library.addAsset({
+        const result = await library.addAsset({
           kind: verified.kind, provenance: "owner_upload", filePath: verified.localPath, mimeType: verified.mimeType, expectedSha256: verified.sha256,
           consent: verified.consent, capturedAt: verified.capturedAt, caption: verified.caption, hints: { originalName: verified.hints.originalName },
         });
+        if (result.status === "rejected") skipped++;
       } catch (error) {
         if (error instanceof MediaLibraryError && ["MANIFEST_INVALID", "MANIFEST_TAMPERED", "MANIFEST_KEY_REQUIRED", "LIBRARY_INVALID"].includes(error.code)) throw error;
         skipped++;
@@ -249,7 +283,12 @@ export async function harvestMedia(input: {
   }
 
   try {
-    const outcome = await dependencies.harvestOwnerMeta({ businessId: input.businessId, connectionsDir: input.connectionsDir, library, workDir: input.workDir, maxImages: HARVEST_MAX_IMAGES, maxVideos: HARVEST_MAX_VIDEOS });
+    // Never download what the run library has no room for (owner uploads outrank connected media).
+    const held = await library.listAssets();
+    const videosHeld = held.filter((asset) => asset.kind === "video").length;
+    const maxVideos = Math.max(0, Math.min(HARVEST_MAX_VIDEOS, MAX_LIBRARY_VIDEOS - videosHeld, MAX_LIBRARY_ASSETS - held.length));
+    const maxImages = Math.max(0, Math.min(HARVEST_MAX_IMAGES, MAX_LIBRARY_ASSETS - held.length - maxVideos));
+    const outcome = await dependencies.harvestOwnerMeta({ businessId: input.businessId, connectionsDir: input.connectionsDir, library, workDir: input.workDir, maxImages, maxVideos });
     connected = outcome.connected;
     notes.push(...outcome.notes);
   } catch (error) {
@@ -271,8 +310,15 @@ export async function harvestMedia(input: {
     } finally { await rm(galleryDir, { recursive: true, force: true }).catch(() => undefined); }
   }
 
-  const { selected, overflow } = selectHarvest(await library.listAssets());
-  if (overflow.images || overflow.videos) notes.push(`Autopilot used the ${HARVEST_MAX_IMAGES} most relevant images and ${HARVEST_MAX_VIDEOS} most recent videos; ${overflow.images + overflow.videos} more item${overflow.images + overflow.videos === 1 ? " was" : "s were"} left out.`);
+  const held = await library.listAssets();
+  const { selected, overflow: libraryOverflow } = selectHarvest(held);
+  // Copies the selection leaves out are private duplicates nothing uses: remove them now.
+  const keep = new Set(selected.map((asset) => asset.id));
+  const unused = held.filter((asset) => !keep.has(asset.id) && asset.provenance !== "meta_illustration").map((asset) => asset.id);
+  if (unused.length) await library.removeAssets(unused);
+  const overflow = { images: libraryOverflow.images + uploadOverflow.images, videos: libraryOverflow.videos + uploadOverflow.videos };
+  const leftOut = overflow.images + overflow.videos;
+  if (leftOut) notes.push(`Autopilot used the ${HARVEST_MAX_IMAGES} most relevant images and ${HARVEST_MAX_VIDEOS} most recent videos; ${leftOut} more item${leftOut === 1 ? " was" : "s were"} left out.`);
   const count = (provenance: MediaProvenance) => selected.filter((asset) => asset.provenance === provenance).length;
   return {
     library, selected,

@@ -998,6 +998,8 @@ select { font: inherit; color: inherit; }
 .ap-approval-files li { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; padding: 8px 0; border-bottom: 1px solid #eef0e7; color: #6d7563; }
 .ap-approval-files li:last-child { border-bottom: 0; }
 .ap-approval-files li code { overflow-wrap: anywhere; color: #2f3b2d; }
+.ap-approval-files li a { display: inline-flex; align-items: center; gap: 6px; color: #2f3b2d; font-weight: 600; overflow-wrap: anywhere; }
+.ap-approval-files li a:focus-visible { outline: 2px solid #4b6958; outline-offset: 2px; border-radius: 4px; }
 .ap-approval-files > .ap-fineprint { margin-top: 8px; }
 .ap-carousel li.is-withheld { border-color: #edc8bd; }
 .ap-carousel li.is-withheld > .ap-boxed { opacity: .55; }

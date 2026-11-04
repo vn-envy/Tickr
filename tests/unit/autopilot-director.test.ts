@@ -22,7 +22,7 @@ function image(id: string, overrides: Partial<NonNullable<AnalyzedAsset["analysi
   };
 }
 function video(id: string, moments: NonNullable<AnalyzedAsset["shotLog"]>["moments"], asset: Partial<AnalyzedAsset> = {}): AnalyzedAsset {
-  return { assetId: id, kind: "video", provenance: "owner_upload", rights: "owner_attested", width: 720, height: 1280, durationSeconds: 20, consent: { peopleVisibleHaveConsented: "no_people" }, analysis: null, shotLog: { heroMomentSeconds: 9, peopleVisible: false, moments }, ...asset };
+  return { assetId: id, kind: "video", provenance: "owner_upload", rights: "owner_attested", width: 720, height: 1280, durationSeconds: 20, consent: { peopleVisibleHaveConsented: "no_people" }, analysis: null, shotLog: { heroMomentSeconds: 9, peopleVisible: false, moments }, frameRisks: { framesChecked: 8, risks: [] }, ...asset };
 }
 
 describe("Autopilot director", () => {
@@ -75,6 +75,30 @@ describe("Autopilot director", () => {
     ] });
     expect(plan.reel.mode).toBe("still_depth");
     expect(plan.excluded.map((item) => item.assetId)).toEqual(["crowd"]);
+  });
+
+  it("applies the image risk exclusions to footage frames, even with the blanket connected-account consent", () => {
+    const steady = [{ startSeconds: 0, endSeconds: 10, kind: "hero_product" as const, steadiness: "steady" as const, subjectLabel: "cake", goalFit: "strong" as const }];
+    const attested = { consent: { peopleVisibleHaveConsented: true as const }, provenance: "owner_instagram" as const };
+    const frames = (kind: "possible_minor" | "third_party_logo" | "other_business_signage" | "price_or_offer_text") => ({ framesChecked: 4, risks: [{ kind, atSeconds: 3 }] });
+    const plan = planProduction({ focusOfferingId: null, offerApproved: false, assets: [
+      image("still"),
+      video("minor", steady, { ...attested, frameRisks: frames("possible_minor") }),
+      video("logo", steady, { ...attested, frameRisks: frames("third_party_logo") }),
+      video("signage", steady, { ...attested, frameRisks: frames("other_business_signage") }),
+      video("price", steady, { ...attested, frameRisks: frames("price_or_offer_text") }),
+      video("unchecked", steady, { ...attested, frameRisks: null }),
+      video("unchecked-legacy", steady, { ...attested, frameRisks: undefined }),
+      video("zero-frames", steady, { ...attested, frameRisks: { framesChecked: 0, risks: [] } }),
+    ] });
+    expect(plan.excluded.map((item) => item.assetId).sort()).toEqual(["logo", "minor", "price", "signage", "unchecked", "unchecked-legacy", "zero-frames"]);
+    expect(plan.excluded.find((item) => item.assetId === "minor")?.reasons.join(" ")).toContain("possible minor");
+    expect(plan.excluded.find((item) => item.assetId === "unchecked")?.reasons.join(" ")).toContain("frames were not checked");
+    expect(plan.reel.mode).toBe("still_depth");
+    // An approved offer allows price text in footage exactly as it does in photos.
+    const approved = planProduction({ focusOfferingId: null, offerApproved: true, assets: [video("price", steady, { ...attested, frameRisks: frames("price_or_offer_text") })] });
+    expect(approved.excluded).toEqual([]);
+    expect(approved.reel).toEqual(expect.objectContaining({ mode: "tracked_video", clipAssetId: "price" }));
   });
 
   it("falls back to a labelled illustration when no real media qualifies", () => {

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  billableFromFailure, createDryClients, diagnoseLiveCheckError, estimateLiveCheckCost, formatLiveCheckTable, MISSING_KEY_MESSAGE, parseLiveCheckArguments, runAutopilotLiveCheck,
+  billableFromFailure, createDryClients, diagnoseLiveCheckError, estimateLiveCheckCost, formatLiveCheckTable, MISSING_KEY_MESSAGE, parseLiveCheckArguments, runAutopilotLiveCheck, STILL_PROBE_PROVENANCE,
   type AdapterDiagnostic, type DryFaults, type LiveCheckOutcome, type LiveCheckStep,
 } from "../../scripts/autopilot-live-check";
 
@@ -64,6 +64,10 @@ describe("autopilot live check --dry", () => {
     const render = outcome.report!.steps.find((step) => step.id === "reel-render")!.facts as Record<string, Record<string, unknown>>;
     expect(render.stillDepth).toMatchObject({ status: "rendered", conceptLabel: "SYNTHETIC DEMO · CONCEPT", generatedPixelsOnSubject: 0 });
     expect(render.trackedReel).toMatchObject({ status: "rendered", conceptLabel: "SYNTHETIC DEMO · CONCEPT", generatedPixelsOnSubject: 0, endCard: "still_depth" });
+    // The tracked Reel's end card is the synthetic probe still: it is never labelled as owner media.
+    expect(render.stillDepth).toMatchObject({ provenanceLabel: STILL_PROBE_PROVENANCE });
+    expect(render.trackedReel).toMatchObject({ endCardProvenanceLabel: STILL_PROBE_PROVENANCE });
+    expect(String(render.trackedReel.endCardProvenanceLabel)).not.toMatch(/owner/i);
     expect(render.overlay).toMatchObject({ status: "rendered", label: "ANALYSIS PREVIEW · NOT CAMPAIGN CREATIVE" });
     expect(outcome.report!.steps.find((step) => step.id === "spark-critic")!.facts).toMatchObject({ reelAsset: "synthetic-tracked-reel.mp4", verdict: "no_blocking_findings", diagnosticOnly: true });
   });

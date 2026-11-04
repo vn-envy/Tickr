@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import sharp, { type Metadata } from "sharp";
 import { z } from "zod";
 import type { OwnerMediaConsent } from "./cinema-types";
+import { MEDIA_DEMUXER_ALLOWLIST, mediaToolEnv } from "./tool-env";
 
 /**
  * Owner media intake. Bytes are sniffed (never trusted from the declared type or filename),
@@ -223,16 +224,25 @@ const VIDEO_CODECS = new Set(["h264", "hevc", "mpeg4", "vp8", "vp9", "av1"]);
 
 export interface OwnerVideoProbe { width: number; height: number; durationSeconds: number; videoCodec: string; hasAudio: boolean }
 
-/** Local ffprobe (file protocol only, bounded output and time). Width/height are display orientation. */
+/** ffprobe's own arguments for an untrusted owner video: file protocol and allowlisted demuxers only. */
+export function ownerVideoProbeArgs(path: string): string[] {
+  return [
+    "-hide_banner", "-v", "error", "-protocol_whitelist", "file", "-format_whitelist", MEDIA_DEMUXER_ALLOWLIST,
+    "-show_entries", "stream=codec_type,codec_name,width,height:stream_tags=rotate:stream_side_data=rotation:format=format_name,duration",
+    "-of", "json", `file:${path}`,
+  ];
+}
+
+/**
+ * Local ffprobe (file protocol and allowlisted demuxers only, bounded output and time). This is the
+ * first full parser of uploaded bytes, so the child gets a minimal environment without server
+ * credentials and is SIGKILLed on timeout. Width/height are display orientation.
+ */
 export async function probeOwnerVideo(path: string, container: OwnerVideoContainer): Promise<OwnerVideoProbe> {
   if (!isAbsolute(path)) throw new OwnerUploadError("STORAGE_INVALID", "Media storage is not configured correctly.");
   let parsed: z.infer<typeof probeSchema>;
   try {
-    const { stdout } = await run("ffprobe", [
-      "-v", "error", "-protocol_whitelist", "file",
-      "-show_entries", "stream=codec_type,codec_name,width,height:stream_tags=rotate:stream_side_data=rotation:format=format_name,duration",
-      "-of", "json", `file:${path}`,
-    ], { timeout: 20_000, maxBuffer: 256 * 1024, windowsHide: true });
+    const { stdout } = await run("ffprobe", ownerVideoProbeArgs(path), { timeout: 20_000, maxBuffer: 256 * 1024, killSignal: "SIGKILL", windowsHide: true, env: mediaToolEnv() });
     parsed = probeSchema.parse(JSON.parse(stdout));
   } catch {
     throw new OwnerUploadError("VIDEO_DECODE_FAILED", "The video could not be read. Upload an MP4, MOV or WebM file.");

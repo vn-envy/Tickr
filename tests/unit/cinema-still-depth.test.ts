@@ -184,6 +184,24 @@ describe("still-depth Reel", () => {
     expect(worst).toBeLessThan(24);
   });
 
+  test("SAM specks and pin-holes never reach the cutout; the supplied mask is untouched and the refinement is reported", async () => {
+    const mask = await raw(still.subjectMask, 1);
+    expect(mask[704 * 720 + 360]).toBe(255);
+    const noisy = Buffer.from(mask);
+    // 3×3 specks on the wall and the counter, 2×2 pin-holes inside the product.
+    for (const [x, y] of [[50, 300], [650, 200], [100, 1100]]) for (let dy = 0; dy < 3; dy++) for (let dx = 0; dx < 3; dx++) noisy[(y + dy) * 720 + x + dx] = 255;
+    for (const [x, y] of [[360, 700], [330, 650]]) for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++) noisy[(y + dy) * 720 + x + dx] = 0;
+    const noisyPng = await sharp(noisy, { raw: { width: 720, height: 1280, channels: 1 } }).png().toBuffer();
+    const pngBefore = Buffer.from(noisyPng);
+    const refined = await prepareStillDepth(input({ ...still, subjectMask: noisyPng }, dir));
+    expect(noisyPng.equals(pngBefore)).toBe(true);
+    expect(refined.layout.subjectMask).toMatchObject({ removedComponents: 3, removedPixels: 27, filledHoles: 2, filledPixels: 8 });
+    expect(refined.layout.subjectMask.edgeSigma).toBeGreaterThan(0);
+    expect(composer.layout.subjectMask).toMatchObject({ removedComponents: 0, filledHoles: 0 });
+    const digest = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+    for (const frame of [0, 100, 300]) expect(digest(refined.renderFrame(frame)), `frame ${frame}`).toBe(digest(composer.renderFrame(frame)));
+  }, 120_000);
+
   test("every sampled frame keeps the concept and provenance chips on top", () => {
     for (const frame of [0, 45, 87, 90, 150, 179, 230, 266, 270, 359]) {
       const rgba = composer.renderFrame(frame);

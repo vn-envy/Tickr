@@ -7,7 +7,7 @@ import type { AutopilotPublicState } from "@/lib/autopilot/public-state";
 import { CampaignPanel, ExportPanel } from "../research-panels";
 import { BoxedImage } from "./boxed-image";
 import { DirectorLog, MediaWall, PhaseRail, PlanCard, SamPanel, SelectionCard, type StateStatus } from "./directors-room";
-import { APPROVAL_STATEMENT, approvalReview, archiveAsset, autopilotFileUrl, campaignFilename, carouselAssets, deriveRail, findingTarget, formatBytes, REEL_MODE_LABEL, reelAsset, runFileUrl, serverWithheld, shortDigest, trackingOverlay, withoutWithheld } from "./model";
+import { APPROVAL_STATEMENT, approvalReview, approvedDownloads, autopilotFileUrl, campaignFilename, carouselAssets, deriveRail, findingTarget, formatBytes, offerableArchive, REEL_MODE_LABEL, reelAsset, runFileUrl, serverWithheld, shortDigest, trackingOverlay, withoutWithheld } from "./model";
 
 function ReelPlayer({ run, state, withheld }: { run: RunView; state: AutopilotPublicState | null; withheld: ReadonlySet<string> }) {
   const reel = reelAsset(run.campaign);
@@ -80,15 +80,24 @@ function CriticPanel({ run, state }: { run: RunView; state: AutopilotPublicState
   </section>;
 }
 
-function ApprovalBlock({ run, state, onApprove }: { run: RunView; state: AutopilotPublicState | null; onApprove: (digest: string) => Promise<void> }) {
+/** After approval, when the ZIP can't be offered: the approved files, each still byte-identical, for individual download. */
+function ApprovedFiles({ run }: { run: RunView }) {
+  const files = approvedDownloads(run);
+  if (!files.length) return <p className="ap-fineprint">The approved files no longer match this kit. Reload the page to review the current files.</p>;
+  return <div className="ap-approval-files"><p className="ap-fineprint">The kit ZIP bundles withheld files, so download the approved files individually:</p>
+    <ul>{files.map((file) => <li key={file.filename}><a href={runFileUrl(run.id, file.filename)} download={file.filename}><Download size={13} />{file.filename}</a><span>{formatBytes(file.bytes)}</span></li>)}</ul>
+  </div>;
+}
+
+export function ApprovalBlock({ run, state, onApprove }: { run: RunView; state: AutopilotPublicState | null; onApprove: (digest: string) => Promise<void> }) {
   // The confirmation is bound to the digest it was given for: a refreshed kit (new digest) must be re-confirmed.
   const [confirmedFor, setConfirmedFor] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const checkId = useId();
-  const campaign = run.campaign!;
   const review = approvalReview(run, state);
-  const archive = archiveAsset(campaign);
+  // Never the unfiltered archive: it bundles every kit file, withheld ones included.
+  const archive = offerableArchive(run);
   const approval = run.approval;
   const digest = run.approvalDigest ?? null;
   const inconsistent = review.conflicts.length > 0;
@@ -110,7 +119,8 @@ function ApprovalBlock({ run, state, onApprove }: { run: RunView; state: Autopil
     <p>{new Date(approval.approvedAt).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })} · {approval.files.length} files · digest <code title={approval.manifestDigest}>{shortDigest(approval.manifestDigest)}</code></p>
     <p className="ap-approved-note"><ShieldCheck size={15} />Nothing was published. Publishing, ad spend and messaging remain separate steps.</p>
     {approval.withheldFiles.length > 0 && <p className="ap-fineprint">Not included: {approval.withheldFiles.join(", ")}</p>}
-    {archive && <a className="button button-secondary" href={runFileUrl(run.id, archive.filename)} download={archive.filename}><Download size={15} />Download the kit (ZIP)</a>}
+    {archive ? <a className="button button-secondary" href={runFileUrl(run.id, archive.filename)} download={archive.filename}><Download size={15} />Download the kit (ZIP)</a>
+      : <ApprovedFiles run={run} />}
   </section>;
   return <section className="ap-approval" id="ap-approval" aria-labelledby="ap-approval-title">
     <span className="ap-kicker"><Fingerprint size={14} />One approval</span>
@@ -120,7 +130,7 @@ function ApprovalBlock({ run, state, onApprove }: { run: RunView; state: Autopil
       <ul>{review.files.map((file) => <li key={file.filename}><code>{file.filename}</code><span>{formatBytes(file.bytes)} · <span title={file.sha256}>{shortDigest(file.sha256)}</span></span></li>)}</ul>
       {review.withheld.length > 0 && <p className="ap-fineprint">Withheld and not covered: {review.withheld.join(", ")}</p>}
     </details>
-    {state?.critic?.verdict === "blocking_findings" && !inconsistent && <p className="ap-hint is-warning">The critic found blocking issues. Those files are withheld; the rest can still be approved.</p>}
+    {!inconsistent && review.withheld.length > 0 && <p className="ap-hint is-warning">{review.files.length > 0 ? "Some files are withheld from this approval; the rest can still be approved." : "Every file is withheld, so nothing can be approved. Run Autopilot again for a fresh critique."}</p>}
     {inconsistent && <div className="ap-error" role="alert"><strong>This kit is inconsistent</strong><p>The critic withheld {review.conflicts.join(", ")}, but {review.conflicts.length === 1 ? "it is" : "they are"} still in the approvable file list. Reload the page; approval stays off until the kit and its review agree.</p></div>}
     <label className="ap-check ap-approval-check" htmlFor={checkId}><input id={checkId} type="checkbox" checked={confirmed} disabled={busy || blocked} onChange={(event) => setConfirmedFor(event.target.checked ? digest : null)} required /><span>{APPROVAL_STATEMENT}</span></label>
     {error && <div className="ap-error" role="alert"><p>{error}</p></div>}
@@ -128,6 +138,7 @@ function ApprovalBlock({ run, state, onApprove }: { run: RunView; state: Autopil
       <button type="button" className="button button-primary" disabled={!confirmed || busy || blocked} onClick={() => void approve()}>{busy ? <LoaderCircle size={16} className="spin" /> : <CircleCheck size={16} />}{busy ? "Re-checking every file…" : "Approve campaign"}</button>
       {archive && <a className="button button-secondary" href={runFileUrl(run.id, archive.filename)} download={archive.filename}><FileArchive size={15} />Download ZIP</a>}
     </div>
+    {!archive && review.withheld.length > 0 && <p className="ap-fineprint">The kit ZIP bundles the withheld files, so it isn’t offered. Each approvable file can be downloaded under “All files &amp; review notes”.</p>}
     <p className="ap-fineprint">{digest ? "Tickr re-hashes every file before recording your approval. If anything changed since you looked, it asks you to review again. Approving never publishes, spends or messages." : "This kit has no approvable digest yet. Reload to review the current files."}</p>
   </section>;
 }
@@ -160,6 +171,6 @@ export function AutopilotReady({ run, state, stateStatus, onApprove }: { run: Ru
     <details className="ap-behind"><summary>Behind the scenes · how Autopilot made this</summary>
       <div className="ap-room-grid"><div className="ap-room-main"><MediaWall run={run} state={state} status={stateStatus} /><SamPanel run={run} state={state} /></div><aside className="ap-room-side"><SelectionCard run={run} /><PlanCard run={run} state={state} /><DirectorLog run={run} state={state} /></aside></div>
     </details>
-    <details className="ap-behind"><summary>All files &amp; review notes</summary>{withheld.size > 0 && <div className="ap-withheld-list"><strong>Withheld files · not shown below</strong><p>Held back from the approval and these previews until the critic’s issue is resolved: {[...withheld].join(", ")}</p></div>}<ExportPanel run={reviewable} onStudio={() => undefined} /></details>
+    <details className="ap-behind"><summary>All files &amp; review notes</summary><ExportPanel run={reviewable} onStudio={() => undefined} /></details>
   </div>;
 }

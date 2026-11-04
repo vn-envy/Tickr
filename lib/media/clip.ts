@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import sharp from "sharp";
 import { z } from "zod";
 import type { ClipFrame, NormalizedClip, OwnerMediaConsent } from "./cinema-types";
+import { MAX_OWNER_VIDEO_SECONDS } from "./uploads";
 
 /**
  * Owner clip normalization and frame access. Everything here is local FFmpeg/ffprobe
@@ -18,7 +19,11 @@ import type { ClipFrame, NormalizedClip, OwnerMediaConsent } from "./cinema-type
 const execFileAsync = promisify(execFile);
 
 export const MAX_OWNER_CLIP_INPUT_BYTES = 300 * 1024 * 1024;
-export const MAX_OWNER_CLIP_INPUT_SECONDS = 180;
+/**
+ * Same as the owner-upload duration limit: normalization only ever decodes a ≤20 s window with
+ * input seeking, so any video intake accepted can be prepared (no accepted-but-unusable range).
+ */
+export const MAX_OWNER_CLIP_INPUT_SECONDS = MAX_OWNER_VIDEO_SECONDS;
 export const DEFAULT_CLIP_WINDOW_SECONDS = 12;
 export const MAX_CLIP_WINDOW_SECONDS = 20;
 export const MAX_NORMALIZED_CLIP_BYTES = 24 * 1024 * 1024;
@@ -37,7 +42,7 @@ const FRAME_IDLE_TIMEOUT_MS = 30_000;
 const CHILD_CLOSE_GRACE_MS = 5_000;
 const TOOL_MAX_BUFFER = 256_000;
 const PACKET_SCAN_TIMEOUT_MS = 60_000;
-/** ~20 bytes per packet line: room for well over 180 s even at 240 fps. */
+/** ~20 bytes per packet line: room for 600 s even at 240 fps (~2.9 MB). */
 const PACKET_SCAN_MAX_BUFFER = 4 * 1024 * 1024;
 
 /** Demuxers FFmpeg may open at all. WAV is only accepted for the extracted owner audio. */
@@ -600,12 +605,12 @@ function assertOwnerAudioContract(audio: MediaProbeSummary) {
 const allowedColor = (value: string | null, allowed: string) => value === null || value === allowed;
 
 /** The tracking-clip contract shared by normalization and later verification. */
-function assertTrackingContract(probe: MediaProbeSummary): { width: number; height: number; frameCount: number } {
+function assertTrackingContract(probe: MediaProbeSummary, maxLongSide = MAX_NORMALIZED_LONG_SIDE): { width: number; height: number; frameCount: number } {
   const bad = () => fail("VERIFICATION_FAILED", "The normalized clip did not meet its output contract.");
   const video = probe.video;
   if (probe.formatName !== ISOBMFF_FORMAT || probe.streams.length !== 1 || !video) return bad();
   if (video.codec !== "h264" || video.pixelFormat !== "yuv420p" || video.frameRate !== `${NORMALIZED_CLIP_FPS}/1`) bad();
-  if (!video.width || !video.height || video.width % 2 || video.height % 2 || Math.max(video.width, video.height) > MAX_NORMALIZED_LONG_SIDE) return bad();
+  if (!video.width || !video.height || video.width % 2 || video.height % 2 || Math.max(video.width, video.height) > maxLongSide) return bad();
   if (video.hasRotationMetadata || video.rotation !== 0 || video.sideDataTypes.length) bad();
   if (!allowedColor(video.colorPrimaries, "bt709") || !allowedColor(video.colorTransfer, "bt709") || !allowedColor(video.colorSpace, "bt709") || !allowedColor(video.colorRange, "tv")) bad();
   const frameCount = video.frameCount;
@@ -658,6 +663,180 @@ export async function verifyNormalizedClip(clip: NormalizedClip): Promise<void> 
 }
 
 // ---------------------------------------------------------------------------
+// Render source
+//
+// The tracking clip is capped at MAX_NORMALIZED_LONG_SIDE so SAM and Spark payloads stay small.
+// Output pixels may instead come from a local render source: the same source window, frame
+// selection, rotation and colour/tone mapping as the tracking clip, at a larger size. It is never
+// sent to Meta, carries no poster or audio and is bound to its tracking clip by hash and frame count.
+
+export const MAX_RENDER_CLIP_BYTES = 192 * 1024 * 1024;
+const RENDER_TRANSCODE_TIMEOUT_MS = 300_000;
+/** Allowed per-axis scale mismatch between the render source and its tracking clip (even rounding). */
+export const MAX_RENDER_ASPECT_DRIFT = 0.02;
+
+export interface OwnerRenderClip {
+  version: 1;
+  kind: "render_source";
+  /** SHA-256 of the tracking clip whose window and frames this file repeats at a larger size. */
+  trackingSha256: string;
+  sha256: string;
+  /** Absolute private path under .data/. Never exported, shown to the browser or sent to Meta. */
+  path: string;
+  width: number;
+  height: number;
+  fps: number;
+  frameCount: number;
+}
+
+export interface NormalizeOwnerRenderClipInput {
+  /** The tracking clip normalized from the same source with the same window options. */
+  tracking: NormalizedClip;
+  sourcePath: string;
+  outputDir: string;
+  consent: OwnerMediaConsent;
+  startSeconds?: number;
+  maxSeconds?: number;
+  /** Output frame size (e.g. 1080×1920) that the largest centred crop of its aspect should cover 1:1. */
+  cover: { width: number; height: number };
+}
+
+/**
+ * Render-source size for a display-oriented source: just large enough that the largest crop of the
+ * cover's aspect is cover-sized (never upscaled), within the frame-read bounds. Even sides.
+ */
+export function renderClipSize(displayWidth: number, displayHeight: number, cover: { width: number; height: number }): { width: number; height: number } {
+  if (![displayWidth, displayHeight, cover.width, cover.height].every((value) => Number.isInteger(value) && value >= 2 && value <= MAX_SOURCE_SIDE)) {
+    fail("INVALID_REQUEST", "The render size request is invalid.");
+  }
+  const cropHeight = displayWidth / displayHeight >= cover.width / cover.height ? displayHeight : (displayWidth * cover.height) / cover.width;
+  const scale = Math.min(1, cover.height / cropHeight, MAX_READ_SIDE / Math.max(displayWidth, displayHeight), Math.sqrt(MAX_READ_PIXELS / (displayWidth * displayHeight)));
+  const even = (side: number) => Math.max(2, Math.floor((side * scale) / 2) * 2);
+  return { width: even(displayWidth), height: even(displayHeight) };
+}
+
+const renderClipSchema = z.object({
+  version: z.literal(1),
+  kind: z.literal("render_source"),
+  trackingSha256: z.string().regex(/^[0-9a-f]{64}$/),
+  sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  path: z.string().min(1).max(4096).refine(isAbsolute),
+  width: z.number().int().min(2).max(MAX_READ_SIDE),
+  height: z.number().int().min(2).max(MAX_READ_SIDE),
+  fps: z.literal(NORMALIZED_CLIP_FPS),
+  frameCount: z.number().int().min(1).max(MAX_CLIP_WINDOW_SECONDS * NORMALIZED_CLIP_FPS + 1),
+}).refine((clip) => clip.width * clip.height <= MAX_READ_PIXELS);
+
+/**
+ * True when `render` repeats `tracking` at a uniformly larger size: same tracking hash, frame
+ * count and frame rate, at least as large on both axes and the same aspect within rounding.
+ */
+export function renderClipMatches(render: OwnerRenderClip, tracking: Pick<NormalizedClip, "sha256" | "width" | "height" | "fps" | "frameCount">): boolean {
+  if (!renderClipSchema.safeParse(render).success) return false;
+  if (render.trackingSha256 !== tracking.sha256 || render.frameCount !== tracking.frameCount || render.fps !== tracking.fps) return false;
+  if (render.width < tracking.width || render.height < tracking.height || (render.width === tracking.width && render.height === tracking.height)) return false;
+  const kx = render.width / tracking.width, ky = render.height / tracking.height;
+  return Math.abs(kx / ky - 1) <= MAX_RENDER_ASPECT_DRIFT;
+}
+
+/**
+ * Normalize the render source for an already normalized tracking clip. Returns null when the
+ * source is not larger than the tracking clip (nothing to gain). The source must still be the
+ * exact file the tracking clip was made from, and consent is re-checked first.
+ */
+export async function normalizeOwnerRenderClip(input: NormalizeOwnerRenderClipInput, internals: Pick<NormalizeOwnerClipInternals, "maxOutputBytes"> = {}): Promise<OwnerRenderClip | null> {
+  if (!input || typeof input !== "object") return fail("INVALID_REQUEST", "The render clip request is invalid.");
+  const consent = consentSchema.safeParse(input.consent);
+  if (!consent.success) fail("CONSENT_REQUIRED", "The owner must confirm they own or license this clip and that any visible people have consented.");
+  const tracking = input.tracking;
+  validClip(tracking);
+  if (!tracking.original || !/^[0-9a-f]{64}$/.test(String(tracking.original.sha256))) fail("INVALID_REQUEST", "The clip record is not a valid normalized clip.");
+  const sourcePath = assertAbsolutePath(input.sourcePath, "source clip");
+  const outputDir = assertAbsolutePath(input.outputDir, "output directory");
+  const maxSeconds = input.maxSeconds ?? DEFAULT_CLIP_WINDOW_SECONDS;
+  if (!Number.isFinite(maxSeconds) || maxSeconds <= 0 || maxSeconds > MAX_CLIP_WINDOW_SECONDS) fail("INVALID_REQUEST", `The clip window must be between 0 and ${MAX_CLIP_WINDOW_SECONDS} seconds.`);
+  if (input.startSeconds !== undefined && (!Number.isFinite(input.startSeconds) || input.startSeconds < 0)) fail("INVALID_REQUEST", "The clip start must be a non-negative number of seconds.");
+  const cover = input.cover;
+  if (!cover || ![cover.width, cover.height].every((value) => Number.isInteger(value) && value >= 2 && value <= MAX_READ_SIDE)) fail("INVALID_REQUEST", "The render size request is invalid.");
+  const maxOutputBytes = internals.maxOutputBytes ?? MAX_RENDER_CLIP_BYTES;
+  if (!Number.isInteger(maxOutputBytes) || maxOutputBytes < 1 || maxOutputBytes > MAX_RENDER_CLIP_BYTES) fail("INVALID_REQUEST", "The render clip size limit is invalid.");
+
+  const before = await lstat(sourcePath).catch(() => fail("SOURCE_UNREADABLE", "The uploaded clip could not be read."));
+  if (!before.isFile() || before.size <= 0) fail("SOURCE_UNREADABLE", "The uploaded clip must be a non-empty regular file.");
+  if (before.size > MAX_OWNER_CLIP_INPUT_BYTES) fail("SOURCE_TOO_LARGE", "The uploaded clip is larger than 300 MiB.");
+  const originalSha256 = await sha256File(sourcePath).catch(() => fail("SOURCE_UNREADABLE", "The uploaded clip could not be read."));
+  if (originalSha256 !== tracking.original.sha256) fail("SOURCE_CHANGED", "The uploaded clip is not the file the tracking clip was made from.");
+
+  const probe = await probeMedia(sourcePath).catch(() => fail("UNSUPPORTED_MEDIA", "Only MP4, MOV, M4V, 3GP, Matroska or WebM video files are accepted."));
+  const source = await assertSourceContract(probe, sourcePath);
+  if (source.displayWidth !== tracking.original.width || source.displayHeight !== tracking.original.height) fail("SOURCE_CHANGED", "The uploaded clip is not the file the tracking clip was made from.");
+  // The same window arithmetic as normalizeOwnerClip, so the same source frames are selected.
+  const window = input.startSeconds === undefined
+    ? chooseClipWindow(source.durationSeconds, null, maxSeconds)
+    : (() => {
+      if (input.startSeconds >= source.durationSeconds) fail("INVALID_REQUEST", "The clip start is beyond the end of the video.");
+      return { startSeconds: roundDownMs(input.startSeconds), durationSeconds: roundDownMs(Math.min(maxSeconds, source.durationSeconds - input.startSeconds)) };
+    })();
+  const windowFrames = Math.floor(window.durationSeconds * NORMALIZED_CLIP_FPS + 1e-6);
+  if (windowFrames < MIN_WINDOW_FRAMES) fail("SOURCE_TOO_SHORT", "The selected clip window is shorter than half a second.");
+  const windowSeconds = windowFrames / NORMALIZED_CLIP_FPS;
+
+  const target = renderClipSize(source.displayWidth, source.displayHeight, cover);
+  if (target.width <= tracking.width && target.height <= tracking.height) return null;
+
+  await mkdir(outputDir, { recursive: true, mode: 0o700 }).catch(() => fail("INVALID_REQUEST", "The private clip directory could not be prepared."));
+  const stem = `render-${tracking.sha256.slice(0, 32)}-${target.width}x${target.height}`;
+  const finalPath = join(outputDir, `${stem}.mp4`);
+  const tempVideo = join(outputDir, `.${stem}.${randomBytes(6).toString("hex")}.partial.mp4`);
+  try {
+    try {
+      await runTool("ffmpeg", [
+        "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-autorotate", "1",
+        "-ss", window.startSeconds.toFixed(3), "-t", windowSeconds.toFixed(6), ...inputArgs(sourcePath),
+        "-map", "0:v:0", "-an", "-sn", "-dn", "-map_metadata", "-1", "-map_chapters", "-1",
+        "-vf", normalizationFilter(target, source.video, source.dynamicRange), "-r", String(NORMALIZED_CLIP_FPS), "-frames:v", String(windowFrames),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "17", "-maxrate", "40M", "-bufsize", "80M", "-profile:v", "high",
+        "-pix_fmt", "yuv420p", "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv",
+        "-g", String(NORMALIZED_CLIP_FPS), "-threads", "2",
+        "-movflags", "+faststart", "-fs", String(2 * maxOutputBytes), "-f", "mp4", `file:${tempVideo}`,
+      ], RENDER_TRANSCODE_TIMEOUT_MS);
+    } catch {
+      fail("TRANSCODE_FAILED", "The render-resolution clip could not be prepared locally.");
+    }
+    const encoded = await stat(tempVideo).catch(() => fail("TRANSCODE_FAILED", "The render-resolution clip could not be prepared locally."));
+    if (encoded.size > maxOutputBytes) fail("OUTPUT_TOO_LARGE", `The render-resolution clip exceeded ${formatMiB(maxOutputBytes)}.`);
+    const output = assertTrackingContract(await probeMedia(tempVideo).catch(() => fail("VERIFICATION_FAILED", "The render-resolution clip did not meet its output contract.")), MAX_READ_SIDE);
+    if (output.width !== target.width || output.height !== target.height || output.frameCount !== tracking.frameCount) fail("VERIFICATION_FAILED", "The render-resolution clip does not repeat the tracking clip's frames.");
+    await chmod(tempVideo, 0o600);
+    const record: OwnerRenderClip = {
+      version: 1, kind: "render_source", trackingSha256: tracking.sha256, sha256: await sha256File(tempVideo), path: finalPath,
+      width: output.width, height: output.height, fps: NORMALIZED_CLIP_FPS, frameCount: output.frameCount,
+    };
+    if (!renderClipMatches(record, tracking)) fail("VERIFICATION_FAILED", "The render-resolution clip does not repeat the tracking clip's frames.");
+    const after = await lstat(sourcePath).catch(() => fail("SOURCE_CHANGED", "The uploaded clip changed while it was being normalized."));
+    if (!after.isFile() || !sameFile(before, after)) fail("SOURCE_CHANGED", "The uploaded clip changed while it was being normalized.");
+    await rename(tempVideo, finalPath);
+    return record;
+  } catch (error) {
+    await rm(tempVideo, { force: true }).catch(() => undefined);
+    if (error instanceof OwnerClipError) throw error;
+    throw new OwnerClipError("TRANSCODE_FAILED", "The render-resolution clip could not be prepared locally.");
+  }
+}
+
+/** Re-hash the render source and re-check its contract against its tracking clip. Throws on any mismatch. */
+export async function verifyRenderClip(render: OwnerRenderClip, tracking: NormalizedClip): Promise<void> {
+  const bad = () => fail("VERIFICATION_FAILED", "The render-resolution clip no longer matches its recorded contract.");
+  validClip(tracking);
+  if (!renderClipMatches(render, tracking)) bad();
+  const info = await lstat(render.path).catch(() => bad());
+  if (!info.isFile() || info.size > MAX_RENDER_CLIP_BYTES) bad();
+  if ((await sha256File(render.path).catch(() => bad())) !== render.sha256) bad();
+  const output = assertTrackingContract(await probeMedia(render.path).catch(() => bad()), MAX_READ_SIDE);
+  if (output.width !== render.width || output.height !== render.height || output.frameCount !== render.frameCount) bad();
+}
+
+// ---------------------------------------------------------------------------
 // Frame access
 
 export interface ReadClipFramesOptions {
@@ -672,8 +851,7 @@ export interface ReadClipFramesOptions {
   idleTimeoutMs?: number;
 }
 
-function framePlan(clip: NormalizedClip, options: ReadClipFramesOptions) {
-  const record = validClip(clip);
+function framePlan(record: { path: string; width: number; height: number; frameCount: number }, options: ReadClipFramesOptions) {
   const fromFrame = options.fromFrame ?? 0;
   const toFrame = options.toFrame ?? record.frameCount - 1;
   const width = options.width ?? record.width;
@@ -696,7 +874,17 @@ function framePlan(clip: NormalizedClip, options: ReadClipFramesOptions) {
  * here; call verifyNormalizedClip at stage boundaries.
  */
 export async function* readClipFrames(clip: NormalizedClip, options: ReadClipFramesOptions = {}): AsyncGenerator<ClipFrame, void, undefined> {
-  const plan = framePlan(clip, options);
+  yield* decodeFrames(framePlan(validClip(clip), options));
+}
+
+/** readClipFrames for a render source; frames default to the render source's own size. */
+export async function* readRenderClipFrames(clip: OwnerRenderClip, options: ReadClipFramesOptions = {}): AsyncGenerator<ClipFrame, void, undefined> {
+  const parsed = renderClipSchema.safeParse(clip);
+  if (!parsed.success) fail("INVALID_REQUEST", "The clip record is not a valid render-resolution clip.");
+  yield* decodeFrames(framePlan(parsed.data, options));
+}
+
+async function* decodeFrames(plan: ReturnType<typeof framePlan>): AsyncGenerator<ClipFrame, void, undefined> {
   const frameBytes = plan.width * plan.height * 4;
   const child = spawn("ffmpeg", [
     "-hide_banner", "-loglevel", "error", "-nostdin", "-threads", "2", ...inputArgs(plan.path),

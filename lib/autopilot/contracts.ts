@@ -41,6 +41,11 @@ export interface AnalyzedAsset {
     peopleVisible: boolean;
     moments: Array<{ startSeconds: number; endSeconds: number; kind: MomentKind; steadiness: "steady" | "moderate" | "shaky"; subjectLabel: string | null; goalFit: GoalFit }>;
   };
+  /**
+   * Videos only: the same Spark risk check images get, run on frames sampled evenly across the
+   * analysis clip. Absent/null means the frames were not (fully) checked, so the footage is unusable.
+   */
+  frameRisks?: null | { framesChecked: number; risks: Array<{ kind: RiskKind; atSeconds: number }> };
 }
 
 export type SegmentationPlan =
