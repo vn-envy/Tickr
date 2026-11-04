@@ -82,6 +82,12 @@ describe("Muse Spark media analysis request", () => {
     const body = fake.bodies[0] as { model: string; instructions: string; store: boolean; stream: boolean; input: Array<{ role: string; content: Array<Record<string, string>> }>; text: { format: Record<string, unknown> } };
     expect(body).toMatchObject({ model: "muse-spark-1.3", store: false, stream: false });
     expect(body.instructions).toContain("UNTRUSTED DATA");
+    // Live regression (a cafe's own logo and dining room were flagged as third-party): own branding
+    // is never third_party_logo / other_business_signage, at most readable_text.
+    expect(body.instructions).toContain("OWN BRANDING IS NEVER A THIRD-PARTY RISK");
+    expect(body.instructions).toMatch(/Never report any of these as third_party_logo or other_business_signage; report their legible text as readable_text at most/);
+    expect(body.instructions).toMatch(/where no other company's or business's name or mark is visible is not other_business_signage/);
+    expect(body.instructions).toMatch(/Use third_party_logo only for a different company's brand mark/);
     expect(body.text.format).toMatchObject({ type: "json_schema", name: "tickr_media_analysis", strict: true });
     assertStrictSchema(body.text.format.schema);
     const content = body.input[0].content;

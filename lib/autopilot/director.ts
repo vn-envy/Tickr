@@ -128,12 +128,16 @@ export function planProduction(input: DirectorInput): ProductionPlan {
   const hero = heroEntry?.pick ?? null;
 
   // Carousel: hero first, then diverse subjects (penalize repeating a subject kind), then repeat real assets if needed.
+  // Every unused moderate-or-better asset outranks every weak-fit one: the diversity penalty only
+  // orders assets within a goal-fit tier, so a weak asset fills a slot only when nothing stronger is left.
   const carousel: StillPick[] = hero ? [hero] : [];
   const usedKinds = new Map<SubjectKind, number>();
   if (heroEntry) usedKinds.set(heroEntry.asset.analysis!.subjectKind, 1);
   const pool = real.filter((item) => item.pick.assetId !== hero?.assetId && item.asset.analysis!.suitableFor.includes("carousel"));
+  const tier = (item: (typeof pool)[number]) => (FIT[item.asset.analysis!.goalFit] >= FIT.moderate ? 1 : 0);
+  const diverse = (item: (typeof pool)[number]) => item.pick.score - 25 * (usedKinds.get(item.asset.analysis!.subjectKind) ?? 0);
   while (carousel.length < 4 && pool.length) {
-    pool.sort((a, b) => (b.pick.score - 25 * (usedKinds.get(b.asset.analysis!.subjectKind) ?? 0)) - (a.pick.score - 25 * (usedKinds.get(a.asset.analysis!.subjectKind) ?? 0)) || a.pick.assetId.localeCompare(b.pick.assetId));
+    pool.sort((a, b) => tier(b) - tier(a) || diverse(b) - diverse(a) || a.pick.assetId.localeCompare(b.pick.assetId));
     const next = pool.shift()!;
     carousel.push(next.pick);
     usedKinds.set(next.asset.analysis!.subjectKind, (usedKinds.get(next.asset.analysis!.subjectKind) ?? 0) + 1);

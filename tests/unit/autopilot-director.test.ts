@@ -60,6 +60,26 @@ describe("Autopilot director", () => {
     expect(sparse.notes.join(" ")).toContain("reuse");
   });
 
+  it("fills carousel slots with moderate-or-better assets before any weak-fit asset", () => {
+    // Live regression: a weak-fit latte (product) displaced an unused moderate brownie plate
+    // (same subject kind as the hero, so its diversity penalty sank it below the latte).
+    const assets = [
+      image("hero", { goalFit: "strong", heroWorthy: true }),
+      image("brownie", { goalFit: "moderate" }),
+      image("latte", { subjectKind: "product", goalFit: "weak", heroWorthy: true }),
+      image("room", { subjectKind: "interior", goalFit: "moderate" }),
+      image("front", { subjectKind: "exterior_storefront", goalFit: "moderate" }),
+    ];
+    const scores = Object.fromEntries(assets.map((asset) => [asset.assetId, scoreStill(asset, null).score]));
+    expect(scores.latte).toBeGreaterThan(scores.brownie - 25);
+    const plan = planProduction({ focusOfferingId: null, offerApproved: false, assets });
+    expect(plan.carousel.map((item) => item.assetId)).toEqual(["hero", "front", "room", "brownie"]);
+    expect(plan.carousel.map((item) => item.assetId)).not.toContain("latte");
+    // A weak asset still fills a slot when no stronger unused real asset remains, before any repeat.
+    const sparse = planProduction({ focusOfferingId: null, offerApproved: false, assets: [image("hero", { goalFit: "strong", heroWorthy: true }), image("brownie", { goalFit: "moderate" }), image("latte", { subjectKind: "product", goalFit: "weak" })] });
+    expect(sparse.carousel.map((item) => item.assetId)).toEqual(["hero", "brownie", "latte", "hero"]);
+  });
+
   it("chooses tracked owner footage for the Reel and centres the window on the hero moment", () => {
     const plan = planProduction({ focusOfferingId: null, offerApproved: false, assets: [
       image("still"),

@@ -72,12 +72,53 @@ export function analysisOfferings(enrichment: BusinessEnrichment | undefined): M
   }).slice(0, 12).map((offering) => ({ offeringId: offering.id, name: offering.name.slice(0, 120), ...(offering.description.trim() ? { description: offering.description.slice(0, 400) } : {}) }));
 }
 
+/**
+ * Words that may accompany this business's own name in a branding risk note without naming any
+ * other party. Deliberately small: any other word (another brand, "another", "next to", "and"...)
+ * keeps the model's third-party label, so a real third-party mark is never reclassified.
+ */
+const OWN_BRAND_NOTE_WORDS: ReadonlySet<string> = new Set([
+  "a", "an", "the", "this", "its", "own", "of", "on", "in", "at", "is", "are", "business", "brand", "branding", "branded",
+  "logo", "logos", "logotype", "wordmark", "emblem", "mark", "name", "sign", "signs", "signage", "signboard", "text", "lettering", "script", "word", "words",
+  "printed", "painted", "embossed", "neon", "illuminated", "visible", "shows", "showing", "shown", "reads", "reading", "displayed", "display", "readable", "legible",
+  "menu", "menus", "board", "chalkboard", "cup", "cups", "mug", "mugs", "packaging", "package", "box", "boxes", "bag", "bags", "sticker", "stickers", "label", "labels",
+  "tin", "can", "jar", "napkin", "apron", "uniform", "wall", "window", "door", "awning", "storefront", "shopfront", "facade", "front", "counter", "interior", "decor",
+  "pink", "white", "black", "red", "blue", "green", "gold", "golden", "yellow", "brown", "purple", "orange", "grey", "gray", "silver", "cream", "small", "large",
+]);
+
+const CATEGORY_STOP_WORDS: ReadonlySet<string> = new Set(["with", "from", "other", "another", "than", "next", "near", "beside", "their", "plus", "also", "into", "over"]);
+const brandTokens = (text: string) => text.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[\u2018\u2019`\u00b4]/g, "'")
+  .replace(/'s\b/g, "").replace(/'/g, "").replace(/[^a-z0-9]+/g, " ").trim().split(" ").filter(Boolean);
+const sameToken = (name: string, note: string) => note === name || note === `${name}s`;
+
+/**
+ * Deterministic guard for a live false positive: Spark sometimes labels the business's OWN logo or
+ * signage as third_party_logo / other_business_signage. Such a risk becomes readable_text only when
+ * its note names this business (by its distinctive name words) and every other note word is a
+ * generic branding word; anything else keeps the model's label and the director's exclusion.
+ */
+export function ownBrandingRiskKind(kind: RiskKind, note: string, business: { name: string; category: string } | undefined): RiskKind {
+  if (!business || (kind !== "third_party_logo" && kind !== "other_business_signage")) return kind;
+  // Category nouns ("cafe", "bakery") may describe the business too; short or joining words never do.
+  const generic = new Set([...OWN_BRAND_NOTE_WORDS, ...brandTokens(business.category).filter((word) => word.length >= 4 && !CATEGORY_STOP_WORDS.has(word))]);
+  const name = brandTokens(business.name);
+  if (!name.length || name.join(" ").length < 3 || name.every((token) => generic.has(token))) return kind;
+  const words = brandTokens(note);
+  const remaining: string[] = [];
+  let matched = false;
+  for (let index = 0; index < words.length;) {
+    if (name.every((token, offset) => words[index + offset] !== undefined && sameToken(token, words[index + offset]))) { matched = true; index += name.length; continue; }
+    remaining.push(words[index++]);
+  }
+  return matched && remaining.every((word) => generic.has(word)) ? "readable_text" : kind;
+}
+
 function consentOf(asset: HarvestedAsset): AnalyzedAsset["consent"] {
   return asset.consent ? { peopleVisibleHaveConsented: asset.consent.peopleVisibleHaveConsented } : null;
 }
 
-/** One analyzed (or unanalyzed) image as the director sees it. */
-export function analyzedImage(asset: HarvestedAsset, analysis: MediaAssetAnalysis | null): AnalyzedAsset {
+/** One analyzed (or unanalyzed) image as the director sees it; `business` enables the own-branding guard. */
+export function analyzedImage(asset: HarvestedAsset, analysis: MediaAssetAnalysis | null, business?: { name: string; category: string }): AnalyzedAsset {
   return {
     assetId: asset.assetId, kind: "image", provenance: asset.provenance, rights: asset.rights,
     width: analysis?.width ?? asset.width, height: analysis?.height ?? asset.height, durationSeconds: null, consent: consentOf(asset),
@@ -85,7 +126,7 @@ export function analyzedImage(asset: HarvestedAsset, analysis: MediaAssetAnalysi
       depicts: analysis.depicts, subjectKind: analysis.subjectKind, matchedOfferingIds: [...analysis.matchedOfferingIds],
       primarySubject: analysis.primarySubject ? { label: analysis.primarySubject.label, box: analysis.primarySubject.box ? { ...analysis.primarySubject.box } : null } : null,
       quality: { ...analysis.technicalQuality }, goalFit: analysis.goalFit, heroWorthy: analysis.heroWorthy, suitableFor: [...analysis.suitableFor],
-      risks: analysis.risks.map((risk) => ({ kind: risk.kind, box: risk.box ? { ...risk.box } : null })),
+      risks: analysis.risks.map((risk) => ({ kind: ownBrandingRiskKind(risk.kind, risk.note, business), box: risk.box ? { ...risk.box } : null })),
     } : null,
     shotLog: null,
   };
@@ -115,8 +156,8 @@ export function riskFrameIndices(clip: Pick<NormalizedClip, "frameCount" | "dura
 }
 
 /** Spark image risks for one sampled frame; a frame whose subject is people counts as a person risk. */
-function frameRiskKinds(analysis: MediaAssetAnalysis): RiskKind[] {
-  const kinds = new Set<RiskKind>(analysis.risks.map((risk) => risk.kind));
+function frameRiskKinds(analysis: MediaAssetAnalysis, business: { name: string; category: string }): RiskKind[] {
+  const kinds = new Set<RiskKind>(analysis.risks.map((risk) => ownBrandingRiskKind(risk.kind, risk.note, business)));
   if (analysis.subjectKind === "people") kinds.add("person");
   return [...kinds];
 }
@@ -251,7 +292,7 @@ export async function analyzeHarvest(input: AnalyzeInput): Promise<AnalysisRecor
   for (const [videoId, frames] of framesByVideo) {
     if (!frames.every((frame) => results.has(frame.id))) continue;
     const seen = new Set<string>();
-    const risks = frames.flatMap((frame) => frameRiskKinds(results.get(frame.id)!).map((kind) => ({ kind, atSeconds: frame.atSeconds })))
+    const risks = frames.flatMap((frame) => frameRiskKinds(results.get(frame.id)!, input.business).map((kind) => ({ kind, atSeconds: frame.atSeconds })))
       .filter((risk) => { const key = `${risk.kind}@${risk.atSeconds}`; if (seen.has(key)) return false; seen.add(key); return true; });
     frameRisks.set(videoId, { framesChecked: frames.length, risks });
   }
@@ -281,8 +322,10 @@ export async function analyzeHarvest(input: AnalyzeInput): Promise<AnalysisRecor
     }
   }
 
+  const ownBranding = [...results.values()].reduce((count, item) => count + item.risks.filter((risk) => ownBrandingRiskKind(risk.kind, risk.note, input.business) !== risk.kind).length, 0);
+  if (ownBranding) notes.push(`${ownBranding} branding flag${ownBranding === 1 ? " names" : "s name"} this business itself, so ${ownBranding === 1 ? "it was" : "they were"} treated as its own readable text rather than third-party branding.`);
   const assets = input.assets.map((asset) => asset.kind === "image"
-    ? analyzedImage(asset, results.get(asset.assetId) ?? null)
+    ? analyzedImage(asset, results.get(asset.assetId) ?? null, input.business)
     : analyzedVideo(asset, clips[asset.assetId] ?? null, shotLogs.get(asset.assetId) ?? null, frameRisks.get(asset.assetId) ?? null));
   return { version: 1, assets, clips, usage, notes, imagesAnalyzed, imagesUnanalyzed: unanalyzed, videosLogged: shotLogs.size };
 }
