@@ -296,7 +296,7 @@ const ASKED_CLAUSE = new RegExp(String.raw`\b(?:${ASK_VERB}${ASK_ADDRESSEE}\s*:?
  * availability, price or local destination is not erased: "Ask what's on sale today" presupposes a sale, and "Ask if
  * it's on sale. It is!" answers itself. Such a clause stays in the checked text and the claim rules decide.
  */
-const ASKED_CLAIM_VOCABULARY = /\b(?:on[- ]?sales?|sales?|stock(?:s|ed)?|in[- ]stock|discount(?:s|ed)?|offers?|deals?|deliver(?:y|ies|s|ed)?|bookings?|slots?|appointments?|reservations?|bogo|b1g1|buy[- ]one[- ]get[- ]one|buy\s*\d+\s*get\s*\d+|half[- ]price|promo(?:tion)?s?|specials?|clearance|available\s+(?:right\s+)?now|now\s+available|open\s+(?:now|today)|today\s+only|visit|located|based|branch|outlet|store|shop|clinic|studio|location)\b|(?<![\p{L}\p{N}-])free\b|[$€£₹]\s?\d|\d\s?%/iu;
+const ASKED_CLAIM_VOCABULARY = /\b(?:on[- ]?sales?|sales?|stock(?:s|ed)?|in[- ]stock|discount(?:s|ed)?|offers?|deals?|deliver(?:y|ies|s|ed)?|bookings?|slots?|appointments?|reservations?|bogo|b1g1|buy[- ]one[- ]get[- ]one|buy\s*\d+\s*get\s*\d+|half[- ]price|promo(?:tion)?s?|specials?|clearance|available\s+(?:right\s+)?now|now\s+available|open\s+(?:now|today)|today\s+only|visit|located|based|branch|outlet|store|shop|clinic|studio|location)\b|(?<![\p{L}\p{N}-])free\b|[$€£₹]\s?\d|\d\s?%|(?<![\p{L}\p{N}])(?:rs\.?|inr)\s?\d|\d\s?off\b/iu;
 /**
  * A following "Yes!", "It is!", "It sure is!", "Spoiler: it is." or "They are." answers the asked question as an
  * assertion, and so does a colon straight after the clause ("Ask what's available today: the Weekend loaf!").
@@ -356,7 +356,10 @@ function campaignClaimRules(report: ResearchReport, opportunity: ResearchOpportu
   const ownFacts = new Map(eligibleBusinessEvidence(report, opportunity, sources).map((item) => [item.id, item]));
   // Publishing destinations and numerical offers are high-impact and cannot be invented.
   const destinations = (text: string) => (text.match(/https?:\/\/[^\s<>"\\]+|\b[\w.+-]+@[\w.-]+\.[a-z]{2,}\b/gi) ?? []).map((value) => value.replace(/[.,;!?)]+$/, ""));
-  const offers = (text: string) => (text.match(/(?:[$€£₹]\s?\d[\d,.]*|\d+(?:\.\d+)?\s?%)/g) ?? []).map((value) => value.replace(/\s/g, ""));
+  // Rupee prefixes ("Rs. 50", "Rs50", "INR 500") and bare "<number> OFF" are prices/offers too. "Rs."/"Rs" compare as one
+  // form; a rupee word never matches the "₹" symbol, so a written prefix cannot satisfy a symbol price or the reverse.
+  const offers = (text: string) => (text.match(/(?:[$€£₹]\s?\d[\d,.]*|(?<![\p{L}\p{N}])(?:rs\.?|inr)\s?\d[\d,.]*(?![\d,.%])|\d+(?:\.\d+)?\s?%|\d[\d,.]*\s?(?:\/-\s?)?off\b(?!['’-]))/giu) ?? [])
+    .map((value) => value.replace(/\s/g, "").toLowerCase().replace(/^rs\./, "rs"));
   const phones = (text: string) => (text.match(/\+?\d[\d ()-]{7,}\d/g) ?? []).map((value) => value.replace(/\D/g, "")).filter((value) => value.length >= 9);
   const summarySourceIds = new Set(sources.filter((source) => source.acquisition === "meta_cited_summary").map((source) => source.id));
   const isSummary = (id: string) => ownFacts.get(id)!.basis === "meta_cited_summary" || summarySourceIds.has(ownFacts.get(id)!.sourceId);
@@ -371,7 +374,7 @@ function campaignClaimRules(report: ResearchReport, opportunity: ResearchOpportu
   const focusPattern = focusOffering?.trim() ? new RegExp(String.raw`(?<![\p{L}\p{N}$€£₹¥]|\d[.,])${escapeRegExp(focusOffering.trim()).replace(/\s+/g, String.raw`\s+`)}(?![\p{L}\p{N}%]|\s?%|[.,]\d)`, "giu") : null;
   const FOCUS_OFFER_BEFORE = /\b(?:save|saving|savings|up\s+to|extra|only|just|now|from|was|were|get|off|less|reduced|discounted|pay|priced?|costs?|worth|plus|over|under|at)\s*[:\-–—]?\s*$/iu;
   const FOCUS_OFFER_AFTER = /^\s*(?:[-–—:]\s*)?(?:%|percent\b|pc\b|off\b|discount|saving|sale\b|deals?\b|offers?\b|free\b|reduced\b|cheaper\b|less\b)/iu;
-  const FOCUS_OFFER_SENTENCE = /\b(?:off|half|price[ds]?|pricing|discount\w*|sav(?:e|es|ed|ing|ings)|deals?|offers?|sales?|reduced|cheaper|bargain\w*|promo\w*|clearance|bogo|b1g1|percent|only|was|slashed)\b|(?<![\p{L}\p{N}-])free\b|%|[$€£₹¥]/iu;
+  const FOCUS_OFFER_SENTENCE = /\b(?:off|half|price[ds]?|pricing|discount\w*|sav(?:e|es|ed|ing|ings)|deals?|offers?|sales?|reduced|cheaper|bargain\w*|promo\w*|clearance|bogo|b1g1|percent|only|was|slashed)\b|(?<![\p{L}\p{N}-])free\b|%|[$€£₹¥]|(?<![\p{L}\p{N}])(?:rs\.?|inr)\s?\d/iu;
   const withoutFocusName = (text: string) => {
     if (!focusPattern) return text;
     return text.split(/(?<=[.!?…])(?=\s)|(?<=\n)/).map((sentence) => {

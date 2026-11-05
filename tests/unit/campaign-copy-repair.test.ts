@@ -923,11 +923,13 @@ describe("fifth review: realistic compliant copy is no longer reset (each allowa
       (copy: CampaignCopy) => { channel(copy, "facebook_ads").caption = "Table for 6?"; },
       (copy: CampaignCopy) => { copy.conversation.qualificationQuestion = "Is it enough for 4?"; },
       (copy: CampaignCopy) => { copy.conversation.commonReplies[1].question = "Can I get 2 for 1?"; },
-      (copy: CampaignCopy) => { copy.conversation.commonReplies[1].question = "Can I get 2 off?"; },
     ]) {
       const copy = generatedDraft(); mutate(copy);
       expect(() => validateCampaignCopy(copy, ...summaryScopedArgs), JSON.stringify(copy.conversation)).toThrow("quantitative promises");
     }
+    // "<number> off" is offer text: it is rejected earlier, as an unsupported price or percentage.
+    const twoOff = generatedDraft(); twoOff.conversation.commonReplies[1].question = "Can I get 2 off?";
+    expect(() => validateCampaignCopy(twoOff, ...summaryScopedArgs)).toThrow("unsupported price or percentage");
     expect(customerQuestionQuantityText("Can we reserve a table for 6?")).not.toMatch(/\d/);
     expect(customerQuestionQuantityText("We can reserve a table for 6.")).toContain("6");
   });
@@ -1039,5 +1041,57 @@ describe("hosted live run (4 Nov 2026): 'ask the team about <items> and what …
     const repaired = validateCompletedCampaignCopy(withField(["facebook_ads", "body", body]), ...scopedArgs);
     expect(channel(repaired, "facebook_ads").body).toBe(fallbackFor("facebook_ads", "body"));
     expect(repaired.claimRepairs!.find((repair) => repair.field === "facebook_ads body")).toMatchObject({ removed: [body], fallback: true });
+  });
+});
+
+describe("hosted live run (4 Nov 2026): rupee prefixes and '<number> OFF' are price/offer text", () => {
+  const LIVE_OFFER_SHAPES = ["Rs.50 OFF on orders above ₹500", "Use code NEW50 for Rs 50 off"];
+  const unscopedArgs = [report, opportunity, [productSource], enrichment] as const;
+
+  test.each(LIVE_OFFER_SHAPES)("strict validation rejects %j and the completed path resets the field", (caption) => {
+    // Scoped or not, the price/offer must appear in original reference wording.
+    for (const args of [scopedArgs, unscopedArgs]) expect(() => validateCampaignCopy(withField(["facebook_ads", "caption", caption]), ...args)).toThrow("unsupported price or percentage");
+    for (const args of [scopedArgs, unscopedArgs]) {
+      const repaired = validateCompletedCampaignCopy(withField(["facebook_ads", "caption", caption]), ...args);
+      expect(channel(repaired, "facebook_ads").caption).toBe(fallbackFor("facebook_ads", "caption"));
+      expect(repaired.claimRepairs!.find((repair) => repair.field === "facebook_ads caption")).toMatchObject({ removed: [caption], fallback: true });
+      expect(JSON.stringify(repaired.channels)).not.toMatch(/\bRs\b|NEW50|₹/);
+      // Idempotent: the repaired copy passes strict validation unchanged.
+      expect(validateCampaignCopy(structuredClone(repaired), ...args)).toEqual(repaired);
+    }
+  });
+
+  test.each(["Rs.50 OFF today", "Rs. 50 for the Weekend loaf", "Rs50 for the Weekend loaf", "INR 500 for the Weekend loaf", "₹500 for the Weekend loaf", "Flat 50 OFF the Weekend loaf", "The Weekend loaf at 20% off", "Weekend loaf for Rs 120/-"])("each written price or offer form is checked: %j", (caption) => {
+    for (const args of [scopedArgs, unscopedArgs]) expect(() => validateCampaignCopy(withField(["facebook_ads", "caption", caption]), ...args)).toThrow("unsupported price or percentage");
+  });
+
+  test("a rupee word never satisfies a symbol price or the reverse, and an ordinary 'hrs'/'Mrs' is not a price", () => {
+    const rupeeSource: CollectedSource = { ...productSource, text: "We make a weekend loaf for Rs. 120." };
+    const rupeeReport: ResearchReport = { ...structuredClone(report), evidence: report.evidence.map((item) => (item.id === "fact-1" ? { ...item, quote: rupeeSource.text } : item)) };
+    const args = [rupeeReport, opportunity, [rupeeSource], enrichment] as const;
+    expect(() => validateCampaignCopy(withField(["facebook_ads", "caption", "The Weekend loaf, Rs 120."]), ...args)).not.toThrow();
+    expect(() => validateCampaignCopy(withField(["facebook_ads", "caption", "The Weekend loaf, ₹120."]), ...args)).toThrow("unsupported price or percentage");
+    // A sourced rupee price is still a commercial promise: without dated exact-location evidence it is rejected.
+    const scopedRupee = [rupeeReport, opportunity, [{ ...rupeeSource, context }], candidate] as const;
+    expect(() => validateCampaignCopy(withField(["facebook_ads", "caption", "The Weekend loaf, Rs 120."]), ...scopedRupee)).toThrow("dated, original evidence");
+    for (const caption of ["Slow-baked over 2 hrs 30 min.", "Mrs 50 years of baking is not a price."]) {
+      expect(() => validateCampaignCopy(withField(["facebook_ads", "caption", caption]), ...unscopedArgs), caption).not.toThrow();
+    }
+  });
+
+  test("both live-run strings still pass unchanged through strict and completed validation", () => {
+    const copy = generatedDraft();
+    channel(copy, "click_to_whatsapp").body = THEOBROMA_CTWA_BODY;
+    channel(copy, "instagram_carousel").caption = GRANDMA_CAROUSEL_ONLY;
+    for (const [strict, completed] of [
+      [validateCampaignCopy(structuredClone(copy), ...scopedArgs), validateCompletedCampaignCopy(structuredClone(copy), ...scopedArgs)],
+      [validateCampaignCopy(structuredClone(copy), ...summaryScopedArgs), validateCompletedCampaignCopy(structuredClone(copy), ...summaryScopedArgs)],
+    ]) {
+      for (const result of [strict, completed]) {
+        expect(channel(result, "click_to_whatsapp").body).toBe(THEOBROMA_CTWA_BODY);
+        expect(channel(result, "instagram_carousel").caption).toBe(GRANDMA_CAROUSEL_ONLY);
+      }
+      expect(completed.claimRepairs).toBeUndefined();
+    }
   });
 });

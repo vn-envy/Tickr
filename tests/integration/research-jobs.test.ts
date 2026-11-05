@@ -417,6 +417,59 @@ test("completed analysis validation failures preserve a bound local-only retry a
   } finally { await rm(resolve(".data/runs", run.id), { recursive: true, force: true }); }
 });
 
+test("hosted run 7f7a5df2 shape: a stored analysis that cited business facts as customer evidence resumes locally after repair, with no paid request", async () => {
+  // Synthetic replica: the stored completed response cites two business facts under the customer finding.
+  const site: CollectedSource = { id: "source-site", kind: "official_website", title: "Synthetic ordering page", url: null, text: "Order online through Swiggy and Zomato. Our cakes are best enjoyed the same day.", retrievedAt: "2026-11-01T00:00:00.000Z", acquisition: "owner_supplied" };
+  const stored = {
+    summary: "Synthetic evidence supports a morning-bake story.",
+    evidence: [
+      { id: "ev1", sourceId: "source1", quote: "We bake sourdough every morning.", claim: "The owner reports daily sourdough baking.", subject: "business", kind: "fact" },
+      { id: "ev4", sourceId: "source-site", quote: "Order online through Swiggy and Zomato.", claim: "The site lists Swiggy and Zomato as ordering channels.", subject: "business", kind: "fact" },
+      { id: "ev5", sourceId: "source-site", quote: "Our cakes are best enjoyed the same day.", claim: "The site advises same-day consumption.", subject: "business", kind: "fact" },
+    ],
+    findings: [
+      { area: "business", summary: "The owner reports a daily bake.", evidenceIds: ["ev1"], caveats: [] },
+      { area: "customer", summary: "No independent customer signals for this exact shop were retrieved. Supported operational context is ordering through Swiggy/Zomato and same-day freshness advice.", evidenceIds: ["ev4", "ev5"], caveats: [] },
+      { area: "competitor", summary: "No competitor evidence was supplied.", evidenceIds: [], caveats: [] },
+      { area: "content", summary: "The daily bake can inform content.", evidenceIds: ["ev1"], caveats: [] },
+    ],
+    opportunities: [{ ...report.opportunities[0], evidenceIds: ["ev1", "ev4"] }],
+    recommendedOpportunityId: "op1", unknowns: ["Customer demand is unknown."], ownerQuestions: [],
+  };
+  const { analyzeBusiness, hasBoundCompletedAnalysis } = await import("../../lib/research/analyze");
+  const dep = dependencies();
+  dep.collectSources = vi.fn(async () => ({ sources: [source, site], warnings: [] }));
+  dep.hasBoundCompletedAnalysis = hasBoundCompletedAnalysis;
+  const request = vi.fn(async () => ({ status: "completed", output: [{ type: "message", content: [{ type: "output_text", text: JSON.stringify(stored) }] }], usage: { input_tokens: 10, output_tokens: 20 } }));
+  const metaClient = { requestJson: request as never };
+  let beforeRepair = true;
+  // The first attempt reproduces the pre-repair outcome: the completed response is stored, then validation is rejected.
+  dep.analyzeBusiness = vi.fn(async (analysisInput) => {
+    const result = await analyzeBusiness(analysisInput, { client: metaClient });
+    if (beforeRepair) throw new AnalysisValidationError();
+    return result;
+  });
+  const run = await store.enqueueResearch(businessId, input);
+  try {
+    await runNextJob({ store, dependencies: dep });
+    expect((await store.view(run.id)).error).toContain("local validation retry");
+    expect(request).toHaveBeenCalledTimes(1);
+    beforeRepair = false;
+    dep.credentialPresent = () => false;
+    await store.retry(run.id);
+    await runNextJob({ store, dependencies: dep });
+    const complete = await store.view(run.id);
+    expect(complete.stage).toBe("awaiting_selection");
+    const customer = complete.report!.findings.find((finding) => finding.area === "customer")!;
+    expect(customer.evidenceIds).toEqual([]);
+    expect(customer.caveats[0]).toBe("Business context cited under customer signals was removed: those statements are business facts, not customer evidence.");
+    expect(complete.report!.unknowns.some((unknown) => unknown.startsWith("Local validation removed 2 citations (ev4, ev5) from the customer finding"))).toBe(true);
+    expect(dep.analyzeBusiness).toHaveBeenLastCalledWith(expect.objectContaining({ requireCompletedResponse: true }));
+    expect(request).toHaveBeenCalledTimes(1);
+    expect((await client.run.findUniqueOrThrow({ where: { id: run.id } })).modelCalls).toBe(1);
+  } finally { await rm(resolve(".data/runs", run.id), { recursive: true, force: true }); }
+});
+
 test("a missing saved analysis response cannot turn an explicit local validation retry into a paid request", async () => {
   const dep = dependencies();
   const run = await store.enqueueResearch(businessId, input);
