@@ -19,7 +19,7 @@ Tickr never publishes, never spends ad budget and never contacts anyone.
 
 ## Try it
 
-- **Live app:** https://vn-envy--tickr.us-east.modal.run. It is behind an access code, which the team can provide on request.
+- **Hosted app:** the demo was recorded on Tickr's Modal deployment, which has since been stopped to save cost; there is no public live access. To run your own copy, see [Run it locally](#run-it-locally) or [deploy/README.md](deploy/README.md).
 - **Demo video:** [demo/tickr-demo.mp4](demo/tickr-demo.mp4) (2:18): a real run on the hosted app, from one link to the finished kit, with each Meta model labelled as it works. The script and timeline are in [demo/SCRIPT.md](demo/SCRIPT.md).
 - **Judge guide:** [docs/JUDGES.md](docs/JUDGES.md) explains what to look at and where each capability lives in the code.
 

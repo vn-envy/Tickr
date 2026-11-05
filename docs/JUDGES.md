@@ -4,7 +4,7 @@ Tickr Autopilot turns one link and one goal into a reviewed campaign kit with on
 
 ## What to look at
 
-Open the live app at https://vn-envy--tickr.us-east.modal.run. It needs an access code, which the team can provide on request. Paste a business website, a Google Maps link or a `share.google` link, and pick a goal.
+Watch the demo video, [demo/tickr-demo.mp4](../demo/tickr-demo.mp4) (2:18). It is a real run, recorded on the hosted app; [demo/SCRIPT.md](../demo/SCRIPT.md) gives its timeline. The hosted app has since been stopped, so there is no live access. To run Tickr yourself, see the README. In the app, you paste a business website, a Google Maps link or a `share.google` link and pick a goal. The video and the steps below follow what happens next.
 
 1. **Live run flow.** After you start, the screen moves through phases on its own. You don't need to enter anything else.
 2. **Director's room.** The phase rail, the director's log and the media wall. The wall shows every harvested photo with Spark's verdict and grounded box. Hover or focus a tile to see its reasons. Excluded photos show why, for example a person without consent, a logo or signage.

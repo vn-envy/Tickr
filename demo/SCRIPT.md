@@ -1,6 +1,6 @@
 # Tickr demo video
 
-`tickr-demo.mp4` (2:18, 1920x1080) records a real Autopilot run on the hosted app at https://vn-envy--tickr.us-east.modal.run, recorded on 5 November 2026.
+`tickr-demo.mp4` (2:18, 1920x1080) records a real Autopilot run on Tickr's hosted Modal deployment on 5 November 2026. The deployment has since been stopped to save cost.
 
 - **Run:** Grandma Daphne's Bakehouse, Hyderabad, from its official website (`grandmadaphnes.com`) with the goal "Get the bakery's story out to differentiate it from other bakeries".
 - **Code:** deployed commit `d338437`.
