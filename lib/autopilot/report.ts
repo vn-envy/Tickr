@@ -160,6 +160,15 @@ export interface SamRecord {
   responseId: string | null;
   objectCount: number | null;
   note: string | null;
+  /**
+   * Shape-quality gate of an image selection (lib/media/mask-quality.ts). `clean` false: the cutout
+   * was not used anywhere and the photo was shown uncut. Absent for video, no-match and older records.
+   */
+  maskQuality?: {
+    clean: boolean; measured: boolean; solidity: number; roughness: number; components: number; largestComponentShare: number;
+    cutThrough: { side: "top" | "bottom" | "left" | "right"; depth: number; span: number; maskSpan: number; strong: boolean } | null;
+    failures: Array<"low_solidity" | "rough_edge" | "fragmented" | "cut_through">;
+  } | null;
 }
 
 export function publicSam(record: SamRecord): AutopilotPublicState["sam"][number] {

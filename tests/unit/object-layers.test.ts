@@ -235,4 +235,27 @@ describe("refined SAM layers on real-photo-like masks", () => {
     expect(parts(await decode(raw.maskPng, 1))).toBeGreaterThan(2);
     expect(raw.refinement).toBeNull();
   });
+
+  test("each layer carries a deterministic shape-quality report: a smooth disk is clean, a mask that stops mid-object is not", async () => {
+    const subjectBoxes = { "2": { left: 60, top: 30, right: 181, bottom: 151 } };
+    const { layer } = await bigLayer({ subjectBoxes });
+    expect(layer!.quality).toMatchObject({ clean: true, measured: true, failures: [], components: 1, largestComponentShare: 1 });
+    expect(layer!.quality.solidity).toBeGreaterThan(0.95);
+    // A torn selection: solid top of the subject box, then a ragged cut about half way down it.
+    const width = box.x2 - box.x1 + 1, height = box.y2 - box.y1 + 1, torn = new Uint8Array(width * height);
+    for (let x = 60; x <= 180; x++) {
+      const cut = 85 + (Math.floor(x / 5) % 3 - 1) * 6;
+      for (let y = 30; y < cut; y++) torn[(y - box.y1) * width + x - box.x1] = 1;
+    }
+    const bytes = await sharp(photo(), { raw: { ...big, channels: 4 } }).png().toBuffer();
+    const requestJson = vi.fn().mockResolvedValue(samResponse(samImageWire([{ id: 2, box, raster: torn, confidence: .8 }], big)));
+    const result = await segmentMetaImage({ bytes, mimeType: "image/png", geometry: bigGeometry, sourceAssetId: "synthetic-site-photo", sourceProvenance: "source_photo" }, { client: { requestJson } });
+    const cut = await composeObjectLayer(bytes, result, 2, { subjectBoxes });
+    expect(cut!.quality.clean).toBe(false);
+    expect(cut!.quality.failures).toContain("cut_through");
+    expect(cut!.quality.cutThrough).toMatchObject({ side: "bottom", strong: true });
+    // Only the decision changes: the layer still selects real pixels and generates none.
+    expect(cut!.provenance).toMatchObject({ originalSubjectPixelsPreserved: true, generatedPixelsOnSubject: 0 });
+    expect((await composeObjectLayer(bytes, result, 2, { subjectBoxes }))!.quality).toEqual(cut!.quality);
+  });
 });

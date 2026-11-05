@@ -4,6 +4,7 @@ import type { SamObjectPrompt } from "../meta/sam-prompts";
 import type { MetaSegmentationPromptKind, MetaSegmentationRegionOrigin, MetaSegmentationResult, MetaSegmentedObject } from "../meta/segmentation";
 import { maskSigmaFor, refineMaskAlpha, type MaskRefinementReport } from "../campaign/cinema/mask-refine";
 import type { PixelBounds } from "./cinema-types";
+import { maskShapeQuality, type MaskShapeQuality } from "./mask-quality";
 
 /**
  * Per-object SAM layers at full source size. A layer only SELECTS real pixels: decoded source
@@ -11,8 +12,11 @@ import type { PixelBounds } from "./cinema-types";
  * the selection is the SAM mask after a deterministic alpha-only refinement (mask-refine.ts:
  * specks and outside-box fragments dropped, pin-holes filled, coarse-grid stair steps re-decoded
  * smoothly, close/open, no growth past a small margin, anti-aliased edge), so real-photo cutouts
- * have clean edges; the SAM response's own mask is never modified. Nothing here verifies product
- * identity; the region origin and label are local provenance only.
+ * have clean edges; the SAM response's own mask is never modified. Each layer also carries a
+ * deterministic shape-quality report of that selection (mask-quality.ts: solidity, roughness,
+ * fragments, cut-through of the subject box), computed once here, so callers can refuse a cutout
+ * whose mask stopped mid-object. Nothing here verifies product identity; the region origin and
+ * label are local provenance only.
  */
 const MAX_SOURCE_PIXELS = 16_777_216;
 const MAX_MASK_PNG_BYTES = 16 * 1024 * 1024;
@@ -58,6 +62,11 @@ export interface ObjectLayer {
   sha256s: { source: string; cutout: string; mask: string; samMask: string };
   /** What the alpha-only refinement changed; null when refinement was disabled. */
   refinement: MaskRefinementReport | null;
+  /**
+   * Shape quality of the selection (`maskPng`) against the object's subject box, when one was
+   * given. `quality.clean` false: the cutout should not be used as a subject layer.
+   */
+  quality: MaskShapeQuality;
   provenance: {
     kind: "sam_object_layer";
     responseId: string;
@@ -162,6 +171,7 @@ async function composeDecoded(source: DecodedSource, result: MetaSegmentationRes
   if (!selected || coverage < minCoverage || coverage > maxCoverage) return null;
   const centroid = maskCentroid(mask, source.width, source.height);
   if (!centroid) return null;
+  const quality = maskShapeQuality(mask, source.width, source.height, { box: options.subjectBoxes?.[object.id] ?? null });
   const [cutoutPng, maskPng] = await Promise.all([
     sharp(cutout, { raw: { width: source.width, height: source.height, channels: 4 } }).png().toBuffer(),
     sharp(mask, { raw: { width: source.width, height: source.height, channels: 1 } }).toColourspace("b-w").png().toBuffer(),
@@ -169,7 +179,7 @@ async function composeDecoded(source: DecodedSource, result: MetaSegmentationRes
   return {
     objectId: object.id, promptObjectId: object.promptObjectId ?? null, label: object.label ?? null, regionOrigin: object.regionOrigin ?? "concept_prompt", confidence: object.confidence,
     width: source.width, height: source.height, bounds: { left: minX, top: minY, right: maxX + 1, bottom: maxY + 1 }, coverage, selectedPixels: selected, centroid,
-    cutoutPng, maskPng, sha256s: { source: source.sha256, cutout: sha256(cutoutPng), mask: sha256(maskPng), samMask: sha256(object.maskPng) }, refinement,
+    cutoutPng, maskPng, sha256s: { source: source.sha256, cutout: sha256(cutoutPng), mask: sha256(maskPng), samMask: sha256(object.maskPng) }, refinement, quality,
     provenance: { kind: "sam_object_layer", responseId: result.responseId, promptKind: result.promptKind ?? result.provenance.promptKind ?? "concept", sourceAssetId: result.provenance.sourceAssetId,
       sourceProvenance: result.provenance.sourceProvenance, alphaRefinement: refinement ? "sam_mask_alpha_only_refinement" : "none", originalSubjectPixelsPreserved: true, generatedPixelsOnSubject: 0, semanticIdentityVerified: false, requiresReview: true },
   };

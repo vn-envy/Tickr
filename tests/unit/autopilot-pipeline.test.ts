@@ -26,12 +26,13 @@ import { applyDeterministicFixes, type CritiqueSnapshot } from "../../lib/autopi
 import { officialWebsiteFor, selectHarvest } from "../../lib/autopilot/harvest";
 import { defaultAutopilotDependencies, produceAutopilotCampaign, type AutopilotDependencies } from "../../lib/autopilot/pipeline";
 import { heroTrack } from "../../lib/autopilot/produce";
+import { maskShapeQuality } from "../../lib/media/mask-quality";
 import { AutopilotPaidStepError, AutopilotResumableError, AutopilotQualitySchema, type AutopilotProductionInput } from "../../lib/autopilot/production-types";
 import { readPublicFile, readPublicState, type AutopilotPublicState } from "../../lib/autopilot/public-state";
 import { ILLUSTRATION_ASSET_ID, ILLUSTRATION_REEL_LABEL } from "../../lib/autopilot/produce";
 import type { BusinessEnrichment, CollectedSource, ResearchOpportunity, ResearchReport } from "../../lib/research/contracts";
 import { ChannelSchema } from "../../lib/schemas/common";
-import { samImageWire, samResponse, samVideoWire } from "../helpers/sam-wire";
+import { ellipseRaster, samImageWire, samResponse, samVideoWire } from "../helpers/sam-wire";
 
 // Every image, clip, business, claim and model response in this file is SYNTHETIC and generated
 // locally (sharp shapes, FFmpeg lavfi testsrc2/color). Meta adapters run for real with injected
@@ -257,6 +258,35 @@ beforeEach(() => {
 
 const kitFile = (outputDir: string, name: string) => readFile(join(outputDir, name), "utf8");
 
+/**
+ * SYNTHETIC torn selection for a box (inclusive source pixels): solid top of the box, then a
+ * ragged cut ~45% of the way down it, like the 5 Nov 2026 jar mask that stopped at its label.
+ */
+function tornRaster(width: number, height: number): Uint8Array {
+  const raster = new Uint8Array(width * height);
+  for (let x = 0; x < width; x++) {
+    const cut = Math.round(height * 0.45 + ((Math.floor(x / 6) * 7) % 5 - 2) * 4);
+    for (let y = 0; y < cut; y++) raster[y * width + x] = 1;
+  }
+  return raster;
+}
+/** SAM image fake whose box-prompted selection is torn for the assets in `torn`, an inscribed ellipse otherwise. */
+function selectiveSegment(h: Harness, torn: (assetId: string) => boolean): AutopilotDependencies["segment"] {
+  return (request, dependencies) => segmentMetaImage(request, { ...dependencies, client: fakeClient(async () => {
+    h.calls.samImage++;
+    h.segmentRequests.push(request);
+    const { width, height } = await sharp(request.bytes).metadata();
+    const box = request.geometry![0].prompts[0].box!;
+    const w = box.x2 - box.x1 + 1, hh = box.y2 - box.y1 + 1;
+    return samResponse(samImageWire([{ id: 0, box, confidence: 0.92, raster: torn(request.sourceAssetId) ? tornRaster(w, hh) : ellipseRaster(w, hh) }], { width: width!, height: height! }));
+  }) });
+}
+type KitProduction = Parameters<AutopilotDependencies["renderKit"]>[4];
+/** Records every production the pipeline hands to the real kit renderer. */
+function capturingKit(productions: KitProduction[]): AutopilotDependencies["renderKit"] {
+  return async (...args) => { productions.push(args[4]); return defaultAutopilotDependencies.renderKit(...args); };
+}
+
 describe("Autopilot production pipeline", () => {
   test("owner photos and an owner clip become a SAM-tracked Reel with cutouts, a self-critique, safe fixes and a director's room", async () => {
     const h = await harness("tracked", {
@@ -359,6 +389,59 @@ describe("Autopilot production pipeline", () => {
     expect(director.sources.officialWebsite).toBe("https://www.synthetic-cafe-fixture.com/");
     expect(director.media[0].sourcePageUrl).toBe("https://www.synthetic-cafe-fixture.com/");
     expect(result.campaign.reviewNotes.some((note) => note.includes("unknown reuse rights"))).toBe(true);
+  }, 400_000);
+
+  test("a hero cutout whose mask stops mid-object is never used: another photo's clean cutout drives the depth Reel and the hero is shown uncut", async () => {
+    const productions: KitProduction[] = [];
+    const h = await harness("torn-hero", { photos: 2, renderKit: capturingKit(productions) });
+    let heroId = "";
+    h.deps.segment = selectiveSegment(h, (assetId) => { heroId ||= assetId; return assetId === heroId; });
+    const depthInputs: Array<Parameters<typeof renderStillDepthReel>[0]> = [];
+    h.deps.renderStillDepth = (async (input: Parameters<typeof renderStillDepthReel>[0]) => { depthInputs.push(input); return fakeStillDepth(input); }) as typeof renderStillDepthReel;
+    const result = await produceAutopilotCampaign(h.input, h.deps);
+    // Existing SAM results only: one request per planned photo, none for the fallback.
+    expect(h.calls.samImage).toBe(2);
+    const otherId = h.segmentRequests.map((request) => request.sourceAssetId).find((id) => id !== heroId)!;
+    expect(result.quality.reelMode).toBe("still_depth");
+    const notes = result.quality.notes.join(" ");
+    expect(notes).toContain(`SAM cutout for ${heroId} was not used: its mask stopped mid-object; the photo is shown uncut.`);
+    expect(notes).toContain(`use the clean SAM cutout of ${otherId}`);
+    // The depth Reel (and its cover) was composed from the clean selection, never the torn one.
+    expect(depthInputs).toHaveLength(1);
+    const decoded = await sharp(depthInputs[0].subjectMask).removeAlpha().greyscale().raw().toBuffer({ resolveWithObject: true });
+    expect(maskShapeQuality(decoded.data, decoded.info.width, decoded.info.height).clean).toBe(true);
+    // Every placement of the hero photo is the real photo uncut; the other photo keeps its cutout.
+    const production = productions.at(-1)!;
+    expect(production.image?.foregroundBytes).toBeUndefined();
+    expect(production.image?.provenanceLabel).toBe("OWNER PHOTO");
+    expect(production.image?.description).toContain("the photo is shown uncut");
+    const carousel = production.render!.carouselImages!;
+    expect(carousel.some((image) => !image.foregroundBytes && image.provenanceLabel === "OWNER PHOTO")).toBe(true);
+    expect(carousel.some((image) => image.foregroundBytes && image.provenanceLabel === "OWNER PHOTO · SAM CUTOUT")).toBe(true);
+    for (const image of Object.values(production.render!.channelImages ?? {})) if (image!.description.includes("shown uncut")) expect(image!.foregroundBytes).toBeUndefined();
+    const director = JSON.parse(await kitFile(h.input.outputDir, "director-report.json")) as { reel: { ledger: { generatedPixelsOnSubject: number } }; segmentation: Array<{ assetId: string; status: string; maskQuality?: { clean: boolean; failures: string[] } }> };
+    expect(director.reel.ledger.generatedPixelsOnSubject).toBe(0);
+    expect(director.segmentation.find((record) => record.assetId === heroId)).toMatchObject({ status: "segmented", maskQuality: { clean: false, failures: expect.arrayContaining(["cut_through"]) } });
+    expect(director.segmentation.find((record) => record.assetId === otherId)).toMatchObject({ status: "segmented", maskQuality: { clean: true, failures: [] } });
+  }, 400_000);
+
+  test("with no clean cutout the hero photo is shown uncut and the run still renders its Reel", async () => {
+    const productions: KitProduction[] = [];
+    const h = await harness("torn-all", { photos: 2, renderKit: capturingKit(productions) });
+    h.deps.segment = selectiveSegment(h, () => true);
+    let depthCalls = 0;
+    h.deps.renderStillDepth = (async (input: Parameters<typeof renderStillDepthReel>[0]) => { depthCalls++; return fakeStillDepth(input); }) as typeof renderStillDepthReel;
+    const result = await produceAutopilotCampaign(h.input, h.deps);
+    expect(h.calls.samImage).toBe(2);
+    expect(depthCalls).toBe(0);
+    expect(result.quality.reelMode).toBe("legacy");
+    expect(result.quality.notes.join(" ")).toContain("no other selected photo has a clean cutout; the Reel uses composed crops of the uncut hero photo");
+    const production = productions.at(-1)!;
+    for (const image of [production.image!, ...production.render!.carouselImages!, ...Object.values(production.render!.channelImages ?? {}).map((image) => image!)]) {
+      expect(image.foregroundBytes).toBeUndefined();
+      expect(image.provenanceLabel).not.toContain("CUTOUT");
+    }
+    expect(result.campaign.assets.some((asset) => asset.filename === "instagram_reel.mp4")).toBe(true);
   }, 400_000);
 
   test("an exhausted budget skips optional SAM, shot-log and critic steps without paid requests", async () => {

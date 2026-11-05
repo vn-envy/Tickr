@@ -44,6 +44,31 @@ function exclusionReasons(asset: AnalyzedAsset, offerApproved: boolean): string[
   return reasons;
 }
 
+/**
+ * Depth-Reel subject when the planned hero's SAM cutout failed the shape-quality gate. `clean`
+ * holds the asset ids whose existing SAM cutout passed it (no new SAM request is ever made for
+ * this). The planned still is kept when its cutout is clean. Otherwise the first photo in the
+ * director's ranking order that (1) has a clean cutout, (2) is real media (never the
+ * illustration), (3) still passes every safety/consent/exclusion rule above (offers unapproved,
+ * as the pipeline plans) and is not excluded by the plan, (4) has moderate-or-better goal fit and
+ * (5) is one of the plan's hero/carousel picks. Null: no such photo; the caller shows the planned
+ * hero uncut.
+ */
+export function cleanReelSubject(plan: Pick<ProductionPlan, "hero" | "carousel" | "ranking" | "excluded">, assets: readonly AnalyzedAsset[], planned: StillPick, clean: ReadonlySet<string>): StillPick | null {
+  if (clean.has(planned.assetId)) return planned;
+  const picks = [plan.hero, ...plan.carousel].filter((pick): pick is StillPick => Boolean(pick));
+  const excluded = new Set(plan.excluded.map((item) => item.assetId));
+  for (const entry of plan.ranking) {
+    if (entry.kind !== "image" || entry.assetId === planned.assetId || !clean.has(entry.assetId) || excluded.has(entry.assetId)) continue;
+    const asset = assets.find((item) => item.assetId === entry.assetId);
+    const pick = picks.find((item) => item.assetId === entry.assetId);
+    if (!asset || !pick || asset.kind !== "image" || asset.provenance === "meta_illustration" || !asset.analysis) continue;
+    if (exclusionReasons(asset, false).length || FIT[asset.analysis.goalFit] < FIT.moderate) continue;
+    return pick;
+  }
+  return null;
+}
+
 export function segmentationPlan(asset: AnalyzedAsset): SegmentationPlan {
   const subject = asset.analysis?.primarySubject;
   if (!subject) return { kind: "none" };

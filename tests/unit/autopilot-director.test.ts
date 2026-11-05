@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { planProduction, scoreStill } from "../../lib/autopilot/director";
+import { cleanReelSubject, planProduction, scoreStill } from "../../lib/autopilot/director";
 import { chooseAutopilotOpportunity } from "../../lib/autopilot/select";
 import { AutopilotBudgetError, createAutopilotBudget } from "../../lib/autopilot/budget";
 import type { AnalyzedAsset } from "../../lib/autopilot/contracts";
@@ -26,6 +26,28 @@ function video(id: string, moments: NonNullable<AnalyzedAsset["shotLog"]>["momen
 }
 
 describe("Autopilot director", () => {
+  it("replaces an unclean hero cutout with the best-ranked eligible photo whose existing cutout is clean", () => {
+    const assets = [
+      image("hero", { goalFit: "strong", heroWorthy: true }), image("weak", { goalFit: "weak", subjectKind: "interior" }),
+      image("second", { goalFit: "moderate", subjectKind: "exterior_storefront" }), image("third", { goalFit: "strong" }),
+    ];
+    const plan = planProduction({ focusOfferingId: null, offerApproved: false, assets });
+    expect(plan.hero?.assetId).toBe("hero");
+    const hero = plan.hero!;
+    const ranked = plan.ranking.map((entry) => entry.assetId).filter((id) => id !== "hero" && id !== "weak");
+    // A clean planned hero is kept; otherwise the director's ranking order decides among clean photos.
+    expect(cleanReelSubject(plan, assets, hero, new Set(["hero", "second", "third"]))).toBe(hero);
+    expect(cleanReelSubject(plan, assets, hero, new Set(["second", "third"]))?.assetId).toBe(ranked[0]);
+    expect(cleanReelSubject(plan, assets, hero, new Set([ranked[1]]))?.assetId).toBe(ranked[1]);
+    // Weak goal fit, the illustration, a later safety risk, an unknown asset or no clean cutout: no replacement.
+    expect(cleanReelSubject(plan, assets, hero, new Set(["weak"]))).toBeNull();
+    expect(cleanReelSubject(plan, assets.map((asset) => asset.assetId === "second" ? { ...asset, provenance: "meta_illustration" as const } : asset), hero, new Set(["second"]))).toBeNull();
+    expect(cleanReelSubject(plan, assets.map((asset) => asset.assetId === "third" ? image("third", { goalFit: "strong", risks: [{ kind: "possible_minor", box: null }] }) : asset), hero, new Set(["third"]))).toBeNull();
+    expect(cleanReelSubject({ ...plan, excluded: [{ assetId: "third", reasons: ["synthetic"] }] } as typeof plan, assets, hero, new Set(["third"]))).toBeNull();
+    expect(cleanReelSubject(plan, assets, hero, new Set(["missing"]))).toBeNull();
+    expect(cleanReelSubject(plan, assets, hero, new Set())).toBeNull();
+  });
+
   it("excludes unsafe media before ranking and explains why", () => {
     const plan = planProduction({ focusOfferingId: null, offerApproved: false, assets: [
       image("minor", { risks: [{ kind: "possible_minor", box: null }] }),

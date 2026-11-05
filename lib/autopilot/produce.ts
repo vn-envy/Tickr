@@ -13,6 +13,7 @@ import { OwnerClipError, renderClipMatches, verifyRenderClip, type normalizeOwne
 import type { CompositionLedger, NormalizedClip } from "../media/cinema-types";
 import type { MediaLibrary } from "../media/library";
 import { MaskletStoreError } from "../media/masklets";
+import { maskQualityNote, maskShapeQuality, type MaskShapeQuality } from "../media/mask-quality";
 import { composeObjectLayers, subjectBoxesFromPrompts, type ObjectLayer } from "../media/object-layers";
 import { MetaClientError } from "../meta/config";
 import { scaleSamBox, type SamObjectPrompt } from "../meta/sam-prompts";
@@ -22,6 +23,7 @@ import type { trackMetaVideo } from "../meta/sam-video";
 import type { ModelUsage } from "../research/contracts";
 import { clipConsent, sparkModelUsage, type PaidGate } from "./analyze";
 import type { AnalyzedAsset, ProductionPlan, ReelPlan, SegmentationPlan, StillPick } from "./contracts";
+import { cleanReelSubject } from "./director";
 import type { HarvestedAsset } from "./harvest";
 import { AutopilotCheckpointError, bounded, readCheckpoint, sha256Hex, writeCheckpoint, type SamRecord } from "./report";
 
@@ -115,7 +117,29 @@ export function stillProvenanceLabel(provenance: HarvestedAsset["provenance"], c
 /** Attempt keys of segmentStill (checkpoint- and path-safe). */
 const ATTEMPT_KEY = /^[a-z0-9][a-z0-9-]{0,23}$/;
 
-export interface StillLayer { assetId: string; cutoutPath: string; maskPath: string; cutoutSha256: string; maskSha256: string; coverage: number; objectId: string }
+export interface StillLayer {
+  assetId: string; cutoutPath: string; maskPath: string; cutoutSha256: string; maskSha256: string; coverage: number; objectId: string;
+  /**
+   * Shape quality of the selection (object-layers / mask-quality.ts). An unclean layer is kept on
+   * record (and its mask preview shown) but never used as a cutout: placements show the photo
+   * uncut. Checkpoints written before the gate lack it; segmentStill recomputes it from the saved
+   * mask and the same subject box (deterministic, no new request).
+   */
+  quality: MaskShapeQuality;
+}
+
+/** A layer may be used as a subject cutout only when its mask passed the shape-quality gate. */
+export function layerIsClean(layer: Pick<StillLayer, "quality"> | null | undefined): boolean {
+  return Boolean(layer && layer.quality.clean);
+}
+
+/** Compact quality record for the director report and the SAM record. */
+export function samQualityRecord(quality: MaskShapeQuality): NonNullable<SamRecord["maskQuality"]> {
+  return {
+    clean: quality.clean, measured: quality.measured, solidity: quality.solidity, roughness: quality.roughness, components: quality.components,
+    largestComponentShare: quality.largestComponentShare, cutThrough: quality.cutThrough, failures: [...quality.failures],
+  };
+}
 export interface SegmentOutcome { layer: StillLayer | null; record: SamRecord; usage: ModelUsage | null; preview: Buffer | null }
 
 function bestLayer(layers: readonly ObjectLayer[], preferredPromptId: number | null): ObjectLayer | null {
@@ -146,6 +170,13 @@ export async function maskPreview(still: Pick<StillSource, "bytes" | "width" | "
   return sharp(rgb, { raw: { width, height, channels: 3 } }).composite([{ input: overlay, left: 0, top: 0 }]).png().toBuffer();
 }
 
+/** Shape quality of a saved full-size selection PNG (the layer's maskPng), against the subject box. */
+async function savedMaskQuality(maskPng: Buffer, still: Pick<StillSource, "width" | "height">, box: ReturnType<typeof subjectBoxesFromPrompts>[string] | null): Promise<MaskShapeQuality> {
+  const decoded = await sharp(maskPng, { limitInputPixels: 50_000_000 }).removeAlpha().greyscale().raw().toBuffer({ resolveWithObject: true }).catch(() => null);
+  if (!decoded || decoded.info.width !== still.width || decoded.info.height !== still.height || decoded.info.channels !== 1) throw new AutopilotCheckpointError();
+  return maskShapeQuality(decoded.data, decoded.info.width, decoded.info.height, { box });
+}
+
 /**
  * One SAM image selection for a planned still. Box prompts come from Spark's located subject
  * (scaled to the working image); a concept phrase is the fallback. Budget exhaustion, no match
@@ -170,22 +201,29 @@ export async function segmentStill(input: {
     status: "skipped", preview: null, overlayVideo: null, coverage: null, framesTracked: null, elapsedMs: null, responseId: null, objectCount: null, note: null,
   };
   if (plan.kind === "none") return { layer: null, record: { ...base, note: "Spark located no single subject; composed crops are used." }, usage: null, preview: null };
-  const saved = await readCheckpoint<{ layer: StillLayer | null; record: SamRecord; usage: ModelUsage | null }>(input.directory, `sam-${key}`, still.sha256);
+  const geometry: SamObjectPrompt[] | undefined = plan.kind === "geometry"
+    ? [{ objectId: 0, label: bounded(plan.label, 120) || "main subject", origin: "spark_grounding", prompts: [{ frame: 0, box: scaleSamBox(plan.box, { width: input.asset.width, height: input.asset.height }, { width: still.width, height: still.height }) }] }]
+    : undefined;
+  const subjectBoxes = geometry ? subjectBoxesFromPrompts(geometry) : {};
+  const previewLabel = (layer: StillLayer) => `SAM 3.1 selection${layer.quality.clean ? "" : " (not used)"} · ${stillProvenanceLabel(still.provenance, false)}`;
+  const saved = await readCheckpoint<{ layer: (Omit<StillLayer, "quality"> & { quality?: MaskShapeQuality }) | null; record: SamRecord; usage: ModelUsage | null }>(input.directory, `sam-${key}`, still.sha256);
   if (saved) {
     if (saved.layer) {
       const mask = await readFile(saved.layer.maskPath).catch(() => null);
       const cutout = await readFile(saved.layer.cutoutPath).catch(() => null);
       if (!mask || !cutout || sha256Hex(mask) !== saved.layer.maskSha256 || sha256Hex(cutout) !== saved.layer.cutoutSha256) throw new AutopilotCheckpointError();
-      return { ...saved, preview: await maskPreview(still, mask, `SAM 3.1 selection · ${stillProvenanceLabel(still.provenance, false)}`) };
+      // A checkpoint from before the quality gate: the same metrics from the saved selection and the
+      // same subject box (pure local computation; the SAM request is never repeated).
+      const quality = saved.layer.quality ?? await savedMaskQuality(mask, still, subjectBoxes[saved.layer.objectId] ?? null);
+      const layer: StillLayer = { ...saved.layer, quality };
+      const record: SamRecord = { ...saved.record, maskQuality: samQualityRecord(quality), note: quality.clean ? saved.record.note : maskQualityNote(still.assetId, quality) };
+      return { layer, record, usage: saved.usage, preview: await maskPreview(still, mask, previewLabel(layer)) };
     }
-    return { ...saved, preview: null };
+    return { ...saved, layer: null, preview: null };
   }
   const directory = join(input.directory, "sam-image", fileKey);
   const gate = await input.gate("sam_image", directory, "sam");
   if (gate === "exhausted") return { layer: null, record: { ...base, note: "The SAM budget for this run was used up; composed crops are used." }, usage: null, preview: null };
-  const geometry: SamObjectPrompt[] | undefined = plan.kind === "geometry"
-    ? [{ objectId: 0, label: bounded(plan.label, 120) || "main subject", origin: "spark_grounding", prompts: [{ frame: 0, box: scaleSamBox(plan.box, { width: input.asset.width, height: input.asset.height }, { width: still.width, height: still.height }) }] }]
-    : undefined;
   let outcome: Omit<SegmentOutcome, "preview">;
   try {
     const result = await input.segment({
@@ -197,11 +235,12 @@ export async function segmentStill(input: {
     // match (checkpointed below), so a retry never loops on the same stored response.
     let unusable = false;
     const layers = result.status === "segmented"
-      ? await composeObjectLayers(still.bytes, result, { minCoverage: MIN_LAYER_COVERAGE, maxCoverage: MAX_LAYER_COVERAGE, ...(geometry ? { subjectBoxes: subjectBoxesFromPrompts(geometry) } : {}) }).catch(() => { unusable = true; return [] as ObjectLayer[]; })
+      ? await composeObjectLayers(still.bytes, result, { minCoverage: MIN_LAYER_COVERAGE, maxCoverage: MAX_LAYER_COVERAGE, ...(geometry ? { subjectBoxes } : {}) }).catch(() => { unusable = true; return [] as ObjectLayer[]; })
       : [];
     const chosen = bestLayer(layers, geometry ? 0 : null);
     const record: SamRecord = { ...base, status: chosen ? "segmented" : unusable ? "failed" : "no_match", coverage: chosen?.coverage ?? null, elapsedMs: result.elapsedMs, responseId: result.responseId, objectCount: result.objects.length,
-      note: chosen ? null : unusable ? "SAM's masks could not be composed into a layer locally; composed crops are used and the request was not repeated." : "SAM returned no usable selection; composed crops are used and the request was not repeated." };
+      ...(chosen ? { maskQuality: samQualityRecord(chosen.quality) } : {}),
+      note: chosen ? (chosen.quality.clean ? null : maskQualityNote(still.assetId, chosen.quality)) : unusable ? "SAM's masks could not be composed into a layer locally; composed crops are used and the request was not repeated." : "SAM returned no usable selection; composed crops are used and the request was not repeated." };
     let layer: StillLayer | null = null;
     if (chosen) {
       const layerDir = join(input.directory, "layers");
@@ -209,7 +248,7 @@ export async function segmentStill(input: {
       const cutoutPath = join(layerDir, `${fileKey}.cutout.png`), maskPath = join(layerDir, `${fileKey}.mask.png`);
       await writeFile(cutoutPath, chosen.cutoutPng, { mode: 0o600 });
       await writeFile(maskPath, chosen.maskPng, { mode: 0o600 });
-      layer = { assetId: still.assetId, cutoutPath, maskPath, cutoutSha256: chosen.sha256s.cutout, maskSha256: chosen.sha256s.mask, coverage: chosen.coverage, objectId: chosen.objectId };
+      layer = { assetId: still.assetId, cutoutPath, maskPath, cutoutSha256: chosen.sha256s.cutout, maskSha256: chosen.sha256s.mask, coverage: chosen.coverage, objectId: chosen.objectId, quality: chosen.quality };
     }
     outcome = { layer, record, usage };
   } catch (error) {
@@ -217,7 +256,7 @@ export async function segmentStill(input: {
     outcome = { layer: null, record: { ...base, status: "failed", note: "The SAM selection did not complete; composed crops are used and the request was not repeated." }, usage: null };
   }
   await writeCheckpoint(input.directory, `sam-${key}`, still.sha256, outcome);
-  const preview = outcome.layer ? await maskPreview(still, await readFile(outcome.layer.maskPath), `SAM 3.1 selection · ${stillProvenanceLabel(still.provenance, false)}`) : null;
+  const preview = outcome.layer ? await maskPreview(still, await readFile(outcome.layer.maskPath), previewLabel(outcome.layer)) : null;
   return { ...outcome, preview };
 }
 
@@ -291,12 +330,18 @@ export async function segmentIllustration(input: {
   return { layer: last?.layer ?? null, records, usage, preview: last?.layer ? last.preview : null, notes };
 }
 
-/** The routed image for one placement: real pixels, plus the SAM cutout when one exists. */
+/**
+ * The routed image for one placement: real pixels, plus the SAM cutout when one exists and its
+ * mask passed the shape-quality gate. An unclean cutout is never composited: the placement shows
+ * the real photo uncut (composed crop), labelled without "SAM CUTOUT".
+ */
 export async function renderImageFor(still: StillSource, layer: StillLayer | null, description: string): Promise<RenderImage> {
-  const foreground = layer ? await readFile(layer.cutoutPath) : undefined;
-  if (layer && (!foreground || sha256Hex(foreground) !== layer.cutoutSha256)) throw new AutopilotCheckpointError();
+  const usable = layer && layerIsClean(layer) ? layer : null;
+  const foreground = usable ? await readFile(usable.cutoutPath) : undefined;
+  if (usable && (!foreground || sha256Hex(foreground) !== usable.cutoutSha256)) throw new AutopilotCheckpointError();
   return {
-    bytes: still.bytes, mimeType: still.mimeType, provenance: still.provenance === "official_website" ? "source_photo" : "owner_photo", sourceIds: [], description,
+    bytes: still.bytes, mimeType: still.mimeType, provenance: still.provenance === "official_website" ? "source_photo" : "owner_photo", sourceIds: [],
+    description: layer && !usable ? `${description} ${maskQualityNote(still.assetId, layer.quality)}` : description,
     ...(foreground ? { foregroundBytes: foreground, backgroundStyle: "palette_gradient" as const } : {}),
     provenanceLabel: stillProvenanceLabel(still.provenance, Boolean(foreground)),
   };
@@ -415,10 +460,24 @@ async function filesRecord(paths: { videoPath: string; coverPath: string }) {
 
 const WITHHOLD_VIOLATIONS = new Set(["foreground_occlusion", "subject_missing"]);
 
+/**
+ * The photo whose clean SAM cutout drives the depth Reel: the planned hero when its cutout passed
+ * the shape gate, else the best-ranked other segmented photo with a clean cutout that the director
+ * would also accept (director.cleanReelSubject). Null: no clean cutout exists. Reuses existing SAM
+ * results only.
+ */
+export function reelSubject(context: Pick<ReelContext, "plan" | "analyzed" | "layers">, still: StillPick | null): StillPick | null {
+  if (!still) return null;
+  const clean = new Set([...context.layers].filter(([, layer]) => layerIsClean(layer)).map(([assetId]) => assetId));
+  return cleanReelSubject(context.plan, context.analyzed, still, clean);
+}
+
 async function stillDepthReel(context: ReelContext, still: StillPick | null, notes: string[]): Promise<ReelRecord | null> {
-  const layer = still ? context.layers.get(still.assetId) : undefined;
-  const source = still ? context.stills.get(still.assetId) : undefined;
-  if (!layer || !source) return null;
+  const subject = reelSubject(context, still);
+  const layer = subject ? context.layers.get(subject.assetId) : undefined;
+  const source = subject ? context.stills.get(subject.assetId) : undefined;
+  if (!subject || !layer || !source) return null;
+  if (subject.assetId !== still?.assetId) notes.push(`The hero photo's SAM cutout was not used, so the depth Reel and its cover use the clean SAM cutout of ${subject.assetId}, the next-ranked selected photo.`);
   return depthReel(context, { source, layer, name: "still-depth", label: `${stillProvenanceLabel(source.provenance, false)} · SAM DEPTH`, fallbackNote: "The depth Reel could not be composed locally; the Reel uses composed crops of the hero photo instead." }, notes);
 }
 
@@ -536,7 +595,8 @@ async function trackedReel(context: ReelContext, reel: Extract<ReelPlan, { mode:
   const ownerLabel = asset.provenance === "owner_upload" ? "OWNER VIDEO" : asset.provenance === "owner_instagram" ? "OWNER INSTAGRAM VIDEO" : "OWNER FACEBOOK VIDEO";
   // The CTA end card reuses the hero photo's SAM layer when the footage window is shorter than the Reel.
   const endStill = reel.fallbackStill ? context.stills.get(reel.fallbackStill.assetId) : undefined;
-  const endLayer = reel.fallbackStill ? context.layers.get(reel.fallbackStill.assetId) : undefined;
+  // Only a clean cutout: an unclean one would show a torn product on the end card.
+  const endLayer = reel.fallbackStill && layerIsClean(context.layers.get(reel.fallbackStill.assetId)) ? context.layers.get(reel.fallbackStill.assetId) : undefined;
   const endMask = endLayer ? await readFile(endLayer.maskPath) : null;
   const endCard = endStill && endMask && sha256Hex(endMask) === endLayer!.maskSha256 ? { source: await sharp(endStill.bytes).png().toBuffer(), subjectMask: endMask, provenanceLabel: stillProvenanceLabel(endStill.provenance, true) } : undefined;
   const renderClip = await reelRenderClip(context, asset.assetId, consent, reel, clip, notes);
@@ -608,6 +668,10 @@ export async function produceReel(context: ReelContext): Promise<ReelRecord> {
   const depth = await stillDepthReel(context, still, notes);
   const carried = { sam: fallback?.sam ?? null, usage: fallback?.usage ?? [] };
   if (depth) return { ...depth, ...carried, notes };
-  if (still) notes.push("No SAM layer exists for the hero photo; the Reel uses composed crops of it.");
+  if (still) {
+    notes.push(context.layers.has(still.assetId)
+      ? "The hero photo's SAM cutout was not used and no other selected photo has a clean cutout; the Reel uses composed crops of the uncut hero photo."
+      : "No SAM layer exists for the hero photo; the Reel uses composed crops of it.");
+  }
   return { ...emptyRecord(), ...carried, notes };
 }

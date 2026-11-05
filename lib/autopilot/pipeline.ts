@@ -25,7 +25,7 @@ import { applyDeterministicFixes, applyRecheckFixes, ARCHIVE_FILE, combinedVerdi
 import { planProduction } from "./director";
 import { defaultHarvestDependencies, harvestMedia, harvestThumbnail, officialWebsiteFor, openRunLibrary, type HarvestDependencies, type HarvestRecord } from "./harvest";
 import {
-  illustrationStill, prebuiltReel, produceReel, renderImageFor, savedReel, segmentIllustration, segmentStill, workingStill,
+  illustrationStill, layerIsClean, prebuiltReel, produceReel, renderImageFor, savedReel, segmentIllustration, segmentStill, workingStill,
   ILLUSTRATION_ASSET_ID, MAX_SEGMENTED_STILLS, type ReelDependencies, type ReelRecord, type ReelVariant, type StillLayer, type StillSource,
 } from "./produce";
 import { AutopilotPaidStepError, AutopilotResumableError, type AutopilotProductionInput, type AutopilotProductionResult, type AutopilotQuality } from "./production-types";
@@ -274,7 +274,9 @@ async function produce(input: AutopilotProductionInput, dependencies: AutopilotD
     const source = await still(pick.assetId);
     const outcome = await segmentStill({ directory, still: source, asset: analyzed.get(pick.assetId)!, pick, gate, segment: dependencies.segment });
     if (outcome.usage) additionalUsage.push(outcome.usage);
-    if (outcome.record.note && outcome.record.status !== "segmented") notes.push(outcome.record.note);
+    // A segmented layer whose mask failed the shape gate is kept on record but never used as a
+    // cutout (renderImageFor and the Reel both check it); its note says the photo is shown uncut.
+    if (outcome.record.note && (outcome.record.status !== "segmented" || (outcome.layer && !layerIsClean(outcome.layer)))) notes.push(outcome.record.note);
     const record = { ...outcome.record };
     if (outcome.layer) layers.set(pick.assetId, outcome.layer);
     if (outcome.preview) {
@@ -312,7 +314,9 @@ async function produce(input: AutopilotProductionInput, dependencies: AutopilotD
     directory, binding: planBinding, plan, analyzed: analysis.assets, harvest: harvest.assets, library, stills, layers,
     business: { name: input.business.name, vertical: input.business.vertical }, mode: input.mode, dependencies,
   };
-  const layerDigest = [...layers.values()].map((layer) => [layer.assetId, layer.maskSha256]);
+  // The shape-gate verdict is part of the binding, so a Reel rendered before the gate (or with a
+  // different verdict) is never reused.
+  const layerDigest = [...layers.values()].map((layer) => [layer.assetId, layer.maskSha256, layerIsClean(layer) ? "clean" : "unclean"]);
   /** Set once the labelled illustration has a SAM layer: from then on the Reel is its depth Reel. */
   let illustration: { still: StillSource; layer: StillLayer } | null = null;
   /**
@@ -380,7 +384,9 @@ async function produce(input: AutopilotProductionInput, dependencies: AutopilotD
       }
       samRecords.push(...records);
       room.state.sam = samRecords.map(publicSam);
-      if (outcome.layer) {
+      if (outcome.layer && !layerIsClean(outcome.layer)) {
+        notes.push("SAM's cutout of the illustration failed the mask shape check, so the Reel uses composed crops of the uncut illustration.");
+      } else if (outcome.layer) {
         illustration = { still: source, layer: outcome.layer };
         const depth = await reelFor(copy, "reel");
         notes.push(...depth.notes);
