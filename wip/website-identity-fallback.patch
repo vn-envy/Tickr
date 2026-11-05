@@ -1,0 +1,705 @@
+diff --git a/docs/AUTOPILOT.md b/docs/AUTOPILOT.md
+index ef38f38..d7c3772 100644
+--- a/docs/AUTOPILOT.md
++++ b/docs/AUTOPILOT.md
+@@ -65,6 +65,7 @@ Budget and recovery:
+   - the background is filled behind the subject, so a moving subject leaves no ghost;
+   - the headline sits behind the subject, with a push-in and parallax;
+   - transitions use a wipe shaped like the subject's silhouette.
++- **Mask shape gate.** Every refined SAM selection gets deterministic shape metrics (`lib/media/mask-quality.ts`): solidity, edge roughness, fragments, and whether its boundary cuts through the interior of Spark's box. A cutout that fails (for example a jar selected only down to its label) is never composited. That photo is shown uncut, and the run notes say so. The depth Reel then uses the next-ranked selected photo with a clean cutout, or composed crops of the uncut hero. No extra SAM request is made.
+ 
+ ## Safety rules the engine enforces
+ 
+diff --git a/lib/jobs/discovery.ts b/lib/jobs/discovery.ts
+index 0590dd3..eade71b 100644
+--- a/lib/jobs/discovery.ts
++++ b/lib/jobs/discovery.ts
+@@ -1,6 +1,7 @@
+ import { BusinessDiscoverySchema, BusinessEnrichmentSchema, CollectedSourceSchema, ModelUsageSchema, type BranchIdentity, type BusinessContext, type BusinessDiscovery, type BusinessEnrichment, type CollectedSource, type ModelUsage } from "../research/contracts";
+ import { assertSourceContext } from "../research/grounding";
+ import { MAX_RESEARCH_SOURCES } from "../research/limits";
++import { suppliedWebsiteIdentitySupported } from "../research/site-identity";
+ 
+ export interface DiscoveryCheckpoint {
+   discovery: BusinessDiscovery;
+@@ -96,10 +97,12 @@ export function prepareDiscoveryCheckpoint(business: BusinessContext, result: {
+   sources.forEach(assertSourceContext);
+   const byId = new Map(sources.map((source) => [source.id, source]));
+   if (byId.size !== sources.length) throw new Error("Discovery source IDs must be unique.");
+-  const attributableIdentity = discovery.completedToolCalls > 0 && discovery.sourceIds.length > 0 && discovery.sourceIds.every((id) => {
++  const metaAttributable = (source: CollectedSource) => discovery.completedToolCalls > 0 && ["meta_search_snippet", "meta_cited_summary"].includes(source.acquisition)
++    && Boolean(source.citation?.responseId.trim() && source.citation.searchCallIds.length > 0 && source.citation.searchCallIds.every((id) => id.trim()) && source.url && source.url === source.citation.url);
++  // The only non-Meta identity basis: the supplied official page, read directly, whose own metadata names a consistent brand.
++  const attributableIdentity = discovery.sourceIds.length > 0 && discovery.sourceIds.every((id) => {
+     const source = byId.get(id);
+-    return source && ["meta_search_snippet", "meta_cited_summary"].includes(source.acquisition)
+-      && source.citation?.responseId.trim() && source.citation.searchCallIds.length > 0 && source.citation.searchCallIds.every((id) => id.trim()) && source.url && source.url === source.citation.url;
++    return source && (metaAttributable(source) || suppliedWebsiteIdentitySupported(discovery, source, business.name));
+   });
+   if (discovery.status === "matched" && !attributableIdentity) {
+     discovery = {
+diff --git a/lib/jobs/worker.ts b/lib/jobs/worker.ts
+index a6f3c93..7b4c451 100644
+--- a/lib/jobs/worker.ts
++++ b/lib/jobs/worker.ts
+@@ -12,6 +12,8 @@ import {
+ import { contentHash, jobs, RESEARCH_WORKFLOW_VERSION, type JobStore } from "./store";
+ import { AutopilotBudgetError, createAutopilotBudget } from "../autopilot/budget";
+ import { AutopilotPaidStepError, AutopilotResumableError, type AutopilotProductionInput, type AutopilotProductionResult } from "../autopilot/production-types";
++import { establishIdentityFromSuppliedWebsite, type SuppliedWebsiteReader } from "../research/site-identity";
++import { validateSourceUrl } from "../research/source-reader";
+ import { prepareDiscoveryCheckpoint, prepareEnrichmentCheckpoint, discoveryNeedsIdentityConfirmation, mergeResearchSources, requiredResearchSourceIds, resolveEnrichedBusiness, type DiscoveryCheckpoint, type EnrichmentCheckpoint } from "./discovery";
+ 
+ export interface WorkerDependencies {
+@@ -26,16 +28,22 @@ export interface WorkerDependencies {
+   hasCopyCheckpoint: (input: CreateCampaignInput) => Promise<boolean>;
+   hasBoundCompletedCopy: (input: CreateCampaignInput) => Promise<boolean>;
+   credentialPresent: () => boolean;
++  /**
++   * The SSRF-safe official-site reader, used once when Meta discovery could not establish identity from an
++   * owner-supplied brand website. A local read, never a Meta call. Optional: absent in network-free test doubles.
++   */
++  readSuppliedWebsite?: SuppliedWebsiteReader;
+   /** One-shot Autopilot production (media harvest/analysis, SAM, cinema, critic). Optional for legacy test doubles. */
+   produceAutopilotCampaign?: (input: AutopilotProductionInput) => Promise<AutopilotProductionResult>;
+ }
+ 
+ async function defaultDependencies(): Promise<WorkerDependencies> {
+-  const [{ collectSources }, { analyzeBusiness, assertAnalysisInput, hasBoundCompletedAnalysis }, { createCampaign, readCopyCheckpoint, hasBoundCompletedCopy, assertCampaignInput }, { discoverBusiness }, { enrichBusiness }] = await Promise.all([
+-    import("../research/collect-sources"), import("../research/analyze"), import("../campaign/index"), import("../research/discover"), import("../research/enrich"),
++  const [{ collectSources }, { analyzeBusiness, assertAnalysisInput, hasBoundCompletedAnalysis }, { createCampaign, readCopyCheckpoint, hasBoundCompletedCopy, assertCampaignInput }, { discoverBusiness }, { enrichBusiness }, { readOfficialPage }] = await Promise.all([
++    import("../research/collect-sources"), import("../research/analyze"), import("../campaign/index"), import("../research/discover"), import("../research/enrich"), import("../research/source-reader"),
+   ]);
+   return {
+     collectSources, analyzeBusiness, assertAnalysisInput, hasBoundCompletedAnalysis, createCampaign, assertCampaignInput, hasBoundCompletedCopy, discoverBusiness, enrichBusiness,
++    readSuppliedWebsite: (url) => readOfficialPage(url),
+     produceAutopilotCampaign: async (input) => (await import("../autopilot/pipeline")).produceAutopilotCampaign(input),
+     hasCopyCheckpoint: async (input) => {
+       const opportunity = input.report.opportunities.find((item) => item.id === input.opportunityId);
+@@ -45,6 +53,10 @@ async function defaultDependencies(): Promise<WorkerDependencies> {
+   };
+ }
+ 
++function sameReadableUrl(first: string | null | undefined, second: string | null | undefined): boolean {
++  try { return Boolean(first && second) && validateSourceUrl(first!).href === validateSourceUrl(second!).href; } catch { return false; }
++}
++
+ async function copyCheckpointHash(input: CreateCampaignInput): Promise<string> {
+   return createHash("sha256").update(await readFile(resolve(input.outputDir, "copy-checkpoint.json"))).digest("hex");
+ }
+@@ -102,8 +114,19 @@ export async function runNextJob(options: { store?: JobStore; dependencies?: Wor
+         await store.markStage(id, owner, "discovering", "Resolving the business link and researching its identity, locality, offerings and public context through Meta search.");
+         await store.reserveModelCall(id, owner);
+         paidRequestStarted = true;
+-        const result = await dependencies.discoverBusiness(originalBusiness);
++        let result = await dependencies.discoverBusiness(originalBusiness);
+         if (lostLease) throw new Error("Worker lease was lost.");
++        const readSuppliedWebsite = dependencies.readSuppliedWebsite;
++        if (readSuppliedWebsite && input.readWebsite) {
++          // Local, credential-free read of the owner's own site (only when official-site reading is permitted for this run),
++          // saved inside the single discovery checkpoint so a retry never repeats it.
++          const supplemented = await establishIdentityFromSuppliedWebsite(originalBusiness, result, {
++            readPage: readSuppliedWebsite,
++            beforeRead: () => store.markStage(id, owner, "discovering", "Meta search did not establish the business identity. Reading the supplied official website once for its own name; no additional Meta request is made."),
++          });
++          result = { discovery: supplemented.discovery, sources: supplemented.sources, usage: supplemented.usage };
++          if (lostLease) throw new Error("Worker lease was lost.");
++        }
+         discovery = prepareDiscoveryCheckpoint(originalBusiness, result);
+         business = discovery.resolvedBusiness;
+         await store.checkpointDiscovery(id, owner, discovery);
+@@ -136,7 +159,10 @@ export async function runNextJob(options: { store?: JobStore; dependencies?: Wor
+       }
+       if (!sources) {
+         await store.markStage(id, owner, "ingesting", "Organizing enriched offerings, discovered citations, supplied evidence and permitted official-site text.");
+-        const collected = await dependencies.collectSources(business, input);
++        // The supplied page already read for identity is not fetched a second time.
++        const websiteAlreadyRead = Boolean(business.website && discovery?.sources.some((item) => item.acquisition === "direct_website" && item.kind === "official_website"
++          && discovery?.discovery.sourceIds.includes(item.id) && sameReadableUrl(item.url, business.website)));
++        const collected = await dependencies.collectSources(business, websiteAlreadyRead ? { ...input, readWebsite: false } : input);
+         const merged = mergeResearchSources([...(enrichment?.sources ?? []), ...(discovery?.sources ?? [])], collected.sources.map((item) => CollectedSourceSchema.parse(item)), requiredResearchSourceIds(discovery?.discovery, enrichment?.enrichment));
+         const branch = enrichment?.enrichment.branch?.status === "matched" ? enrichment.enrichment.branch : discovery?.discovery.branch?.status === "matched" ? discovery.discovery.branch : enrichment?.enrichment.branch ?? discovery?.discovery.branch;
+         sources = reconcileLocationScopes(merged.sources, branch);
+diff --git a/lib/research/discover.ts b/lib/research/discover.ts
+index 4eca39a..7791e92 100644
+--- a/lib/research/discover.ts
++++ b/lib/research/discover.ts
+@@ -130,7 +130,7 @@ function brandDomain(url: string): { host: string; label: string } | null {
+   return { host, label };
+ }
+ 
+-export { brandDomain as discoveryBrandDomain };
++export { brandDomain as discoveryBrandDomain, GENERIC_NAME_WORDS as DISCOVERY_GENERIC_NAME_WORDS };
+ 
+ function stripGenericSuffixes(value: string): string {
+   let core = value;
+@@ -175,6 +175,8 @@ function historicalSourceHint(url: string | null, text: string, at: string): boo
+   return years.some((year) => year < currentYear);
+ }
+ 
++export { historicalSourceHint as discoveryHistoricalSourceHint };
++
+ /** Each source URL must occur in completed retrieval metadata. Reference method remains explicit. */
+ export function extractDiscoveryResponse(
+   response: unknown,
+diff --git a/lib/research/site-identity.ts b/lib/research/site-identity.ts
+new file mode 100644
+index 0000000..f2fc4be
+--- /dev/null
++++ b/lib/research/site-identity.ts
+@@ -0,0 +1,170 @@
++import { randomUUID } from "node:crypto";
++import { BusinessDiscoverySchema, CollectedSourceSchema, type BusinessContext, type BusinessDiscovery, type CollectedSource, type ModelUsage } from "./contracts";
++import { brandDomainMatchesName, discoveryBrandDomain, discoveryHistoricalSourceHint, discoveryNameMatches, DISCOVERY_GENERIC_NAME_WORDS } from "./discover";
++import { SourceReadError, validateSourceUrl, type OfficialPage } from "./source-reader";
++
++/**
++ * Bounded identity fallback for an owner-supplied official website.
++ *
++ * Runs only when Meta-native discovery did not establish a business name. The supplied page is read
++ * once through the SSRF-safe official-site reader (no credentials, robots respected, same-origin
++ * redirects only). The brand name comes deterministically from the page's own first-party metadata
++ * and must be consistent with its domain or visible text. Locality, offerings and story are never
++ * derived here, the campaign goal is never used, and the branch stays unresolved.
++ */
++
++export const SUPPLIED_WEBSITE_IDENTITY_SUMMARY = "Identified from the supplied website's own title and site name; offerings, story and location are researched from the page itself, not assumed here.";
++export const SUPPLIED_WEBSITE_IDENTITY_WARNING = "Business identity was taken from the supplied website's own title and site name because Meta search returned no usable sources; the branch is not confirmed.";
++
++type DiscoveryResult = { discovery: BusinessDiscovery; sources: CollectedSource[]; usage: ModelUsage };
++export type SuppliedWebsiteReader = (url: string) => Promise<OfficialPage>;
++export type SuppliedWebsiteOutcome = "not_eligible" | "established" | "not_established" | "unreadable";
++
++const MAX_NAME_LENGTH = 80;
++const TITLE_SEPARATOR = /\s*[|·•»]\s*|\s+[–—-]\s+|\s*:\s+/;
++const GENERIC_NAMES = new Set([
++  "home", "homepage", "home page", "welcome", "shop", "store", "online store", "shop online", "menu", "our menu", "index", "main",
++  "official website", "official site", "website", "web site", "site", "untitled", "coming soon", "under construction", "maintenance",
++  "page not found", "not found", "404", "error", "about", "about us", "contact", "contact us", "products", "all products", "collections",
++  "my site", "my blog", "blog", "default", "just another wordpress site", "order online", "cart", "checkout", "login", "log in", "sign in",
++]);
++// Hosting, error, parking and bot-check interstitials can return HTTP 200 and repeat their own title.
++const INTERSTITIAL_NAME = /^(?:index of\b|it works\b|welcome to (?:nginx|apache|iis|openresty|caddy)\b)|\b(?:account (?:has been )?suspended|suspended (?:account|site|website|page|domain)|(?:site|website|domain|hosting|account) (?:is )?(?:suspended|expired|unavailable|disabled|inactive|parked)|maintenance|under construction|coming soon|attention required|just a moment|access denied|forbidden|bad gateway|service (?:temporarily )?unavailable|gateway time-?out|internal server error|server error|page not found|not found|(?:domain|website|site) (?:is )?for sale|buy this domain|parked (?:domain|free)|default (?:web )?(?:site |server )?page|test page|bandwidth limit|resource limit|too many requests|security check|captcha|ddos protection|checking your browser|cloudflare|error \d{3}|\d{3} error)\b/;
++// Category and page words that never identify a brand on their own.
++const GENERIC_WORDS = new Set([...DISCOVERY_GENERIC_NAME_WORDS, "home", "welcome", "official", "website", "site", "online", "menu", "order", "orders",
++  "cakes", "cake", "desserts", "dessert", "pastries", "pastry", "bread", "breads", "cookies", "baking", "baked", "fresh", "freshly", "fine",
++  "products", "services", "gallery", "catalog", "catalogue", "delivery", "booking", "appointments", "pricing", "news", "events", "offers", "gifts", "hampers"]);
++
++function normalise(value: string): string {
++  return value.normalize("NFKC").replace(/[’‘`]/g, "'").replace(/[“”]/g, '"').replace(/\s+/g, " ").trim().toLowerCase();
++}
++
++function cleanCandidate(raw: string | null | undefined): string | null {
++  if (!raw) return null;
++  const value = raw.normalize("NFKC").replace(/[\u0000-\u001f\u007f]/g, " ").replace(/[®™©]/g, " ").replace(/\s+/g, " ").trim()
++    .replace(/^welcome\s+to\s+/i, "")
++    .replace(/\s*(?:[-–—|:]\s*)?official\s+(?:website|site|store|online\s+store)$/i, "")
++    .replace(/^["'“”‘’\s]+|["'“”‘’\s.,;!]+$/g, "").trim();
++  return value || null;
++}
++
++/** Brand-like names only: not empty, generic, a bare domain, too short or too long. */
++export function acceptableSiteBrandName(name: string): boolean {
++  const lower = normalise(name);
++  if (!lower || name.length > MAX_NAME_LENGTH || GENERIC_NAMES.has(lower) || INTERSTITIAL_NAME.test(lower)) return false;
++  if ((lower.match(/\p{L}/gu) ?? []).length < 3) return false;
++  if (/^(?:https?:\/\/)?(?:www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)+\/?$/i.test(lower)) return false;
++  const words = lower.replace(/'s\b/g, "").match(/[\p{L}\p{N}]+/gu) ?? [];
++  return words.some((word) => word.length >= 3 && !GENERIC_WORDS.has(word));
++}
++
++function occurrences(name: string, text: string): number {
++  const words = normalise(name).match(/[\p{L}\p{N}']+|&/gu);
++  if (!words?.length) return 0;
++  const escaped = words.map((word) => word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("[\\s\\-]+");
++  return [...normalise(text).matchAll(new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, "gu"))].length;
++}
++
++/** The name must match the brand domain or recur in the page's own visible text. The title/head is not visible text. */
++export function siteBrandNameSupported(name: string, pageUrl: string, visibleText: string): boolean {
++  const domain = discoveryBrandDomain(pageUrl);
++  if (!domain || !acceptableSiteBrandName(name)) return false;
++  return brandDomainMatchesName(name, domain.label) || occurrences(name, visibleText) >= 2;
++}
++
++function titleCandidate(title: string): string | null {
++  const segments = title.split(TITLE_SEPARATOR).map((segment) => cleanCandidate(segment)).filter((segment): segment is string => Boolean(segment));
++  // "Home | Brand" is a common CMS pattern: skip one leading generic page label, never more.
++  if (segments.length > 1 && GENERIC_NAMES.has(normalise(segments[0]))) return segments[1];
++  return segments[0] ?? null;
++}
++
++/**
++ * Deterministic: og:site_name, else the title prefix, else the first <h1>; the first acceptable, consistent candidate wins.
++ * When another first-party candidate spells the same name with different capitals (og:site_name "labonel Fine baking",
++ * title "Labonel Fine Baking | ..."), the title's, then the heading's, spelling is used.
++ */
++export function deriveSiteBrandName(page: Pick<OfficialPage, "url" | "title" | "text" | "identity">): string | null {
++  const title = titleCandidate(page.title);
++  const heading = cleanCandidate(page.identity?.heading);
++  const candidates = [cleanCandidate(page.identity?.siteName), title, heading];
++  for (const candidate of candidates) {
++    if (!candidate || !siteBrandNameSupported(candidate, page.url, page.text)) continue;
++    return [title, heading].find((spelling) => spelling && spelling !== candidate && normalise(spelling) === normalise(candidate)) ?? candidate;
++  }
++  return null;
++}
++
++/** The supplied link qualifies only when it is a readable brand domain, not Maps/Google, social, listing, marketplace or link-in-bio. */
++export function suppliedWebsiteForIdentity(business: BusinessContext, discovery: BusinessDiscovery): string | null {
++  if (discovery.status === "matched" || discovery.name || !business.website) return null;
++  let url: URL;
++  try { url = validateSourceUrl(business.website); } catch { return null; }
++  if (!discoveryBrandDomain(url.href)) return null;
++  try { if (new URL(discovery.inputUrl).origin !== url.origin) return null; } catch { return null; }
++  return url.href;
++}
++
++function sameOrigin(first: string | null | undefined, second: string | null | undefined): boolean {
++  try { return Boolean(first && second) && new URL(first!).origin === new URL(second!).origin; } catch { return false; }
++}
++
++/** Revalidates a stored supplied-website identity source without reading anything. */
++export function suppliedWebsiteIdentitySupported(discovery: BusinessDiscovery, source: CollectedSource, businessName: string): boolean {
++  if (source.acquisition !== "direct_website" || source.kind !== "official_website" || !source.url || !discovery.name) return false;
++  if (!sameOrigin(source.url, discovery.inputUrl) || !discovery.officialWebsite || discovery.officialWebsite !== `${new URL(source.url).origin}/`) return false;
++  try { validateSourceUrl(source.url); } catch { return false; }
++  if (businessName.trim() && !discoveryNameMatches(businessName, discovery.name)) return false;
++  return siteBrandNameSupported(discovery.name, source.url, source.text);
++}
++
++/**
++ * Applies the fallback to a completed (or saved) discovery result. Never throws and never calls Meta;
++ * an ineligible link performs no read, and any read or consistency failure leaves identity unconfirmed.
++ */
++export async function establishIdentityFromSuppliedWebsite(
++  business: BusinessContext,
++  result: DiscoveryResult,
++  dependencies: { readPage: SuppliedWebsiteReader; id?: () => string; beforeRead?: () => Promise<void> | void },
++): Promise<DiscoveryResult & { outcome: SuppliedWebsiteOutcome }> {
++  // Only when Meta returned no sources at all: cited Meta material (possibly about another branch or business) is never upgraded here.
++  const supplied = result.sources.length === 0 ? suppliedWebsiteForIdentity(business, result.discovery) : null;
++  if (!supplied) return { ...result, outcome: "not_eligible" };
++  const unchanged = (outcome: SuppliedWebsiteOutcome, warning: string) => ({
++    ...result, outcome, discovery: { ...result.discovery, warnings: [...new Set([...result.discovery.warnings, warning])] },
++  });
++  let page: OfficialPage;
++  try {
++    await dependencies.beforeRead?.();
++    page = await dependencies.readPage(supplied);
++    validateSourceUrl(page.url);
++    if (!sameOrigin(page.url, supplied)) throw new SourceReadError("CROSS_ORIGIN_REDIRECT", "The supplied website redirected to another origin.");
++  } catch (error) {
++    const code = error instanceof SourceReadError ? error.code : "READ_FAILED";
++    return unchanged("unreadable", `The supplied website could not be read directly (${code}); the business identity remains unconfirmed.`);
++  }
++  const name = deriveSiteBrandName(page);
++  if (!name || business.name.trim() && !discoveryNameMatches(business.name, name)) {
++    return unchanged("not_established", "The supplied website's own title, site name and heading did not consistently identify the business; the identity remains unconfirmed.");
++  }
++  const officialWebsite = `${new URL(page.url).origin}/`;
++  const source = CollectedSourceSchema.parse({
++    id: (dependencies.id ?? randomUUID)(), kind: "official_website", title: (page.title || name).slice(0, 180), url: page.url,
++    text: page.text.slice(0, 12_000), retrievedAt: page.retrievedAt, acquisition: "direct_website",
++    context: { scope: "brand", location: null, locationEvidence: null, publishedAt: null, validFrom: null, validThrough: null,
++      temporalStatus: discoveryHistoricalSourceHint(page.url, page.text, page.retrievedAt) ? "historical" : "unknown", dateEvidence: null },
++  });
++  const previous = result.discovery;
++  const branch = previous.branch ?? { status: "unresolved" as const, label: null, locality: null, address: null, sourceIds: [], rationale: "A brand match does not establish which location the supplied link represents. No source-supported exact location was established." };
++  const stale = new Set(["Business identity could not be completely resolved from attributed output."]);
++  const links = previous.links.some((link) => link.url === page.url) ? previous.links.map((link) => link.url === page.url ? { ...link, relationship: "business" as const } : link)
++    : [{ url: page.url, title: source.title, relationship: "business" as const }, ...previous.links].slice(0, 12);
++  const discovery = BusinessDiscoverySchema.parse({
++    // Unsourced model locality, vertical and summary are never carried into the upgraded identity; the page's own
++    // opening text (often template placeholder copy) is not used as a summary either.
++    ...previous, status: "matched", name, officialWebsite, locality: null, vertical: null, summary: SUPPLIED_WEBSITE_IDENTITY_SUMMARY,
++    sourceIds: [source.id], links, branch: branch.status === "unresolved" ? branch : { ...branch, status: "unresolved" },
++    warnings: [...new Set([SUPPLIED_WEBSITE_IDENTITY_WARNING, ...previous.warnings.filter((warning) => !stale.has(warning))])],
++  });
++  return { discovery, sources: [...result.sources, source], usage: result.usage, outcome: "established" };
++}
+diff --git a/lib/research/source-reader.ts b/lib/research/source-reader.ts
+index 84d185f..d35d224 100644
+--- a/lib/research/source-reader.ts
++++ b/lib/research/source-reader.ts
+@@ -146,12 +146,35 @@ export function extractWebsiteText(html: string): { title: string; text: string
+   return { title, text };
+ }
+ 
++/** First-party identity metadata (og:site_name and the first <h1>), decoded and bounded; never interpreted as instructions. */
++export function extractPageIdentity(html: string): { siteName: string | null; heading: string | null } {
++  const clean = (value: string | undefined | null, max: number) => {
++    const text = value ? decodeEntities(value.replace(/<[^>]*>/g, " ")).replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim() : "";
++    return text && text.length <= max ? text : null;
++  };
++  let siteName: string | null = null;
++  for (const match of html.matchAll(/<meta\b[^>]{0,2000}>/gi)) {
++    if (!/\b(?:property|name)\s*=\s*["']?og:site_name["'\s/>]/i.test(match[0])) continue;
++    const content = /\bcontent\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/i.exec(match[0]);
++    siteName = clean(content?.[1] ?? content?.[2] ?? content?.[3], 200);
++    break;
++  }
++  const lower = html.toLowerCase();
++  const open = lower.search(/<h1[\s>]/);
++  const contentStart = open < 0 ? -1 : html.indexOf(">", open);
++  const close = contentStart < 0 ? -1 : lower.indexOf("</h1", contentStart);
++  const heading = close < 0 || close - contentStart > 2000 ? null : clean(html.slice(contentStart + 1, close), 200);
++  return { siteName, heading };
++}
++
+ function rejectsAutomatedUse(headers: RawSourceResponse["headers"], body: string): boolean {
+   const directives = `${headers["x-robots-tag"] ?? ""} ${[...body.matchAll(/<meta\b[^>]*>/gi)].filter((match) => /name\s*=\s*["']?(?:robots|tickrresearch)["'\s>]/i.test(match[0])).map((match) => match[0]).join(" ")}`;
+   return /(?:^|[^a-z])(?:noindex|none|noai|noimageai|noarchive|nosnippet)(?:[^a-z]|$)/i.test(directives);
+ }
+ 
+-export async function readOfficialPage(input: string, options: { transport?: SourceTransport; timeoutMs?: number } = {}): Promise<{ url: string; title: string; text: string; retrievedAt: string }> {
++export type OfficialPage = { url: string; title: string; text: string; retrievedAt: string; identity?: { siteName: string | null; heading: string | null } };
++
++export async function readOfficialPage(input: string, options: { transport?: SourceTransport; timeoutMs?: number } = {}): Promise<OfficialPage> {
+   const start = validateSourceUrl(input);
+   const transport = options.transport ?? officialRequest;
+   const controller = new AbortController();
+@@ -194,6 +217,7 @@ export async function readOfficialPage(input: string, options: { transport?: Sou
+       ? { title: start.hostname, text: response.body.replace(/\s+/g, " ").trim().slice(0, MAX_TEXT_LENGTH) }
+       : extractWebsiteText(response.body);
+     if (extracted.text.length < 30) throw new SourceReadError("NO_READABLE_TEXT", "The page did not expose enough readable text; supply an attributable excerpt.");
+-    return { url: url.href, ...extracted, retrievedAt: new Date().toISOString() };
++    const identity = /^text\/plain\b/i.test(contentType) ? { siteName: null, heading: null } : extractPageIdentity(response.body);
++    return { url: url.href, ...extracted, retrievedAt: new Date().toISOString(), identity };
+   } finally { clearTimeout(timer); }
+ }
+diff --git a/tests/integration/research-jobs.test.ts b/tests/integration/research-jobs.test.ts
+index 86d9785..4911daf 100644
+--- a/tests/integration/research-jobs.test.ts
++++ b/tests/integration/research-jobs.test.ts
+@@ -12,6 +12,8 @@ import { CampaignCopyValidationError, CampaignRenderError } from "../../lib/camp
+ import { BusinessDraftInput } from "../../lib/businesses/input";
+ import { prepareEnrichmentCheckpoint } from "../../lib/jobs/discovery";
+ import { AnalysisValidationError } from "../../lib/research/analyze";
++import { extractDiscoveryResponse } from "../../lib/research/discover";
++import { SourceReadError } from "../../lib/research/source-reader";
+ import type { BusinessDiscovery, BusinessEnrichment, ResearchInput, ResearchReport, CollectedSource, CampaignKit } from "../../lib/research/contracts";
+ 
+ let directory: string;
+@@ -207,6 +209,110 @@ test("optional name and city hints cannot bypass unresolved discovery and activa
+ });
+ afterEach(async () => { await client.$disconnect(); await rm(directory, { recursive: true, force: true }); });
+ 
++function labonelIncidentDiscovery(website: string) {
++  // Hosted run d5c15c28: Meta opened the supplied URL but returned no title, excerpt or name.
++  const envelope = { id: "response-labonel", status: "completed", output: [
++    { id: "open-labonel", type: "web_search_call", status: "completed", action: { type: "open_page", url: website } },
++    { type: "message", content: [{ type: "output_text", text: JSON.stringify({ name: null, locality: null, vertical: null, officialWebsite: null, instagram: null, identitySourceUrls: [], branch: null, facts: [], unknowns: [] }) }] },
++  ] };
++  const extracted = extractDiscoveryResponse(envelope, { id: "business", name: "", locality: "", vertical: "business", goal: "Grow orders", website }, { discoveredAt: "2026-11-05T00:00:00.000Z" });
++  return { discovery: extracted.discovery, sources: extracted.sources, usage };
++}
++const labonelSite = "https://www.labonelfinebaking.shop/";
++const labonelPage = { url: labonelSite, title: "Labonel Fine Baking | Made-To-Order Freshly Baked Desserts", text: "Labonel Fine Baking Made-to-order desserts, baked fresh for every celebration. Order from Labonel Fine Baking by message.", retrievedAt: "2026-11-05T00:00:00.000Z", identity: { siteName: null, heading: "Labonel Fine Baking" } };
++
++test("hosted run d5c15c28: an unusable Meta discovery of the supplied official site falls back to one direct read and continues", async () => {
++  const business = await client.business.create({ data: BusinessDraftInput.parse({ website: labonelSite }) });
++  const dep = dependencies();
++  dep.discoverBusiness = vi.fn(async () => labonelIncidentDiscovery(labonelSite));
++  dep.readSuppliedWebsite = vi.fn(async () => labonelPage);
++  const run = await store.enqueueResearch(business.id, { mode: "live", readWebsite: true, sources: [], enrichFromLink: false });
++  try {
++    await runNextJob({ store, dependencies: dep });
++    const result = await store.view(run.id);
++    expect(result.stage).toBe("awaiting_selection");
++    expect(result.discovery).toMatchObject({ status: "matched", name: "Labonel Fine Baking", officialWebsite: labonelSite, locality: null, branch: { status: "unresolved" } });
++    expect(result.discovery?.warnings).toContain("Business identity was taken from the supplied website's own title and site name because Meta search returned no usable sources; the branch is not confirmed.");
++    expect(result.business).toMatchObject({ name: "Labonel Fine Baking", website: labonelSite, locality: "" });
++    expect(result.sources.some((item) => item.acquisition === "direct_website" && item.kind === "official_website" && item.url === labonelSite)).toBe(true);
++    expect(result.events.some((event) => event.message.includes("Reading the supplied official website once"))).toBe(true);
++    expect(dep.readSuppliedWebsite).toHaveBeenCalledTimes(1);
++    expect(dep.readSuppliedWebsite).toHaveBeenCalledWith(labonelSite);
++    // The page already read for identity is not fetched again during collection.
++    expect(dep.collectSources).toHaveBeenCalledWith(expect.objectContaining({ name: "Labonel Fine Baking" }), expect.objectContaining({ readWebsite: false }));
++    expect(dep.analyzeBusiness).toHaveBeenCalledWith(expect.objectContaining({ business: expect.objectContaining({ name: "Labonel Fine Baking" }) }));
++    // Discovery plus analysis; the fallback read is local and never reserves a Meta request.
++    expect((await client.run.findUniqueOrThrow({ where: { id: run.id } })).modelCalls).toBe(2);
++    await store.enqueueCampaign(run.id, "op1");
++    await runNextJob({ store, dependencies: dep });
++    expect(dep.discoverBusiness).toHaveBeenCalledTimes(1);
++    expect(dep.readSuppliedWebsite).toHaveBeenCalledTimes(1);
++  } finally { await rm(resolve(".data/runs", run.id), { recursive: true, force: true }); }
++});
++
++test("the supplied-site fallback is saved with discovery and is not repeated by a safe retry", async () => {
++  const business = await client.business.create({ data: BusinessDraftInput.parse({ website: labonelSite }) });
++  const dep = dependencies();
++  dep.discoverBusiness = vi.fn(async () => labonelIncidentDiscovery(labonelSite));
++  dep.readSuppliedWebsite = vi.fn(async () => labonelPage);
++  let collectionAttempts = 0;
++  dep.collectSources = vi.fn(async () => {
++    if (++collectionAttempts === 1) throw new Error("Synthetic local collection failure");
++    return { sources: [source], warnings: [] };
++  });
++  const run = await store.enqueueResearch(business.id, { mode: "live", readWebsite: true, sources: [], enrichFromLink: false });
++  await runNextJob({ store, dependencies: dep });
++  expect((await client.run.findUniqueOrThrow({ where: { id: run.id } })).retrySafe).toBe(true);
++  await store.retry(run.id);
++  await runNextJob({ store, dependencies: dep });
++  expect((await store.view(run.id)).stage).toBe("awaiting_selection");
++  expect(dep.discoverBusiness).toHaveBeenCalledTimes(1);
++  expect(dep.readSuppliedWebsite).toHaveBeenCalledTimes(1);
++});
++
++test.each([
++  ["a Maps link", "https://maps.app.goo.gl/fixtureReference", async () => labonelPage, false],
++  ["a social profile", "https://www.instagram.com/labonelfinebaking/", async () => labonelPage, false],
++  ["a generic site title", labonelSite, async () => ({ ...labonelPage, title: "Home", identity: { siteName: null, heading: "Welcome" } }), true],
++  ["a robots restriction", labonelSite, async () => { throw new SourceReadError("ROBOTS_RESTRICTED", "Website access restrictions could not be cleared for this page."); }, true],
++] as const)("the supplied-site fallback keeps needs_owner for %s", async (_label, website, read, expectRead) => {
++  const business = await client.business.create({ data: BusinessDraftInput.parse({ website }) });
++  const dep = dependencies();
++  dep.discoverBusiness = vi.fn(async () => labonelIncidentDiscovery(website));
++  dep.readSuppliedWebsite = vi.fn(read);
++  const run = await store.enqueueResearch(business.id, { mode: "live", readWebsite: true, sources: [] });
++  await runNextJob({ store, dependencies: dep });
++  const result = await store.view(run.id);
++  expect(result.stage).toBe("awaiting_owner");
++  expect(result.discovery?.name).toBeNull();
++  expect(result.discovery?.status).not.toBe("matched");
++  expect(dep.readSuppliedWebsite).toHaveBeenCalledTimes(expectRead ? 1 : 0);
++  expect(dep.analyzeBusiness).not.toHaveBeenCalled();
++  expect((await client.run.findUniqueOrThrow({ where: { id: run.id } })).modelCalls).toBe(1);
++});
++
++test("the supplied-site fallback never reads when official-site reading is not permitted for the run", async () => {
++  const business = await client.business.create({ data: BusinessDraftInput.parse({ website: labonelSite }) });
++  const dep = dependencies();
++  dep.discoverBusiness = vi.fn(async () => labonelIncidentDiscovery(labonelSite));
++  dep.readSuppliedWebsite = vi.fn(async () => labonelPage);
++  const run = await store.enqueueResearch(business.id, { mode: "live", readWebsite: false, sources: [] });
++  await runNextJob({ store, dependencies: dep });
++  expect((await store.view(run.id)).stage).toBe("awaiting_owner");
++  expect(dep.readSuppliedWebsite).not.toHaveBeenCalled();
++});
++
++test("a cited Meta discovery never triggers the supplied-site read", async () => {
++  const business = await client.business.create({ data: BusinessDraftInput.parse({ website: "https://fixture.example/listing" }) });
++  const dep = dependencies();
++  dep.discoverBusiness = vi.fn(async () => discoveredFixture());
++  dep.readSuppliedWebsite = vi.fn(async () => labonelPage);
++  const run = await store.enqueueResearch(business.id, { mode: "live", readWebsite: true, sources: [], enrichFromLink: false });
++  await runNextJob({ store, dependencies: dep });
++  expect((await store.view(run.id)).discovery).toMatchObject({ status: "matched", name: "Fixture Clinic" });
++  expect(dep.readSuppliedWebsite).not.toHaveBeenCalled();
++});
++
+ test("identical research input reuses one run and a lease cannot be claimed twice", async () => {
+   const first = await store.enqueueResearch(businessId, input);
+   const second = await store.enqueueResearch(businessId, input);
+diff --git a/tests/unit/discovery-site-identity.test.ts b/tests/unit/discovery-site-identity.test.ts
+new file mode 100644
+index 0000000..b624cd2
+--- /dev/null
++++ b/tests/unit/discovery-site-identity.test.ts
+@@ -0,0 +1,205 @@
++import { describe, expect, test, vi } from "vitest";
++import { discoveryNeedsIdentityConfirmation, prepareDiscoveryCheckpoint } from "../../lib/jobs/discovery";
++import type { BusinessContext } from "../../lib/research/contracts";
++import { extractDiscoveryResponse } from "../../lib/research/discover";
++import { deriveSiteBrandName, establishIdentityFromSuppliedWebsite, SUPPLIED_WEBSITE_IDENTITY_SUMMARY, SUPPLIED_WEBSITE_IDENTITY_WARNING, suppliedWebsiteIdentitySupported } from "../../lib/research/site-identity";
++import { readOfficialPage, SourceReadError, type OfficialPage, type RawSourceResponse } from "../../lib/research/source-reader";
++
++const at = "2026-11-05T00:00:00.000Z";
++const site = "https://www.labonelfinebaking.shop/";
++const business: BusinessContext = { id: "business", name: "", locality: "", vertical: "business", goal: "Launch a Diwali dessert box campaign in Jubilee Hills", website: site };
++const usage = { model: "test-double-no-inference", inputTokens: 0, outputTokens: 0, elapsedMs: 1 };
++const visibleText = "Labonel Fine Baking Made-to-order desserts, baked fresh for every celebration. Custom cakes, tea cakes and cookies. Order from Labonel Fine Baking by message. Hyderabad.";
++const labonelPage = (overrides: Partial<OfficialPage> = {}): OfficialPage => ({
++  url: site, title: "Labonel Fine Baking | Made-To-Order Freshly Baked Desserts", text: visibleText, retrievedAt: at,
++  identity: { siteName: null, heading: "Labonel Fine Baking" }, ...overrides,
++});
++
++/** Run d5c15c28 shape: Meta opened the supplied URL but returned no title, excerpt or name. */
++function incidentDiscovery(input: BusinessContext = business) {
++  const envelope = { id: "response-labonel", status: "completed", usage: { input_tokens: 10, output_tokens: 5 }, output: [
++    { id: "open-labonel", type: "web_search_call", status: "completed", action: { type: "open_page", url: input.website } },
++    { type: "message", content: [{ type: "output_text", text: JSON.stringify({ name: null, locality: null, vertical: null, officialWebsite: null, instagram: null, identitySourceUrls: [], branch: null, facts: [], unknowns: ["The business identity could not be confirmed from retrieved content."] }) }] },
++  ] };
++  const { discovery, sources } = extractDiscoveryResponse(envelope, input, { discoveredAt: at });
++  return { discovery, sources, usage };
++}
++
++let ids = 0;
++const id = () => `site-source-${++ids}`;
++
++describe("supplied official website identity fallback", () => {
++  test("hosted run d5c15c28: establishes the brand from the supplied site's own title, leaving the branch unresolved", async () => {
++    const meta = incidentDiscovery();
++    expect(meta.discovery).toMatchObject({ status: "ambiguous", name: null });
++    expect(meta.sources).toHaveLength(0);
++    expect(discoveryNeedsIdentityConfirmation(prepareDiscoveryCheckpoint(business, meta))).toBe(true);
++
++    const readPage = vi.fn(async () => labonelPage());
++    const result = await establishIdentityFromSuppliedWebsite(business, meta, { readPage, id });
++    expect(readPage).toHaveBeenCalledTimes(1);
++    expect(readPage).toHaveBeenCalledWith(site);
++    expect(result.outcome).toBe("established");
++    expect(result.discovery).toMatchObject({ status: "matched", name: "Labonel Fine Baking", officialWebsite: site, locality: null, vertical: null, instagramUrl: null });
++    expect(result.discovery.branch).toMatchObject({ status: "unresolved", locality: null, address: null, sourceIds: [] });
++    expect(result.discovery.warnings).toContain(SUPPLIED_WEBSITE_IDENTITY_WARNING);
++    expect(result.discovery.warnings.some((warning) => warning.includes("exact location behind the supplied link remains unresolved"))).toBe(true);
++    expect(result.discovery.warnings).not.toContain("Business identity could not be completely resolved from attributed output.");
++    expect(result.sources).toHaveLength(1);
++    const [source] = result.sources;
++    expect(source).toMatchObject({ kind: "official_website", acquisition: "direct_website", url: site, title: "Labonel Fine Baking | Made-To-Order Freshly Baked Desserts", text: visibleText, context: { scope: "brand", location: null } });
++    expect(source.citation).toBeUndefined();
++    expect(result.discovery.sourceIds).toEqual([source.id]);
++
++    const checkpoint = prepareDiscoveryCheckpoint(business, result);
++    expect(discoveryNeedsIdentityConfirmation(checkpoint)).toBe(false);
++    expect(checkpoint.resolvedBusiness).toMatchObject({ name: "Labonel Fine Baking", website: site, locality: "", vertical: "business" });
++    // No locality, story or offering is derived from the page or the goal.
++    expect(JSON.stringify(checkpoint.discovery)).not.toMatch(/Jubilee|Diwali/);
++    expect(checkpoint.discovery.locality).toBeNull();
++  });
++
++  test("real Labonel page shape: lowercase og:site_name, no <h1>, lorem-ipsum opening text", async () => {
++    const lorem = "Lorem Ipsum proin gravida nibh vel velit auctor aliquetenean sollicitudin, lorem quis bibendum auctor.";
++    const html = `<html><head><title>Labonel Fine Baking | Made-To-Order Freshly Baked Desserts</title><meta property="og:site_name" content="labonel Fine baking" /></head><body><p>${lorem}</p><p>${visibleText}</p></body></html>`;
++    const transport = async (url: URL): Promise<RawSourceResponse> => url.pathname === "/robots.txt" ? { status: 404, headers: {}, body: "" } : { status: 200, headers: { "content-type": "text/html" }, body: html };
++    const page = await readOfficialPage(site, { transport });
++    expect(page.identity).toEqual({ siteName: "labonel Fine baking", heading: null });
++    expect(deriveSiteBrandName(page)).toBe("Labonel Fine Baking");
++    const result = await establishIdentityFromSuppliedWebsite(business, incidentDiscovery(), { readPage: async () => page, id });
++    expect(result.discovery.name).toBe("Labonel Fine Baking");
++    expect(result.discovery.summary).toBe(SUPPLIED_WEBSITE_IDENTITY_SUMMARY);
++    expect(result.discovery.summary).not.toMatch(/lorem/i);
++    expect(prepareDiscoveryCheckpoint(business, result).resolvedBusiness.name).toBe("Labonel Fine Baking");
++    // A different spelling is not a capitalisation variant: og:site_name still wins.
++    expect(deriveSiteBrandName(labonelPage({ title: "Labonel Bakes | Desserts", identity: { siteName: "Labonel Fine Baking", heading: null } }))).toBe("Labonel Fine Baking");
++    // Heading spelling is used when the title does not carry the name.
++    expect(deriveSiteBrandName(labonelPage({ title: "Home", identity: { siteName: "LABONEL FINE BAKING", heading: "Labonel Fine Baking" } }))).toBe("Labonel Fine Baking");
++  });
++
++  test("hosting, error, parking and bot-check interstitials are never accepted as a brand", () => {
++    for (const title of ["Account Suspended", "Index of /", "Site Maintenance", "Attention Required! | Cloudflare", "Just a moment...", "403 Forbidden", "Welcome to nginx!",
++      "This domain is for sale", "Service Unavailable", "Website Expired", "Default Web Site Page", "Error 404", "Access Denied"]) {
++      const text = `${title} ${title} This page is not available right now. Please try again later.`;
++      for (const page of [
++        { url: site, title, text, identity: { siteName: null, heading: null } },
++        { url: site, title: "Labonel", text, identity: { siteName: title, heading: title } },
++      ]) expect(deriveSiteBrandName(page), title).toBe(page.title === title ? null : null);
++    }
++  });
++
++  test("Meta output with cited sources is never upgraded, and unsourced model locality, vertical and summary are dropped", async () => {
++    const meta = incidentDiscovery();
++    const readPage = vi.fn(async () => labonelPage());
++    const established = await establishIdentityFromSuppliedWebsite(business, meta, { readPage, id });
++    const otherBranchSource = { ...established.sources[0], id: "meta-other-branch", acquisition: "meta_search_snippet" as const, url: "https://news.example.com/labonel-bengaluru" };
++    const withSources = { ...meta, discovery: { ...meta.discovery, locality: "Bengaluru", vertical: "bakery" as const, summary: "Labonel opened in Bengaluru.", sourceIds: ["meta-other-branch"] }, sources: [otherBranchSource] };
++    readPage.mockClear();
++    const untouched = await establishIdentityFromSuppliedWebsite(business, withSources, { readPage, id });
++    expect(readPage).not.toHaveBeenCalled();
++    expect(untouched.outcome).toBe("not_eligible");
++    expect(untouched.discovery).toEqual(withSources.discovery);
++
++    const unsourced = { ...meta, discovery: { ...meta.discovery, locality: "Bengaluru", vertical: "bakery" as const, summary: "Labonel opened in Bengaluru." } };
++    const upgraded = await establishIdentityFromSuppliedWebsite(business, unsourced, { readPage, id });
++    expect(upgraded.outcome).toBe("established");
++    expect(upgraded.discovery).toMatchObject({ status: "matched", locality: null, vertical: null, summary: SUPPLIED_WEBSITE_IDENTITY_SUMMARY });
++    expect(upgraded.discovery.sourceIds).toEqual([upgraded.sources[0].id]);
++    expect(JSON.stringify(prepareDiscoveryCheckpoint(business, upgraded))).not.toContain("Bengaluru");
++  });
++
++  test("prefers og:site_name, then the title prefix, then the first heading, rejecting generic names", () => {
++    expect(deriveSiteBrandName(labonelPage({ identity: { siteName: "Labonel Fine Baking", heading: "Welcome" } }))).toBe("Labonel Fine Baking");
++    expect(deriveSiteBrandName(labonelPage({ title: "Home | Labonel Fine Baking", identity: { siteName: null, heading: null } }))).toBe("Labonel Fine Baking");
++    expect(deriveSiteBrandName(labonelPage({ title: "Home", identity: { siteName: null, heading: "Labonel Fine Baking" } }))).toBe("Labonel Fine Baking");
++    for (const title of ["Home", "Welcome", "Shop", "Menu", "labonelfinebaking.shop", "Official website", "Cakes | Desserts", "Ab", `${"Labonel ".repeat(12)}Baking`]) {
++      expect(deriveSiteBrandName(labonelPage({ title, identity: { siteName: null, heading: null } })), title).toBeNull();
++    }
++  });
++
++  test("requires the name to match the domain or recur in visible text", () => {
++    // Recurs twice in visible text on an unrelated domain: accepted.
++    expect(deriveSiteBrandName(labonelPage({ url: "https://www.lfbdesserts.in/", identity: { siteName: null, heading: null } }))).toBe("Labonel Fine Baking");
++    // Neither the domain nor the visible text supports the title's name.
++    expect(deriveSiteBrandName({ url: "https://www.lfbdesserts.in/", title: "Sugar Petal Studio | Desserts", text: "Made-to-order desserts for every celebration in the city.", identity: { siteName: null, heading: null } })).toBeNull();
++  });
++
++  test("Maps, Google, social, listing and link-in-bio inputs are never read", async () => {
++    for (const website of [
++      "https://maps.app.goo.gl/fixtureReference", "https://www.google.com/maps/place/Labonel", "https://share.google/FVjbnawViHJw2GdDg",
++      "https://www.instagram.com/labonelfinebaking/", "https://www.zomato.com/hyderabad/labonel", "https://linktr.ee/labonel",
++      "https://labonel.wixsite.com/bakes", "https://labonel.myshopify.com/", "http://www.labonelfinebaking.shop/",
++    ]) {
++      const input = { ...business, website };
++      const readPage = vi.fn(async () => labonelPage());
++      const meta = incidentDiscovery(input);
++      const result = await establishIdentityFromSuppliedWebsite(input, meta, { readPage, id });
++      expect(readPage, website).not.toHaveBeenCalled();
++      expect(result.outcome).toBe("not_eligible");
++      expect(result.discovery).toEqual(meta.discovery);
++    }
++  });
++
++  test("generic or mismatched names, a conflicting owner name hint, and reader failures leave identity unconfirmed", async () => {
++    const cases: [BusinessContext, () => Promise<OfficialPage>][] = [
++      [business, async () => labonelPage({ title: "Home", identity: { siteName: null, heading: "Welcome" } })],
++      [business, async () => labonelPage({ title: "Sugar Petal Studio | Desserts", text: "Made-to-order desserts for every celebration in the city.", identity: { siteName: null, heading: null } })],
++      [{ ...business, name: "Orchard Bakehouse" }, async () => labonelPage()],
++      [business, async () => { throw new SourceReadError("ROBOTS_RESTRICTED", "Website access restrictions could not be cleared for this page."); }],
++      [business, async () => { throw new SourceReadError("READ_TIMEOUT", "The website read timed out."); }],
++      [business, async () => { throw new Error("socket closed"); }],
++      [business, async () => labonelPage({ url: "https://www.other-brand.shop/" })],
++    ];
++    for (const [input, read] of cases) {
++      const meta = incidentDiscovery(input);
++      const readPage = vi.fn(read);
++      const result = await establishIdentityFromSuppliedWebsite(input, meta, { readPage, id });
++      expect(readPage).toHaveBeenCalledTimes(1);
++      expect(["not_established", "unreadable"]).toContain(result.outcome);
++      expect(result.discovery).toMatchObject({ status: "ambiguous", name: null, officialWebsite: null, sourceIds: [] });
++      expect(result.sources).toEqual([]);
++      expect(discoveryNeedsIdentityConfirmation(prepareDiscoveryCheckpoint(input, result))).toBe(true);
++    }
++  });
++
++  test("a successful Meta discovery is untouched and never triggers a read", async () => {
++    const website = "https://orchard.example.com/";
++    const value = { name: "Orchard Patisserie", locality: null, vertical: "bakery", officialWebsite: website, instagram: null, identitySourceUrls: [website], facts: [{ subject: "business", claim: "Orchard Patisserie describes its baking as inspired by family recipes.", sourceUrl: website }], unknowns: [] };
++    const envelope = { id: "opened-website", status: "completed", output: [
++      { id: "opened-homepage", type: "web_search_call", status: "completed", action: { type: "open_page", url: website }, results: [] },
++      { type: "message", content: [{ type: "output_text", text: JSON.stringify(value) }] },
++    ] };
++    const input = { ...business, website };
++    const extracted = extractDiscoveryResponse(envelope, input, { discoveredAt: at });
++    expect(extracted.discovery.status).toBe("matched");
++    const readPage = vi.fn(async () => labonelPage());
++    const result = await establishIdentityFromSuppliedWebsite(input, { ...extracted, usage }, { readPage, id });
++    expect(readPage).not.toHaveBeenCalled();
++    expect(result.outcome).toBe("not_eligible");
++    expect(result.discovery).toEqual(extracted.discovery);
++  });
++
++  test("a tampered or unsupported direct-website identity is downgraded at checkpoint validation", async () => {
++    const result = await establishIdentityFromSuppliedWebsite(business, incidentDiscovery(), { readPage: async () => labonelPage(), id });
++    const [source] = result.sources;
++    expect(suppliedWebsiteIdentitySupported(result.discovery, source, "")).toBe(true);
++    const renamed = { ...result, discovery: { ...result.discovery, name: "Sugar Petal Studio" } };
++    expect(prepareDiscoveryCheckpoint(business, renamed).discovery).toMatchObject({ status: "unresolved", name: null });
++    const otherOrigin = { ...result, sources: [{ ...source, url: "https://www.other-brand.shop/" }] };
++    expect(prepareDiscoveryCheckpoint(business, otherOrigin).discovery).toMatchObject({ status: "unresolved", name: null });
++    const ownerSupplied = { ...result, sources: [{ ...source, acquisition: "owner_supplied" as const }] };
++    expect(prepareDiscoveryCheckpoint(business, ownerSupplied).discovery).toMatchObject({ status: "unresolved", name: null });
++  });
++
++  test("the official-site reader exposes first-party og:site_name and heading metadata from the supplied page", async () => {
++    const html = `<html><head><title>Labonel Fine Baking | Made-To-Order Freshly Baked Desserts</title><meta property="og:site_name" content="Labonel Fine Baking"></head><body><h1 class="hero">Labonel <em>Fine</em> Baking</h1><p>${visibleText}</p></body></html>`;
++    const requested: string[] = [];
++    const page = await readOfficialPage(site, { transport: async (url): Promise<RawSourceResponse> => {
++      requested.push(url.href);
++      return url.pathname === "/robots.txt" ? { status: 404, headers: {}, body: "" } : { status: 200, headers: { "content-type": "text/html; charset=utf-8" }, body: html };
++    } });
++    expect(requested).toEqual(["https://www.labonelfinebaking.shop/robots.txt", site]);
++    expect(page.identity).toEqual({ siteName: "Labonel Fine Baking", heading: "Labonel Fine Baking" });
++    expect(deriveSiteBrandName(page)).toBe("Labonel Fine Baking");
++  });
++});
