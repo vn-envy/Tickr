@@ -31,7 +31,9 @@ export function validateSourceUrl(input: string): URL {
     || /\.(?:localhost|local|internal|test|invalid|example|onion)$/.test(host)
     || BLOCKED_HOSTS.some((blocked) => host === blocked || host.endsWith(`.${blocked}`))
     || /^(?:api|search|maps)\./.test(host)
-    || /(?:^|\.)google\.[a-z.]+$/.test(host)) {
+    || /(?:^|\.)google\.[a-z.]+$/.test(host)
+    // Google's own ".google" TLD (share.google, about.google...) is a listing/redirect surface, never an official business site.
+    || /(?:^|\.)google$/.test(host)) {
     throw new SourceReadError("URL_NOT_ALLOWED", "Direct reading supports public official HTTPS websites only; listing, social, search and API URLs remain references.");
   }
   if (url.href.length > 2048) throw new SourceReadError("INVALID_URL", "Website URL is too long.");

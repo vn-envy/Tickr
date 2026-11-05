@@ -37,7 +37,9 @@ export function normalizeBusinessLink(raw: string): NormalizedLink {
   if (url.username || url.password) return { ok: false, error: "Remove the sign-in details from that link." };
   if (!url.hostname.includes(".")) return { ok: false, error: "Add the full web address, for example yourcafe.com." };
   const host = url.hostname.replace(/^www\./i, "").toLowerCase();
-  const isMaps = (MAPS_HOSTS.test(url.hostname) && (url.hostname.startsWith("maps.") || url.pathname.startsWith("/maps") || url.hostname.toLowerCase() === "maps.app.goo.gl"));
+  // A share.google/<token> link is Google's share-sheet link for a Business Profile listing.
+  const isGoogleShare = url.hostname.toLowerCase() === "share.google" && /^\/[A-Za-z0-9_-]{6,64}\/?$/.test(url.pathname);
+  const isMaps = isGoogleShare || (MAPS_HOSTS.test(url.hostname) && (url.hostname.startsWith("maps.") || url.pathname.startsWith("/maps") || url.hostname.toLowerCase() === "maps.app.goo.gl"));
   const kind: LinkKind = isMaps ? "maps" : /(^|\.)instagram\.com$/.test(host) ? "instagram" : /(^|\.)(facebook\.com|fb\.com|fb\.me)$/.test(host) ? "facebook" : "website";
   return { ok: true, url: url.href, kind, host };
 }

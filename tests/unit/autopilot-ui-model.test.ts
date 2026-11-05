@@ -3,7 +3,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { CampaignKit, RunView } from "@/lib/research/contracts";
 import { emptyPublicState, type AutopilotPublicState } from "@/lib/autopilot/public-state";
-import { APPROVAL_STATEMENT, approvableFiles, approvalReview, approvedDownloads, campaignFilename, carouselAssets, clampBox, classifyUpload, composeGoal, connectUrl, deriveRail, directorLog, findingTarget, isOAuthReturn, mediaWallMode, normalizeBusinessLink, offerableArchive, railForStage, reelAsset, resolveOAuthReturn, roleBadges, roomHeadline, serverWithheld, shortDigest, STOPPED_STATE_MAX_RETRIES, stoppedStateRetryDelay, trackingOverlay, uploadUrl, withoutWithheld } from "@/components/autopilot/model";
+import { APPROVAL_STATEMENT, LINK_KIND_LABEL, approvableFiles, approvalReview, approvedDownloads, campaignFilename, carouselAssets, clampBox, classifyUpload, composeGoal, connectUrl, deriveRail, directorLog, findingTarget, isOAuthReturn, mediaWallMode, normalizeBusinessLink, offerableArchive, railForStage, reelAsset, resolveOAuthReturn, roleBadges, roomHeadline, serverWithheld, shortDigest, STOPPED_STATE_MAX_RETRIES, stoppedStateRetryDelay, trackingOverlay, uploadUrl, withoutWithheld } from "@/components/autopilot/model";
 import { ApprovalBlock } from "@/components/autopilot/autopilot-ready";
 import { DirectorsRoom, MediaWall } from "@/components/autopilot/directors-room";
 import { MediaDropzone, type QueuedFile } from "@/components/autopilot/media-dropzone";
@@ -25,6 +25,10 @@ describe("autopilot intake helpers", () => {
     expect(normalizeBusinessLink("synthetic-cafe.example")).toMatchObject({ ok: true, url: "https://synthetic-cafe.example/", kind: "website" });
     expect(normalizeBusinessLink("https://facebook.com/synthetic")).toMatchObject({ ok: true, kind: "facebook" });
     expect(normalizeBusinessLink("https://www.google.com/search?q=cafe")).toMatchObject({ ok: true, kind: "website" });
+    const share = normalizeBusinessLink("share.google/FVjbnawViHJw2GdDg");
+    expect(share).toMatchObject({ ok: true, url: "https://share.google/FVjbnawViHJw2GdDg", kind: "maps", host: "share.google" });
+    expect(share.ok && LINK_KIND_LABEL[share.kind]).toBe("Google Maps listing");
+    expect(normalizeBusinessLink("https://share.google/")).toMatchObject({ ok: true, kind: "website" });
   });
   it("rejects credentials, non-web schemes and fragments", () => {
     expect(normalizeBusinessLink("").ok).toBe(false);

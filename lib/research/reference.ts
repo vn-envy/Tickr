@@ -53,6 +53,69 @@ function routingHints(url: URL): Pick<BusinessReference, "nameHint" | "coordinat
   return result;
 }
 
+const SHARE_HOST = "share.google";
+const SHARE_REDIRECT_HOST = "www.google.com";
+const SHARE_TOKEN = /^[A-Za-z0-9_-]{6,64}$/;
+const KNOWLEDGE_GRAPH_ID = /^\/g\/[A-Za-z0-9_]{4,40}$|^\/m\/[A-Za-z0-9_]{2,40}$/;
+const SHARE_MAX_HOPS = 3;
+
+/** The token of an exact https://share.google/<token> link, or null. Query, fragment, credentials and ports are refused. */
+function shareToken(url: URL): string | null {
+  if (url.protocol !== "https:" || url.hostname !== SHARE_HOST || url.username || url.password || url.port || url.search || url.hash || /[?#]/.test(url.href)) return null;
+  const token = url.pathname.slice(1);
+  return SHARE_TOKEN.test(token) ? token : null;
+}
+
+/** Search-query text from the terminal redirect: control characters removed, whitespace collapsed, oversized input refused. */
+function shareQueryText(value: string): string | null {
+  if (value.length > 200) return null;
+  const text = value.replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ").replace(/\s+/g, " ").trim();
+  return text.length >= 2 ? text : null;
+}
+
+type ShareHints = Pick<BusinessReference, "resolvedUrl" | "nameHint" | "contextHint" | "placeIdHint">;
+
+/** Hints carried by the terminal www.google.com/search URL. The URL itself is never requested. */
+function shareSearchHints(url: URL): ShareHints | null {
+  const query = url.searchParams.getAll("q");
+  if (query.length !== 1) return null;
+  const text = shareQueryText(query[0]);
+  if (!text) return null;
+  const [name, ...context] = text.split(" | ").map((part) => part.trim());
+  if (!name || name.length < 2 || context.some((part) => part.length < 2)) return null;
+  const graphIds = url.searchParams.getAll("kgmid");
+  const placeIdHint = graphIds.length === 1 && KNOWLEDGE_GRAPH_ID.test(graphIds[0]) ? graphIds[0] : null;
+  // Session and tracking parameters (sxsrf, sca_esv, kgs, shem, utm_*) are dropped; only the routing hints are kept.
+  const resolved = new URL("https://www.google.com/search");
+  resolved.searchParams.set("q", query[0]);
+  if (placeIdHint) resolved.searchParams.set("kgmid", placeIdHint);
+  return { resolvedUrl: resolved.href, nameHint: name, contextHint: context.length ? context.join(" | ") : null, placeIdHint };
+}
+
+/**
+ * Follow a Google share link header-only on fixed hosts and stop at the search redirect target without requesting it.
+ * Any unexpected host, path, status, token or hop count fails closed with no hints.
+ */
+async function resolveShareLink(start: URL, token: string, transport: typeof fetch): Promise<ShareHints | null> {
+  let url = start;
+  for (let hop = 0; hop < SHARE_MAX_HOPS; hop++) {
+    const response = await transport(url.href, { method: "GET", redirect: "manual", signal: AbortSignal.timeout(7000), headers: { Accept: "text/html" }, credentials: "omit", cache: "no-store" });
+    const location = response.headers.get("location");
+    try { await response.body?.cancel(); } catch { /* The body is never read. */ }
+    if (response.redirected || ![301, 302, 303, 307, 308].includes(response.status) || !location || location.length > 8192) return null;
+    let destination: URL;
+    try { destination = new URL(location, url); } catch { return null; }
+    if (destination.protocol !== "https:" || destination.username || destination.password || destination.port || destination.hash) return null;
+    if (destination.hostname === SHARE_REDIRECT_HOST && destination.pathname === "/search") return shareSearchHints(destination);
+    const sameShare = shareToken(destination) === token;
+    const sameRedirect = destination.hostname === SHARE_REDIRECT_HOST && destination.pathname === "/share.google"
+      && [...destination.searchParams.keys()].length === 1 && destination.searchParams.getAll("q").length === 1 && destination.searchParams.get("q") === token;
+    if (!sameShare && !sameRedirect) return null;
+    url = destination;
+  }
+  return null;
+}
+
 export async function resolveBusinessReference(input: string, dependencies: { fetch?: typeof fetch } = {}): Promise<BusinessReference> {
   const result: BusinessReference = { inputUrl: input, resolvedUrl: input, nameHint: null, coordinatesHint: null, placeIdHint: null, featureIdHint: null, contextHint: null, warnings: [] };
   let url: URL;
@@ -70,6 +133,14 @@ export async function resolveBusinessReference(input: string, dependencies: { fe
     result.warnings.push(...hints.warnings);
   };
   applyHints(url);
+  const token = shareToken(url);
+  if (token) {
+    let hints: ShareHints | null = null;
+    try { hints = await resolveShareLink(url, token, dependencies.fetch ?? globalThis.fetch); } catch { hints = null; }
+    if (hints) { Object.assign(result, hints); return result; } // Deliberately never fetch the Google search destination.
+    result.warnings.push("The Google share link did not expose a usable routing redirect. Meta will investigate the supplied reference directly.");
+    return result;
+  }
   // All other sources are passed to Meta discovery; no arbitrary host can reach this fetch path.
   if (url.hostname !== "maps.app.goo.gl" || !tokenPath.test(url.pathname) || url.href.length > 2048) return result;
   const transport = dependencies.fetch ?? globalThis.fetch;

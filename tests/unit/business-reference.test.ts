@@ -69,3 +69,102 @@ describe("business reference routing", () => {
     expect(transport).not.toHaveBeenCalled();
   });
 });
+
+describe("Google share-link routing", () => {
+  const input = "https://share.google/FVjbnawViHJw2GdDg";
+  const hop = "https://www.google.com/share.google?q=FVjbnawViHJw2GdDg";
+  const terminal = "https://www.google.com/search?sca_esv=fixtureEsv&sxsrf=fixtureSxsrf&kgmid=/g/11yfky_f64&q=Katha+Coffee+%26+Bakehouse+%7C+Financial+District&shem=fixtureShem&source=sh/x/loc/uni/m1/1&kgs=fixtureKgs&utm_source=fixtureUtm";
+  type Step = { status: number; location?: string; body?: string };
+  /** A header-only fake transport: it records whether any response body was read and never serves /search. */
+  function chain(steps: Record<string, Step>) {
+    const bodyReads: string[] = [];
+    const cancelled: string[] = [];
+    const transport = vi.fn<(target: string | URL | Request, init?: RequestInit) => Promise<Response>>(async (target) => {
+      const href = String(target);
+      if (new URL(href).pathname === "/search") throw new Error("The search destination must never be requested.");
+      const step = steps[href];
+      if (!step) throw new Error(`Unexpected request ${href}`);
+      const stream = new ReadableStream<Uint8Array>({
+        pull(controller) { bodyReads.push(href); controller.enqueue(new TextEncoder().encode(step.body ?? "<html>fixture</html>")); controller.close(); },
+        cancel() { cancelled.push(href); },
+      }, { highWaterMark: 0 });
+      const response = new Response(stream, { status: step.status, headers: step.location ? { Location: step.location } : {} });
+      for (const method of ["text", "json", "arrayBuffer", "blob", "formData", "bytes"] as const) {
+        if (method in response) vi.spyOn(response, method as "text").mockImplementation(async () => { bodyReads.push(href); throw new Error("body read"); });
+      }
+      return response;
+    });
+    return { transport: transport as unknown as typeof fetch & typeof transport, bodyReads, cancelled };
+  }
+  const noHints = { nameHint: null, contextHint: null, placeIdHint: null, coordinatesHint: null, featureIdHint: null };
+
+  it("follows the observed header-only chain and stops before the search page", async () => {
+    const { transport, bodyReads, cancelled } = chain({ [input]: { status: 302, location: hop }, [hop]: { status: 301, location: terminal } });
+    const result = await resolveBusinessReference(input, { fetch: transport });
+    expect(result).toMatchObject({ inputUrl: input, nameHint: "Katha Coffee & Bakehouse", contextHint: "Financial District", placeIdHint: "/g/11yfky_f64", coordinatesHint: null, featureIdHint: null, warnings: [] });
+    expect(result.resolvedUrl).toBe("https://www.google.com/search?q=Katha+Coffee+%26+Bakehouse+%7C+Financial+District&kgmid=%2Fg%2F11yfky_f64");
+    expect(result.resolvedUrl).not.toMatch(/sxsrf|sca_esv|kgs|shem|utm_/);
+    expect(transport.mock.calls.map((call) => String(call[0]))).toEqual([input, hop]);
+    for (const call of transport.mock.calls) {
+      expect(call[1]).toEqual(expect.objectContaining({ method: "GET", redirect: "manual", credentials: "omit", cache: "no-store", headers: { Accept: "text/html" } }));
+      expect(JSON.stringify(call[1]?.headers)).not.toMatch(/authorization|cookie/i);
+    }
+    expect(bodyReads).toEqual([]);
+    expect(cancelled).toEqual([input, hop]);
+  });
+
+  it("refuses malformed share links without any request", async () => {
+    const { transport } = chain({});
+    for (const value of ["http://share.google/FVjbnawViHJw2GdDg", "https://share.google/abc", "https://share.google/FVjbnawViHJw2GdDg?x=1", "https://share.google/FVjbnawViHJw2GdDg?", "https://share.google/FVjbnawViHJw2GdDg#frag",
+      "https://user:pw@share.google/FVjbnawViHJw2GdDg", "https://share.google:8443/FVjbnawViHJw2GdDg", "https://share.google/FVjb/nawViHJw2GdDg", "https://share.google.evil.test/FVjbnawViHJw2GdDg", `https://share.google/${"a".repeat(65)}`]) {
+      const result = await resolveBusinessReference(value, { fetch: transport });
+      expect(result).toMatchObject(noHints);
+    }
+    expect(transport).not.toHaveBeenCalled();
+  });
+
+  it("fails closed on any deviation in the redirect chain", async () => {
+    const cases: { name: string; steps: Record<string, Step>; requests: number }[] = [
+      { name: "other host", steps: { [input]: { status: 302, location: "https://evil.test/share.google?q=FVjbnawViHJw2GdDg" } }, requests: 1 },
+      { name: "lookalike host", steps: { [input]: { status: 302, location: "https://www.google.com.evil.test/share.google?q=FVjbnawViHJw2GdDg" } }, requests: 1 },
+      { name: "other Google host", steps: { [input]: { status: 302, location: hop }, [hop]: { status: 301, location: terminal.replace("www.google.com", "www.google.co.in") } }, requests: 2 },
+      { name: "http terminal", steps: { [input]: { status: 302, location: hop }, [hop]: { status: 301, location: terminal.replace("https:", "http:") } }, requests: 2 },
+      { name: "http hop", steps: { [input]: { status: 302, location: hop.replace("https:", "http:") } }, requests: 1 },
+      { name: "unexpected path", steps: { [input]: { status: 302, location: "https://www.google.com/maps/place/Katha" } }, requests: 1 },
+      { name: "token mismatch", steps: { [input]: { status: 302, location: "https://www.google.com/share.google?q=OtherToken123" } }, requests: 1 },
+      { name: "extra hop parameter", steps: { [input]: { status: 302, location: `${hop}&next=https://evil.test` } }, requests: 1 },
+      { name: "different share token", steps: { [input]: { status: 302, location: "https://share.google/OtherToken123" } }, requests: 1 },
+      { name: "credentials in redirect", steps: { [input]: { status: 302, location: "https://user@www.google.com/share.google?q=FVjbnawViHJw2GdDg" } }, requests: 1 },
+      { name: "body-only 200", steps: { [input]: { status: 200, body: `<a href="${terminal}">Katha</a>` } }, requests: 1 },
+      { name: "200 with Location", steps: { [input]: { status: 200, location: terminal } }, requests: 1 },
+      { name: "missing Location", steps: { [input]: { status: 302 } }, requests: 1 },
+      { name: "missing q", steps: { [input]: { status: 302, location: hop }, [hop]: { status: 301, location: "https://www.google.com/search?kgmid=/g/11yfky_f64" } }, requests: 2 },
+      { name: "duplicate q", steps: { [input]: { status: 302, location: hop }, [hop]: { status: 301, location: `${terminal}&q=Other` } }, requests: 2 },
+      { name: "oversized q", steps: { [input]: { status: 302, location: hop }, [hop]: { status: 301, location: `https://www.google.com/search?q=${"Katha+".repeat(40)}` } }, requests: 2 },
+      { name: "control-only q", steps: { [input]: { status: 302, location: hop }, [hop]: { status: 301, location: "https://www.google.com/search?q=%00%01%1F" } }, requests: 2 },
+      { name: "too many hops", steps: { [input]: { status: 302, location: hop }, [hop]: { status: 302, location: hop } }, requests: 3 },
+    ];
+    for (const entry of cases) {
+      const { transport, bodyReads } = chain(entry.steps);
+      const result = await resolveBusinessReference(input, { fetch: transport });
+      expect(result, entry.name).toMatchObject({ ...noHints, resolvedUrl: input });
+      expect(result.warnings.join(" "), entry.name).toContain("Google share link did not expose a usable routing redirect");
+      expect(transport, entry.name).toHaveBeenCalledTimes(entry.requests);
+      expect(bodyReads, entry.name).toEqual([]);
+    }
+  });
+
+  it("strips control characters from the routed name and ignores a malformed knowledge-graph id", async () => {
+    const { transport } = chain({ [input]: { status: 302, location: hop }, [hop]: { status: 301, location: "https://www.google.com/search?q=Katha%00+Coffee%1B+%7C+Financial%0ADistrict&kgmid=/x/../../etc" } });
+    const result = await resolveBusinessReference(input, { fetch: transport });
+    expect(result).toMatchObject({ nameHint: "Katha Coffee", contextHint: "Financial District", placeIdHint: null });
+    expect(`${result.nameHint}${result.contextHint}`).not.toMatch(/[\u0000-\u001f\u007f]/);
+  });
+
+  it("tolerates an unavailable network without hints", async () => {
+    const transport = vi.fn(async () => { throw new TypeError("network down"); });
+    const result = await resolveBusinessReference(input, { fetch: transport as unknown as typeof fetch });
+    expect(result).toMatchObject({ ...noHints, resolvedUrl: input });
+    expect(transport).toHaveBeenCalledOnce();
+  });
+});

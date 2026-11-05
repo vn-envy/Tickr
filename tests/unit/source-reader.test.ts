@@ -16,6 +16,9 @@ describe("public website boundary", () => {
       "https://maps.app.goo.gl/reference", "https://www.google.co.uk/maps", "https://www.instagram.com/bakery", "https://api.vendor.com/data",
     ]) expect(() => validateSourceUrl(url), url).toThrow();
     expect(validateSourceUrl("https://bakery.example.com/menu#section").href).toBe("https://bakery.example.com/menu");
+    for (const url of ["https://share.google/FVjbnawViHJw2GdDg", "https://SHARE.GOOGLE/FVjbnawViHJw2GdDg", "https://about.google/", "https://www.share.google/x"])
+      expect(() => validateSourceUrl(url), url).toThrow(expect.objectContaining({ code: "URL_NOT_ALLOWED" }));
+    expect(validateSourceUrl("https://notgoogle.example.com/").hostname).toBe("notgoogle.example.com");
     for (const address of ["0.1.2.3", "10.1.2.3", "100.64.1.1", "127.1.2.3", "169.254.1.1", "172.31.1.1", "192.168.1.1", "192.0.2.1", "198.18.1.1", "198.51.100.1", "203.0.113.1", "224.0.0.1", "255.255.255.255", "::ffff:127.0.0.1"])
       expect(isPublicIPv4(address), address).toBe(false);
     expect(isPublicIPv4("93.184.216.34")).toBe(true);

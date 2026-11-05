@@ -219,4 +219,20 @@ describe("Meta business discovery", () => {
     await expect(discoverBusiness(business, { client: { requestJson }, resolveReference })).rejects.toThrow("Provider unavailable");
     expect(requestJson).toHaveBeenCalledTimes(2);
   });
+
+  test("passes Google share-link routing to Spark as unverified hints and treats it as a listing", async () => {
+    const shareLink = "https://share.google/FVjbnawViHJw2GdDg";
+    const located = { ...candidate, locality: "Riverside", facts: [{ subject: "business", claim: "Orchard Bakehouse is located in Riverside.", sourceUrl: url }] };
+    const requestJson = vi.fn().mockResolvedValue(response(located, { snippet: "Orchard Bakehouse is located in Riverside." }));
+    const resolveReference = vi.fn().mockResolvedValue({ inputUrl: shareLink, resolvedUrl: "https://www.google.com/search?q=Orchard+Bakehouse+%7C+Riverside&kgmid=%2Fg%2F11fixture", nameHint: "Orchard Bakehouse", coordinatesHint: null, placeIdHint: "/g/11fixture", featureIdHint: null, contextHint: "Riverside", warnings: [] });
+    const result = await discoverBusiness({ ...business, name: "", website: shareLink }, { client: { requestJson }, resolveReference, now: () => new Date(at) });
+    const request = requestJson.mock.calls[0][1];
+    expect(request.body.instructions).toContain("Google share links (share.google)");
+    expect(request.body.instructions).toContain("unverified search hints; do not fetch Maps, Google share or Google search pages");
+    expect(JSON.parse(request.body.input)).toMatchObject({ suppliedLink: shareLink, nameHint: "Orchard Bakehouse", localityHint: null, routingHints: { placeId: "/g/11fixture", context: "Riverside", coordinates: null, provenance: "unverified_url_routing" } });
+    // An unmatched branch keeps the listing's locality unresolved, as for Maps links; a plain website keeps the supported brand locality.
+    expect(result.discovery).toMatchObject({ locality: null, branch: { status: "unresolved" } });
+    const website = await discoverBusiness({ ...business, website: "https://orchard.example.com/" }, { client: { requestJson }, resolveReference: vi.fn().mockResolvedValue({ inputUrl: "https://orchard.example.com/", resolvedUrl: "https://orchard.example.com/", nameHint: null, coordinatesHint: null, placeIdHint: null, featureIdHint: null, contextHint: null, warnings: [] }), now: () => new Date(at) });
+    expect(website.discovery.locality).toBe("Riverside");
+  });
 });
