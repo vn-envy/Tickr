@@ -1,12 +1,18 @@
 # Tickr Autopilot
 
-Updated 4 November 2026 (IST). **Autopilot** is the one-shot product flow. The owner shares a Google Maps listing or website link and a campaign goal, and Tickr works autonomously until there is a **review-ready** campaign kit with reel-worthy content. The owner then gives **one** approval, bound to the exact file hashes. Nothing is published, no ad budget is spent and no message is sent.
+Updated 5 November 2026 (IST). **Autopilot** is the one-shot product flow. The owner shares one link (a website, a Google Maps link or a Google `share.google` link) and a campaign goal, and Tickr works autonomously until there is a **review-ready** campaign kit with reel-worthy content. The owner then gives **one** approval, bound to the exact file hashes. Nothing is published, no ad budget is spent and no message is sent.
 
-Live verification status (4 November 2026): `npm run autopilot:check` passed all 7 steps against the live Meta API on synthetic media. It made 6 paid requests: 3 Muse Spark and 3 SAM 3.1. The full end-to-end Autopilot path through the app and worker is verified offline (614 tests, production build, browser flow). A live end-to-end run on real businesses is the next recorded check; see [setup verification](SETUP_VERIFICATION.md).
+Live verification status (5 November 2026):
+
+- **4 Nov, live capability probe.** `npm run autopilot:check` passed all 7 steps against the live Meta API on synthetic media. It made 6 paid requests: 3 Muse Spark and 3 SAM 3.1.
+- **5 Nov, hosted end-to-end run.** On the Modal deployment, Grandma Daphne's Bakehouse (Hyderabad) completed from a website link and a story goal in 3 min 40 s. See [Hosted run results](#hosted-run-results-5-november-2026) below.
+- **Offline.** `npm run check` passes with 951 tests on the deployed commit `6c0aaec`.
+
+See also [setup verification](SETUP_VERIFICATION.md).
 
 ## The owner's experience
 
-1. **One screen.** The owner pastes the link and picks a goal ("Tell our story", "Launch something new", "Fill quiet hours", "Promote an event", "Win new regulars", or their own words). Two things are optional:
+1. **One screen.** The owner pastes the link (website, Google Maps or `share.google`) and picks a goal ("Tell our story", "Launch something new", "Fill quiet hours", "Promote an event", "Win new regulars", or their own words). Two things are optional:
    - **Drop in photos and videos.** Two consent confirmations are required first: the owner has the rights, and anyone shown has agreed (or no one is shown).
    - **Connect Instagram/Facebook** with Meta login. This needs an attestation covering the media on those accounts.
 2. **Run Autopilot.** A "director's room" shows the work live: the phase rail, a log, every harvested photo with Spark's verdicts, SAM mask previews, and the production plan.
@@ -62,8 +68,9 @@ Budget and recovery:
 
 ## Safety rules the engine enforces
 
-- **Google listings.** The Maps link provides only an identity hint. Maps pages and Places are never read (AGENTS.md).
-- **Website media.** Only images referenced by the official site are used, through the SSRF-safe pinned reader. Images on exact Squarespace, Wix and Shopify CDN origins are allowed. Rights stay "unknown – review".
+- **Google listings.** A Maps link provides only an identity hint. A `share.google` link is resolved from redirect headers only, and no Google page is fetched. Maps pages and Places are never read (AGENTS.md).
+- **Brand website fallback.** When the exact branch from a Maps link can't be resolved, discovery can still find the brand's official website through Meta search.
+- **Website media.** Only images referenced by the official site are used, through the SSRF-safe pinned reader. Images on exact Squarespace, Wix, Shopify and Zyro (`assets.zyrosite.com`) CDN origins are allowed (`lib/media/policy.ts`). Rights stay "unknown – review".
 - **Owner media.** Owner uploads and connected-account media require consent attestations. Tokens are encrypted at rest with `TICKR_SECRET_KEY`, never logged and never sent to a CDN.
 - **Exclusions.** The director always excludes possible minors, people without a recorded consent, third-party logos or signage, and visible price or offer text when no offer is approved.
 - **Withholding.** The critic's deterministic fixes withhold assets rather than invent copy. Withheld files are excluded from the approval digest. The concept ZIP is withheld when it contains a withheld file.
@@ -72,6 +79,8 @@ Budget and recovery:
 ## Configuration
 
 `META_API_KEY` is required for live runs. The owner Meta connection is optional and is enabled only when all of `META_APP_ID`, `META_APP_SECRET`, `META_OAUTH_REDIRECT_URI` and `TICKR_SECRET_KEY` are set. See [.env.example](../.env.example). Put values in the environment, never in files or chat.
+
+A hosted deployment also sets `TICKR_ACCESS_CODE` (turns on the access-code gate) and `TICKR_ALLOWED_HOSTS` (the public host allowed for browser writes). Both are optional locally, where the gate is off by default. See [deploy/README.md](../deploy/README.md).
 
 ## Verification
 
@@ -104,9 +113,41 @@ The list-price estimate for the whole probe was about USD 0.06; this is an estim
 - a low-contrast subtitle;
 - a wrong end-card label.
 
+### Hosted run results (5 November 2026)
+
+This was a real business on the hosted Modal deployment. The input was a website link and a story goal.
+
+| Item | Result |
+| --- | --- |
+| Business | Grandma Daphne's Bakehouse, Hyderabad |
+| Wall time | 3 min 40 s, from start to a review-ready kit |
+| Media analysed | 12 official-site photos studied by Spark |
+| Media excluded | 3, each with a recorded reason: a person without consent, a logo, interior signage |
+| SAM 3.1 cutouts | 3 |
+| Reel | Still-depth Reel from the hero photo's SAM layers |
+| Critic | 10 findings, none blocking. They included ragged edges on the hero cutout and text contrast. |
+
+Work in progress after this run:
+
+- **Mask-quality gate.** A SAM mask-quality gate, to catch ragged cutout edges like the one above.
+- **Website-identity fallback.** When Meta search doesn't return usable sources, Tickr will read the owner's own website with its permitted, SSRF-safe reader to establish the business's identity.
+
+Maps-link discovery depends on Meta search returning usable sources. In 3 of the last 5 Maps attempts it did not, and Tickr stopped and asked for a better link instead of guessing. Earlier, Theobroma completed with a labelled illustration, because its image CDN blocks downloads.
+
+Hardening in this build:
+
+- Copy claim repair: a copy line the selected sources can't support, and the lines read together with it (the same ad, scene sequence or script), are replaced by neutral lines. Each replacement is recorded with its original text in `copy-claim-repairs.json`.
+- Research analysis repair: findings that cite evidence about a different subject are repaired.
+- Brand-website discovery fallback.
+- Mask refinement.
+- Bounded Reel framing.
+- A fix for layout clipping.
+- The critic now ignores provenance labels.
+- The fallback illustration now follows the focus subject.
+
 ### Still live-unverified
 
-- How accurate Spark's boxes are on real busy product photos, as opposed to synthetic ones.
+- How accurate Spark's boxes are across many real busy product photos. The 5 Nov hosted run covered one business.
 - SAM 3.1 behaviour on long or crowded real footage and on video frames with no objects.
 - The Graph API's acceptance of the form-POST code exchange and token upgrade, and the real CDN hostnames.
 - Inline payload limits for long Reels sent to the critic.

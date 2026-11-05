@@ -73,3 +73,23 @@ Run `npm run media:check` for renderer changes. Explicit live generation command
 The Meta hackathon overview and linked official rules were previously retrieved successfully. Judging weights are impact 30%, Meta AI tooling 25%, technical depth/execution 20%, and demo 25%. The stated deadline is November 4, 2026 at 9 PM US Eastern, or November 5 at 07:30 IST. See the build plan for remaining submission details.
 
 No repository push, public deployment, social publication, outbound message or ad activation was performed.
+
+---
+
+# Correction and update — 5 November 2026
+
+This entry is appended. It corrects two statements in the entries above, which are left as they were.
+
+| Earlier statement | Current status |
+| --- | --- |
+| 4 Nov entry: "614 tests across 56 files" | `npm run check` passes with **951 tests** on the deployed commit `6c0aaec`. |
+| 2 Nov entry: "No repository push, public deployment, social publication, outbound message or ad activation was performed." | Tickr's own code is now deployed on Modal as one persistent container behind an access-code gate (see [deploy/README.md](../deploy/README.md)). Modal runs no models; inference stays on Meta-hosted APIs. No social publication, outbound message or ad activation has been performed. |
+| 2 Nov entry: "The app is a private development instance without multi-user access controls." | An access-code gate now exists (`proxy.ts`, `lib/access.ts`) and is on for the hosted deployment. There are still no per-user accounts. |
+
+| Check | Observed result |
+| --- | --- |
+| Hosted end-to-end Autopilot | Grandma Daphne's Bakehouse (Hyderabad), website link with a story goal, on the Modal deployment. It completed in 3 min 40 s. Spark analysed 12 official-site photos. 3 were excluded with recorded reasons: a person without consent, a logo, interior signage. SAM 3.1 produced 3 cutouts, and Tickr rendered a still-depth Reel. The critic raised 10 findings, none blocking, including ragged edges on the hero cutout and text contrast. |
+| Maps-link discovery | In 3 of the last 5 Maps attempts, Meta search returned no usable sources, and Tickr stopped and asked for a better link instead of guessing. |
+| `share.google` links | Resolved from redirect headers only. No Google page is fetched. |
+
+In progress at the time of writing: a SAM mask-quality gate, and a website-identity fallback that uses Tickr's permitted, SSRF-safe reading of the owner's own site.

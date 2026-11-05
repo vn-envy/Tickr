@@ -1,108 +1,195 @@
-# Tickr
+# Tickr Autopilot
 
-**Turn a business link into a researched campaign and a playable Reel.**
+**One link and one goal in. A reviewed, ready-to-approve campaign kit out.**
 
-Tickr helps local businesses that cannot afford a photographer, videographer or ad agency start with a useful campaign concept. Paste a website, Maps reference or social profile; the engine investigates the business, proposes a supported direction, and produces coordinated Instagram, Facebook and WhatsApp creative.
-
-Built for the Meta Global AI Hackathon. All runtime AI uses Meta-hosted APIs.
-
-## Autopilot: one link, one goal, a finished campaign
-
-The default experience is **Autopilot**. Paste a Google Maps listing or website link and pick a goal. Optionally drop in phone photos and videos, or connect Instagram/Facebook with Meta login.
-
-Tickr then works without further input until there is a review-ready kit:
-
-1. It researches the business and chooses the best-supported campaign.
-2. Muse Spark studies **every** photo and clip against the goal.
-3. SAM 3.1 cuts out the real products, using Spark's grounded boxes as prompts, and **tracks them through the owner's footage**.
-4. It renders a cinematic Reel from real pixels, plus a multi-photo carousel and every channel asset.
-5. Spark watches and critiques the result, and fixes that need no new copy are applied.
-
-The owner then approves once; the approval is bound to the exact file hashes. Nothing is published. See [Autopilot](docs/AUTOPILOT.md) for the pipeline, safety rules and verification status.
+All AI inference runs on Meta-hosted APIs (`api.meta.ai`); the hosting runs only Tickr's own code.
 
 ## What it does
 
-1. **Discover** the business, its category and the likely shop location from one link.
-2. **Investigate** products, brand story, customer signals, competitors and seasonal context, with sources and gaps visible.
-3. **Choose a direction** grounded in an actual offering or attributed story.
-4. **Create** feed images, a carousel, Stories, Facebook ads, click-to-WhatsApp creative, Status artwork and a four-scene Reel.
-5. **Export** PNGs, a 12-second MP4, captions, suggested replies, evidence and a checksummed ZIP.
+Tickr is for small businesses that can't afford a photographer, a videographer or an agency.
 
-Business categories are free-form. The engine distinguishes a confirmed branch from a likely or unresolved match, and a proposed seasonal idea from an established promotion.
+1. The owner pastes **one link**: their website, a Google Maps link or a Google `share.google` link.
+2. The owner picks **one goal**, for example "Tell our story" or "Fill quiet hours".
+3. Tickr works on its own from there. It researches the business and collects the business's real photos. It studies every image with Muse Spark and cuts out the real products with SAM 3.1. It then renders a vertical Reel and a full channel kit, and critiques its own output.
+4. The owner reviews the kit and gives **one approval**. That approval is bound to the exact file hashes.
 
-## Meta-powered media
+The kit covers Instagram feed, carousel, Stories and Reels, a Facebook ad, click-to-WhatsApp creative and WhatsApp Status.
 
-| Component | Role |
-| --- | --- |
-| Muse Spark | Native web research, evidence analysis and campaign copy |
-| Muse Image | Illustrations and empty campaign backdrops |
-| SAM 3.1 | Subject masks for composition while retaining source-image pixels |
-| Sharp + FFmpeg | Local layouts, typography, motion and video encoding |
+Tickr never publishes, never spends ad budget and never contacts anyone.
 
-A product illustration can use a SAM cutout over a campaign palette. An acquired source photo can use a SAM cutout over a generated backdrop. Story imagery and failed selections use composed crops. Generated imagery stays labelled as illustrative.
+## Try it
 
-Research uses bounded Meta-native retrieval and a restricted public official-site reader. Maps links supply routing hints; Tickr does not call Google Places or scrape Maps pages. No additional model provider, external search service or video-generation API is used.
+- **Live app:** https://vn-envy--tickr.us-east.modal.run. It is behind an access code, which the team can provide on request.
+- **Demo video:** link to be added.
+- **Judge guide:** [docs/JUDGES.md](docs/JUDGES.md) explains what to look at and where each capability lives in the code.
 
-![Four compositions using a Meta illustration and its SAM subject mask](docs/assets/sam-composition-example.png)
+## How it uses Meta models
 
-*Local rendering diagnostic using a saved, genuine SAM response and a Muse illustration. These are example layouts, not authenticated product photography or an approved brand campaign.*
+| Model | Capability used | Role in Tickr |
+| --- | --- | --- |
+| `muse-spark-1.3` | Native web search with citations | Finds the business, its offerings and its story from one link, with sources kept |
+| `muse-spark-1.3` | Strict JSON output | Research analysis, campaign choice and channel copy |
+| `muse-spark-1.3` | Image grounding (boxes on a 0–1000 grid, up to 24 images per request) | Studies every harvested photo and points at the main subject |
+| `muse-spark-1.3` | Video understanding | Writes a shot log for the owner's clips |
+| `muse-spark-1.3` | Vision and video critique | Reviews the finished stills and the Reel, with grounded findings |
+| `sam-3.1` | Box prompts | Cuts out the exact object Spark pointed at |
+| `sam-3.1` | Concept prompts | Fallback when there is no usable box |
+| `sam-3.1` | Video tracking | Follows the product through the owner's footage for the tracked Reel |
+| `muse-image-1.0` | Image generation | Labelled backdrops, or a labelled illustration when no real photo can be used. It never puts generated pixels on the product. |
 
-## Run locally
+## Spark points, SAM cuts
 
-Requires **Linux, Node.js 24, npm 11.9, FFmpeg, Chromium and `setsid`**. Package-registry and Prisma binary access are needed during setup.
+Muse Spark draws a box around the main subject of each photo. Tickr turns that box into a SAM 3.1 box prompt, so SAM cuts out that specific object instead of guessing from a product name. Concept prompts are the fallback. Each cutout keeps the original photo's pixels and only changes transparency. Every Reel's composition ledger records `generatedPixelsOnSubject: 0`. With owner footage, SAM 3.1 tracks the product through the clip, and the Reel sets the headline behind the moving subject. Without footage, the hero photo's SAM layers drive a depth Reel.
+
+## Architecture
+
+Tickr is one Next.js app plus a durable background worker, with SQLite for state. Rendering is local: Sharp for stills and FFmpeg for video. All model calls go to Meta-hosted APIs. Each paid step reserves budget and stores the raw response before decoding it. After a crash, saved responses are reused and an uncertain paid request is not repeated automatically.
+
+```mermaid
+flowchart LR
+  A[One link + one goal] --> B[Discover and research<br/>Muse Spark search]
+  B --> C[Harvest real media<br/>official site, owner uploads]
+  C --> D[Analyse every image<br/>Spark grounded boxes]
+  D --> E[Cut out products<br/>SAM 3.1 box prompts]
+  E --> F[Reel and channel kit<br/>local Sharp + FFmpeg]
+  F --> G[Self-critique<br/>Spark stills + Reel]
+  G --> H[One hash-bound<br/>owner approval]
+```
+
+- [docs/AUTOPILOT.md](docs/AUTOPILOT.md): the Autopilot pipeline, request budgets, safety rules and live results.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): the full system design.
+
+## Safety and honesty guarantees
+
+- **No publishing.** Tickr never publishes, spends ad budget or messages anyone. The output is a kit for the owner to review.
+- **One exact approval.** The server re-hashes every file before it records the approval. Withheld files are left out of the approval.
+- **No generated product pixels.** Products are always real source pixels. Generated imagery is labelled as a backdrop or an illustration.
+- **Provenance labels.** Every frame and still is labelled as a concept and names its source, for example OWNER PHOTO · SAM CUTOUT, WEBSITE IMAGE, AI BACKDROP or ILLUSTRATIVE IMAGE.
+- **Evidence, not instructions.** Website text is treated as evidence. Original excerpts, provider-cited summaries and model-linked summaries are kept apart. A proposed offer is never presented as a verified fact.
+- **Copy claim repair.** If the selected sources can't support a copy line, that line and the lines read together with it (the same ad, scene sequence or script) are replaced by neutral lines. Every replacement, with its original text, is recorded in `copy-claim-repairs.json`.
+- **People and rights.** The director excludes possible minors, people without recorded consent, third-party logos and signage. Owner uploads need consent attestations first.
+- **No Google page scraping.** Maps and `share.google` links are resolved from redirect headers only. Tickr never fetches Maps pages or calls Google Places.
+- **Credentials stay server-side.** Keys live in the environment or a Modal Secret and never appear in files, logs or exports.
+- **Stops instead of guessing.** When discovery can't find usable sources, Tickr stops and asks for a better link.
+
+## Live results
+
+These are recorded results, not projections.
+
+- **4 Nov 2026, live capability probe** (`npm run autopilot:check`, synthetic media): 7 of 7 steps passed.
+  - Spark grounding returned boxes for both subjects.
+  - SAM 3.1 box prompt: confidence 0.988. Concept prompt: confidence 0.922.
+  - Spark shot log passed.
+  - SAM 3.1 video tracking held the subject in 120 of 120 frames.
+  - The Spark critic reviewed a still and an inline Reel.
+  - List-price estimate about USD 0.06. This is an estimate, not an invoice.
+- **5 Nov 2026, hosted run: Grandma Daphne's Bakehouse (Hyderabad)**, website link with a story goal. It completed in 3 min 40 s.
+  - Spark analysed 12 official-site photos.
+  - 3 photos were excluded with reasons: a person without consent, a logo and interior signage.
+  - SAM 3.1 produced 3 cutouts, and Tickr rendered a still-depth Reel.
+  - The critic raised 10 findings, none blocking. They included ragged edges on the hero cutout and text contrast.
+- **Earlier:** Theobroma completed with a labelled illustration, because its image CDN blocks downloads.
+- **Tests:** `npm run check` passes with 951 tests on the deployed commit `6c0aaec`.
+
+Known limitations and work in progress:
+
+- **Maps discovery.** Maps-link discovery depends on Meta search returning usable sources. In 3 of the last 5 Maps attempts it did not. In those cases Tickr stopped and asked for a better link.
+- **Website fallback (in progress).** When search comes up short, Tickr will fall back to reading the owner's own website (a permitted, SSRF-safe reader) to find the business.
+- **Mask-quality gate (in progress).** A fix for ragged cutout edges, like the one the critic flagged on the 5 Nov run.
+- **Graph connector.** The optional Instagram/Facebook connection is implemented but not yet verified live.
+
+## Run it locally
+
+Requires Linux, Node.js 24, npm 11.9, FFmpeg, Chromium and `setsid`. Setup needs access to the npm registry and Prisma binaries.
 
 ```bash
 git clone https://github.com/vn-envy/Tickr.git
 cd Tickr
-bash scripts/setup.sh
+npm ci                 # pinned dependencies
+npm run db:setup       # Prisma client and non-destructive SQLite migrations
+npm run check          # ESLint, TypeScript and the test suite (no paid calls)
 npm run build
-TICKR_SERVER_MODE=production bash scripts/start.sh
+TICKR_SERVER_MODE=production bash scripts/start.sh   # app on port 3000 plus the worker
 ```
 
-The app runs on port **3000**. The start script manages both the app and the background worker. Use `bash scripts/start.sh` without the production flag for development.
+`bash scripts/setup.sh` runs `npm ci` and `npm run db:setup` together. Use `bash scripts/start.sh` without the production flag for development.
 
-For live generation, supply **`META_API_KEY` through the process environment** before starting both processes. In Codex, use environment settings. Never put credentials in source files. See [.env.example](.env.example) for optional configuration. The shell, tests and media diagnostics work without a key.
+For live runs, set `META_API_KEY` in the process environment before starting. Never put it in a file. See [.env.example](.env.example) for optional settings. The tests and media diagnostics run without a key.
 
-Setup installs pinned dependencies and applies migrations without resetting existing data. SQLite, generated media and private responses live under ignored `.data/`; they are not included in a clone. The current app is a private development instance and has no multi-user authentication.
-
-## Demo and verification
-
-Real link-only runs have produced reviewable kits for **Grandma Daphne’s Bakehouse**, **Theobroma** and **Tiger Lily Coffee & Bistro**. The Tiger Lily example found five named offerings and produced seven channel versions, 22 downloadable files and a playable Reel. Its exact branch remains unresolved, and Diwali is a proposed theme.
-
-Muse Image and SAM have passed separate live capability checks. Tiger Lily’s original SAM attempt failed, so that saved kit honestly uses the crop fallback. SAM failures are not proof of a working cutout; [media verification](docs/MEDIA_PIPELINE.md) records the tested paths and remaining limits.
+Verification commands:
 
 ```bash
-npm run check         # ESLint, TypeScript and unit tests
-npm run media:check   # Local four-scene rendering diagnostic
-npm run smoke        # Persistence/API check; app + worker must be running
-npm run meta:check   # Read-only model listing; requires META_API_KEY
+npm run media:check                  # local renderer contracts, including the depth Reel
+npm run autopilot:check -- --dry     # full capability probe with fake Meta clients (offline)
+npm run autopilot:check              # LIVE probe on synthetic media; needs META_API_KEY
+npm run smoke                        # persistence/API check against a running app and worker
+npm run meta:check                   # read-only model listing; needs META_API_KEY
 ```
 
-To create a new campaign with actual provider usage:
+## Hosting on Modal
+
+Modal hosts Tickr's own code only, as one persistent container. It runs no models. All inference stays on Meta-hosted APIs.
+
+- Run outputs and SQLite snapshots are kept on a Modal Volume.
+- Credentials live only in Modal Secrets: `tickr-runtime`, plus `tickr-keys`, which is created once.
+- A public deployment keeps the access-code gate on.
+- Always deploy with `modal deploy --strategy recreate`.
+
+Full steps are in [deploy/README.md](deploy/README.md).
+
+## Repository map
+
+- `app/`, `components/`: the web app. `components/autopilot/` holds the intake, the director's room and the review screen.
+- `lib/autopilot/`: the Autopilot pipeline: harvest, analyse, select, direct, produce, critique, budget and report.
+- `lib/agents/`: the Spark critic and its deterministic fixes.
+- `lib/meta/`: Meta adapters: Spark media analysis, SAM 3.1 segmentation and video tracking, Muse Image and the Graph connector.
+- `lib/research/`, `lib/network/`: link resolution, research, evidence and the restricted official-site reader.
+- `lib/media/`: media acquisition, the CDN allow-list, uploads, object layers and masks.
+- `lib/campaign/`: copy, channel rendering and archive export. `lib/campaign/cinema/` holds the Reel renderer.
+- `lib/jobs/`, `prisma/`: the durable worker, checkpoints and SQLite.
+- `deploy/`: Modal hosting.
+- `scripts/`, `tests/`: setup, live and offline checks, and the test suite.
+- `docs/`: architecture, Autopilot, media pipeline, demo notes and the verification log.
+
+## Details
+
+### Manual studio and request budgets
+
+The earlier step-by-step studio is still available behind "Advanced". Request ceilings differ by mode:
+
+- **Manual run:** at most 6 Meta requests.
+- **Autopilot run:** at most 28 requests, with per-role caps in `lib/autopilot/budget.ts`.
+
+Research tool actions have their own separate limits.
+
+Uncertain paid requests are never retried automatically. Completed responses and hashed artifacts allow local recovery. Ordinary tests make no paid model calls.
+
+To run a live link-only manual campaign from the command line (makes paid Meta requests):
 
 ```bash
 npm run link:smoke -- --live-meta --url=https://theobroma.in --report=my-demo
 ```
 
-A link-only run reserves at most **six Meta requests**: four text requests and up to two visual requests. Research tool actions are separately bounded. Completed responses and hashed artifacts support local recovery; uncertain requests are not automatically repeated. Ordinary tests make no paid model calls.
+### Data and access
 
-See the [demo guide](docs/DEMO.md) for saved examples and [verification report](docs/SETUP_VERIFICATION.md) for executed checks.
+SQLite, generated media and private responses live under the ignored `.data/` folder and are not part of a clone. Setup applies migrations without resetting existing data.
 
-## Current scope
+When `TICKR_ACCESS_CODE` is set, an access-code gate protects the app (`proxy.ts`, `lib/access.ts`). The Modal deployment requires it. Locally the gate is off by default. Tickr has no per-user accounts.
 
-Outputs are **campaign concepts requiring review**, not approved advertisements. Source-linked AI summaries are distinguished from original excerpts. Public evidence may be incomplete; the engine does not claim comprehensive review coverage, a validated competitive gap or measured conversion uplift.
+### Earlier runs and media verification
 
-Contextual final critique, exact-version owner approval, authorized uploads and connected social accounts remain open. WhatsApp output is creative and suggested conversation copy. Publishing, messaging automation and ad spending are not connected.
+Earlier link-only manual runs produced reviewable kits for Grandma Daphne's Bakehouse, Theobroma and Tiger Lily Coffee & Bistro. Tiger Lily's original SAM attempt failed, so that saved kit uses the crop fallback. See the [demo guide](docs/DEMO.md), the [media pipeline](docs/MEDIA_PIPELINE.md) and the [verification log](docs/SETUP_VERIFICATION.md).
 
-## Project map
+![Four compositions using a Meta illustration and its SAM subject mask](docs/assets/sam-composition-example.png)
 
-- `app/`, `components/` — five-stage workspace and local APIs
-- `lib/research/`, `lib/network/` — research, evidence and restricted source access
-- `lib/meta/`, `lib/media/` — Meta adapters and source-image acquisition
-- `lib/campaign/` — copy, visual composition, Reel and archive generation
-- `lib/jobs/`, `prisma/` — durable worker, checkpoints and SQLite
-- `tests/`, `scripts/` — tests, setup and reproducible verification
+*A local rendering diagnostic using a saved, genuine SAM response and a Muse illustration. These are example layouts, not real product photography or an approved brand campaign.*
 
-Read the [architecture](docs/ARCHITECTURE.md), [generic research design](docs/GENERIC_RESEARCH.md), [media pipeline](docs/MEDIA_PIPELINE.md) and [build plan](BUILD_PLAN.md).
+### Scope
 
-Tickr uses Meta SAM Materials through the pinned, unmodified `@meta-sam/parser` package under the [Meta SAM License](docs/licenses/meta-sam-LICENSE.txt). Hosted SAM performs inference; the local parser decodes its masks. Remotion is used for a separate rendering diagnostic; the campaign renderer uses Sharp and FFmpeg.
+Outputs are campaign concepts that need owner review, not approved advertisements. Public evidence may be incomplete. Tickr does not claim complete review coverage, a validated competitive gap or a measured lift in conversions. WhatsApp output is creative and suggested reply copy only.
+
+Further reading: [generic research design](docs/GENERIC_RESEARCH.md), [build plan](BUILD_PLAN.md).
+
+### License note
+
+Tickr uses Meta SAM Materials through the pinned, unmodified `@meta-sam/parser` package under the [Meta SAM License](docs/licenses/meta-sam-LICENSE.txt). Hosted SAM performs inference, and the local parser decodes its masks. Remotion is used for a separate rendering diagnostic. The campaign renderer uses Sharp and FFmpeg.
